@@ -71,7 +71,7 @@ PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in resu
 PIN_IOU_THR     = 0.50   # NMS overlap threshold
 
 MIN_CONTOUR_AREA = 1
-IMAGE_SOURCE_DIR  = "image_source"
+IMAGE_SOURCE_DIR  = "image_source/"
 OUTPUT_DIR        = "Inspection_result"
 
 # Camera

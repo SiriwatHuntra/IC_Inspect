@@ -1,0 +1,33 @@
+# Image inputs / outputs
+image_source/
+Inspection_result/
+debug/
+*.bmp
+*.jpg
+*.jpeg
+*.png
+
+# Logs and run output
+run_log/
+program_logs/
+NG_log/
+*.log
+*.csv
+
+# ML model artifacts
+svm_model.pkl
+training_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Backup copies
+insp_exp copy*.py
+Backup_Code/
+
+# Misc
+*.tmp
