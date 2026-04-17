@@ -878,6 +878,16 @@ class ContourTemplate:
         data["canvas"]  = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
         data["hog_vec"] = _compute_hog(data["canvas"])
 
+        # Pre-compute shape descriptors — used by _compute_shape_score at runtime.
+        # Computed here once at cache load so compare_roi pays no extraction cost.
+        # InspectionEngine is defined later in the file but resolved at call time.
+        outer = data["contours"][0] if data["contours"] else None
+        data["approx_feat"]    = InspectionEngine._approx_features(outer) \
+                                  if outer is not None else None
+        data["contour_signal"] = InspectionEngine._resample_contour_signal(outer) \
+                                  if outer is not None else None
+        data["topo_feat"]      = InspectionEngine._skeleton_features(data["canvas"])
+
         # Backfill missing fields from older templates
         if not data.get("expected_pixels") and data["canvas"] is not None:
             data["expected_pixels"] = int(np.count_nonzero(data["canvas"]))
@@ -1208,6 +1218,333 @@ class InspectionEngine:
         if q_hog is None or tmpl_hog is None:
             return 0.0
         return float(np.clip(np.dot(q_hog, tmpl_hog), 0.0, 1.0))
+
+    # =========================================================
+    # DESCRIPTOR: polygon approximation
+    # =========================================================
+
+    @staticmethod
+    def _approx_features(contour: np.ndarray) -> tuple:
+        """
+        Douglas-Peucker approximation of outer contour.
+        epsilon = 0.04 × perimeter — tuned for laser stroke widths 3-6 px.
+
+        Input : outer contour (np.int32)
+        Output: (vertex_count: int, sorted_angles: list[float])
+                angles are interior turn angles in degrees, ascending.
+        """
+        peri   = cv2.arcLength(contour, closed=True)
+        approx = cv2.approxPolyDP(contour, 0.04 * peri, closed=True)
+        pts    = approx.reshape(-1, 2).astype(np.float32)
+        n      = len(pts)
+        angles = []
+        for i in range(n):
+            a, b, c = pts[i - 1], pts[i], pts[(i + 1) % n]
+            v1    = a - b
+            v2    = c - b
+            denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+            cos_a = np.dot(v1, v2) / max(float(denom), 1e-6)
+            angles.append(float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))))
+        return n, sorted(angles)
+
+    @staticmethod
+    def _approx_score(feat_q: tuple, feat_t: tuple) -> float:
+        """
+        Similarity between two _approx_features() outputs.
+
+        Vertex count mismatch > 1  → returns 0.0 immediately (hard gate).
+        Angle list L1 distance mapped to [0, 1].
+        Shorter list padded with 180° (straight segment).
+
+        Input : feat_q, feat_t — tuples from _approx_features()
+        Output: float [0, 1]
+        """
+        if feat_q is None or feat_t is None:
+            return 0.0
+        n_q, ang_q = feat_q
+        n_t, ang_t = feat_t
+        if abs(n_q - n_t) > 1:
+            return 0.0
+        max_n = max(len(ang_q), len(ang_t))
+        aq    = ang_q + [180.0] * (max_n - len(ang_q))
+        at    = ang_t + [180.0] * (max_n - len(ang_t))
+        l1    = sum(abs(a - b) for a, b in zip(aq, at)) / max(max_n * 180.0, 1.0)
+        return round(float(max(0.0, 1.0 - l1)), 4)
+
+    # =========================================================
+    # DESCRIPTOR: resampled contour radius signal
+    # =========================================================
+
+    @staticmethod
+    def _resample_contour_signal(contour: np.ndarray,
+                                  n: int = 64) -> "np.ndarray | None":
+        """
+        Resample outer contour to N equally-spaced arc-length points.
+        Returns normalised centroid-distance signal, shape (N,) float32.
+        Returns None for degenerate contours (perimeter < 1 px).
+
+        Input : contour (np.int32), n — number of sample points
+        Output: float32 ndarray shape (n,), values in [0, 1]  or  None
+        """
+        pts    = contour.reshape(-1, 2).astype(np.float32)
+        diffs  = np.diff(pts, axis=0, append=pts[:1])
+        segs   = np.hypot(diffs[:, 0], diffs[:, 1])
+        cumlen = np.concatenate([[0.0], np.cumsum(segs)])
+        total  = float(cumlen[-1])
+        if total < 1.0:
+            return None
+        targets  = np.linspace(0.0, total, n, endpoint=False)
+        resampled = np.column_stack([
+            np.interp(targets, cumlen, pts[:, 0]),
+            np.interp(targets, cumlen, pts[:, 1]),
+        ])
+        cx, cy  = resampled.mean(axis=0)
+        radii   = np.hypot(resampled[:, 0] - cx, resampled[:, 1] - cy)
+        max_r   = float(radii.max())
+        if max_r < 1e-6:
+            return None
+        return (radii / max_r).astype(np.float32)
+
+    @staticmethod
+    def _contour_signal_sim(sig_q: "np.ndarray | None",
+                             sig_t: "np.ndarray | None") -> float:
+        """
+        Rotation-invariant similarity between two radius signals.
+        Uses circular cross-correlation via FFT — finds best rotational alignment.
+        Returns 0.0 when either signal is None.
+
+        Input : sig_q, sig_t — float32 ndarrays from _resample_contour_signal()
+        Output: float [0, 1]
+        """
+        if sig_q is None or sig_t is None:
+            return 0.0
+        corr  = np.real(np.fft.ifft(
+            np.fft.fft(sig_q) * np.conj(np.fft.fft(sig_t))))
+        denom = np.sqrt(np.dot(sig_q, sig_q) * np.dot(sig_t, sig_t))
+        return float(np.clip(np.max(corr) / max(float(denom), 1e-6), 0.0, 1.0))
+
+    # =========================================================
+    # DESCRIPTOR: skeleton topology
+    # =========================================================
+
+    @staticmethod
+    def _skeleton_features(canvas: np.ndarray) -> "dict | None":
+        """
+        Zhang-Suen thinning → vectorised crossing-number topology.
+        Requires opencv-contrib (cv2.ximgproc.thinning).
+        Returns None silently when ximgproc is unavailable or canvas is empty.
+
+        Crossing number (CN) per skeleton pixel (8-neighbourhood):
+          CN = 1  → endpoint (stroke tip)
+          CN ≥ 3  → branch / junction
+
+        Input : filled binary canvas uint8
+        Output: dict with keys:
+                  skel        — uint8 skeleton image
+                  n_endpoints — int
+                  n_branches  — int
+                  n_loops     — int  (interior connected components)
+                  stroke_len  — int  (total skeleton px)
+                  avg_width   — float (mean stroke width in px)
+                or None
+        """
+        if canvas is None or not np.any(canvas):
+            return None
+        try:
+            skel = cv2.ximgproc.thinning(
+                canvas, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+        except AttributeError:
+            return None
+
+        p = (skel > 0).astype(np.int32)
+
+        # Vectorised crossing-number over interior pixels
+        nb = np.stack([
+            p[:-2, 1:-1], p[:-2, 2:],  p[1:-1, 2:],  p[2:, 2:],
+            p[2:,  1:-1], p[2:,  :-2], p[1:-1, :-2], p[:-2, :-2],
+        ], axis=2)
+        nb_shift = np.roll(nb, -1, axis=2)
+        cn       = np.sum(np.abs(nb_shift - nb), axis=2) // 2
+        center   = p[1:-1, 1:-1]
+
+        n_endpoints = int(np.count_nonzero((cn == 1) & (center == 1)))
+        n_branches  = int(np.count_nonzero((cn >= 3) & (center == 1)))
+        stroke_len  = int(np.count_nonzero(skel))
+
+        # Loop count via interior connected components of the filled canvas
+        inv    = cv2.bitwise_not(canvas)
+        n_cc, _ = cv2.connectedComponents(inv, connectivity=4)
+        n_loops = max(0, n_cc - 1)   # subtract background component
+
+        # Average stroke width from distance transform sampled at skeleton
+        dist      = cv2.distanceTransform(canvas, cv2.DIST_L2, 3)
+        skel_mask = skel > 0
+        avg_width = float(dist[skel_mask].mean()) * 2.0 \
+                    if np.any(skel_mask) else 0.0
+
+        return {
+            "skel":        skel,
+            "n_endpoints": n_endpoints,
+            "n_branches":  n_branches,
+            "n_loops":     n_loops,
+            "stroke_len":  stroke_len,
+            "avg_width":   round(avg_width, 2),
+        }
+
+    @staticmethod
+    def _topology_score(feat_q: "dict | None", feat_t: "dict | None") -> float:
+        """
+        Normalised similarity between two _skeleton_features() dicts.
+        Four-component weighted vector:
+          endpoints (35%) · branches (25%) · loops (25%) · stroke_len (15%)
+
+        Count tolerance: endpoints/branches ±2, loops ±1.
+
+        Input : feat_q, feat_t — dicts from _skeleton_features()
+        Output: float [0, 1]  — 0.0 when either feat is None
+        """
+        if feat_q is None or feat_t is None:
+            return 0.0
+
+        def _cnt(a: int, b: int, tol: int) -> float:
+            return max(0.0, 1.0 - abs(a - b) / max(tol, 1))
+
+        ep_sim  = _cnt(feat_q["n_endpoints"], feat_t["n_endpoints"], 2)
+        br_sim  = _cnt(feat_q["n_branches"],  feat_t["n_branches"],  2)
+        lp_sim  = _cnt(feat_q["n_loops"],     feat_t["n_loops"],     1)
+        sq, st  = feat_q["stroke_len"], feat_t["stroke_len"]
+        len_sim = 1.0 - abs(sq - st) / max(sq + st, 1)
+
+        score = ep_sim * 0.35 + br_sim * 0.25 + lp_sim * 0.25 + len_sim * 0.15
+        return round(float(score), 4)
+
+    # =========================================================
+    # DESCRIPTOR: skeleton IoU
+    # =========================================================
+
+    @staticmethod
+    def _skeleton_iou(canvas_q: np.ndarray,
+                       canvas_t: np.ndarray,
+                       dilate_px: int = 2) -> float:
+        """
+        IoU between centre-aligned dilated skeletons.
+        Dilation adds sub-pixel tolerance without collapsing fine stroke detail.
+        Returns 0.0 if ximgproc unavailable or skeletons are empty.
+
+        Input : canvas_q / canvas_t — filled binary uint8 canvases
+                dilate_px — dilation radius in pixels (default 2)
+        Output: float [0, 1]
+        """
+        def _thin(c: np.ndarray) -> "np.ndarray | None":
+            try:
+                return cv2.ximgproc.thinning(
+                    c, thinningType=cv2.ximgproc.THINNING_ZHANGSUEN)
+            except AttributeError:
+                return None
+
+        def _centre_align(src: np.ndarray, size: int = 64) -> np.ndarray:
+            pts = cv2.findNonZero(src)
+            if pts is None:
+                return np.zeros((size, size), dtype=np.uint8)
+            x, y, w, h = cv2.boundingRect(pts)
+            crop  = src[y:y + h, x:x + w]
+            scale = min(size / max(w, 1), size / max(h, 1))
+            sw    = max(1, int(round(w * scale)))
+            sh    = max(1, int(round(h * scale)))
+            rsz   = cv2.resize(crop, (sw, sh), interpolation=cv2.INTER_NEAREST)
+            frame = np.zeros((size, size), dtype=np.uint8)
+            frame[(size - sh) // 2:(size - sh) // 2 + sh,
+                  (size - sw) // 2:(size - sw) // 2 + sw] = rsz
+            return frame
+
+        sq = _thin(canvas_q)
+        st = _thin(canvas_t)
+        if sq is None or st is None:
+            return 0.0
+
+        sq = _centre_align(sq)
+        st = _centre_align(st)
+
+        if dilate_px > 0:
+            k  = cv2.getStructuringElement(
+                cv2.MORPH_RECT, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+            sq = cv2.dilate(sq, k)
+            st = cv2.dilate(st, k)
+
+        inter = np.count_nonzero(cv2.bitwise_and(sq, st))
+        union = np.count_nonzero(cv2.bitwise_or(sq, st))
+        return round(float(inter / max(union, 1)), 4)
+
+    # =========================================================
+    # COMPOSITE SCORER
+    # =========================================================
+
+    @staticmethod
+    def _compute_shape_score(canvas_q:   np.ndarray,
+                              contours_q: list,
+                              tmpl:       dict) -> float:
+        """
+        Weighted combination of all shape descriptors.
+        Each descriptor is independent — zero its weight to disable it.
+
+        Descriptor weights (must sum to 1.0):
+          W_HOG      0.25   gradient texture (HOG cosine)
+          W_FILLED   0.15   global silhouette (filled canvas IoU)
+          W_SKEL     0.25   stroke position (skeleton IoU, dilated)
+          W_SIGNAL   0.20   outline shape (resampled radius signal)
+          W_APPROX   0.15   corner topology (polygon approximation)
+
+        Skeleton descriptors fall back gracefully when ximgproc is absent
+        — their weight is redistributed to HOG + filled IoU.
+
+        Input : canvas_q   — extracted binary canvas for query slot
+                contours_q — contour list from _check_presence
+                tmpl       — loaded template dict (pre-computed fields expected)
+        Output: float [0, 1]
+        """
+        W_HOG    = 0.25
+        W_FILLED = 0.15
+        W_SKEL   = 0.25
+        W_SIGNAL = 0.20
+        W_APPROX = 0.15
+
+        q_hog = _compute_hog(canvas_q)
+        hog   = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
+
+        filled = InspectionEngine._check_similarity(canvas_q, tmpl.get("canvas"))
+
+        skel = InspectionEngine._skeleton_iou(canvas_q, tmpl.get("canvas", np.zeros((1,1), np.uint8)))
+        topo = InspectionEngine._topology_score(
+            InspectionEngine._skeleton_features(canvas_q),
+            tmpl.get("topo_feat"))
+
+        outer_q  = contours_q[0] if contours_q else None
+        sig_q    = InspectionEngine._resample_contour_signal(outer_q) \
+                   if outer_q is not None else None
+        signal   = InspectionEngine._contour_signal_sim(sig_q, tmpl.get("contour_signal"))
+
+        af_q   = InspectionEngine._approx_features(outer_q) \
+                 if outer_q is not None else None
+        approx = InspectionEngine._approx_score(af_q, tmpl.get("approx_feat"))
+
+        # Redistribute skeleton weight when unavailable
+        if skel == 0.0 and topo == 0.0:
+            w_hog    = W_HOG    + W_SKEL * 0.60
+            w_filled = W_FILLED + W_SKEL * 0.40
+            w_skel   = 0.0
+        else:
+            w_hog    = W_HOG
+            w_filled = W_FILLED
+            w_skel   = W_SKEL
+
+        score = (hog    * w_hog  +
+                 filled * w_filled +
+                 skel   * w_skel  +
+                 topo   * 0.0     +   # topology informs logging; weight here = 0
+                 signal * W_SIGNAL +
+                 approx * W_APPROX)
+
+        return round(float(np.clip(score, 0.0, 1.0)), 4)
 
     @staticmethod
     def _is_laser_mark(canvas: np.ndarray) -> bool:
