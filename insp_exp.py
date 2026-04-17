@@ -1920,18 +1920,20 @@ class InspectionEngine:
                  "shift_ratio": shift_ratio,
                  "roi_canvas": canvas})
 
-        # ── HOG confidence (hard) ─────────────────────────────
-        confidence = self._hog_cosine(_compute_hog(canvas), tmpl.get("hog_vec"))
+        # ── Step 4 : Weighted shape score ────────────────────────
+        # Replaces single HOG gate with multi-descriptor weighted scorer.
+        # Swap individual descriptors by changing weights in _compute_shape_score.
+        confidence = self._compute_shape_score(canvas, contours, tmpl)
 
         conf_thr = max(0.0, FONT_CONFIDENCE_MIN - 0.05) if is_retry \
                    else FONT_CONFIDENCE_MIN
         if confidence < conf_thr:
             return _fail(4,
-                f"low confidence={confidence:.3f} < {conf_thr:.3f}",
+                f"low shape_score={confidence:.3f} < {conf_thr:.3f}",
                 {"confidence":  confidence,
-                 "shift_px":   shift_px,
+                 "shift_px":    shift_px,
                  "shift_ratio": shift_ratio,
-                 "roi_canvas": canvas})
+                 "roi_canvas":  canvas})
 
         return {
             "pass":        True,
