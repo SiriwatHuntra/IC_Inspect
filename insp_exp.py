@@ -938,6 +938,100 @@ def _encode_canvas(canvas: np.ndarray) -> str:
 
 
 # =========================================================
+# B.  YOLOMoldDetector  — mold bbox detection via YOLO8
+# =========================================================
+YOLO_MODEL_PATH = "Mold_detector.onnx"
+
+class YOLOMoldDetector:
+    """
+    Wraps Mold_detector.onnx (exported from YOLO8, single class "IC").
+    detect_top_left() returns the top-left-most bbox as QRect.
+    Falls back gracefully if model file is missing or inference fails.
+
+    Export on a PC with PyTorch:
+        from ultralytics import YOLO
+        YOLO("Mold_detector.pt").export(format="onnx", imgsz=640)
+    """
+    _INPUT_SIZE = 640
+
+    def __init__(self):
+        self._session = None
+        self._ready   = False
+        try:
+            import onnxruntime as ort
+            if os.path.exists(YOLO_MODEL_PATH):
+                self._session = ort.InferenceSession(
+                    YOLO_MODEL_PATH,
+                    providers=["CPUExecutionProvider"])
+                self._input_name  = self._session.get_inputs()[0].name
+                self._ready = True
+                print(f"[YOLO] ONNX model loaded: {YOLO_MODEL_PATH}")
+            else:
+                print(f"[YOLO] Model file not found: {YOLO_MODEL_PATH}")
+        except Exception as e:
+            print(f"[YOLO] Load failed: {e}")
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def detect_top_left(self, image_bgr: np.ndarray,
+                        conf_thr: float = 0.40):
+        """
+        Run inference and return the top-left-most detection as QRect.
+        Top-left-most = lowest (x1 + y1) sum.
+        Returns QRect on success, None if no detection or model not ready.
+        """
+        if not self._ready or self._session is None:
+            return None
+        try:
+            ih, iw = image_bgr.shape[:2]
+            sz = self._INPUT_SIZE
+
+            # letterbox resize to sz×sz
+            scale  = min(sz / iw, sz / ih)
+            nw, nh = int(iw * scale), int(ih * scale)
+            resized = cv2.resize(image_bgr, (nw, nh))
+            canvas  = np.full((sz, sz, 3), 114, dtype=np.uint8)
+            pad_x   = (sz - nw) // 2
+            pad_y   = (sz - nh) // 2
+            canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+
+            blob = canvas[:, :, ::-1].astype(np.float32) / 255.0
+            blob = blob.transpose(2, 0, 1)[np.newaxis]
+
+            outputs = self._session.run(None, {self._input_name: blob})
+            # YOLOv8 ONNX output: [1, 5, N]  (cx, cy, w, h, conf)
+            preds = outputs[0][0].T          # → [N, 5]
+            mask  = preds[:, 4] >= conf_thr
+            preds = preds[mask]
+            if len(preds) == 0:
+                return None
+
+            best = None
+            best_score = float("inf")
+            for row in preds:
+                cx, cy, bw, bh = row[:4]
+                x1 = int((cx - bw / 2 - pad_x) / scale)
+                y1 = int((cy - bh / 2 - pad_y) / scale)
+                x2 = int((cx + bw / 2 - pad_x) / scale)
+                y2 = int((cy + bh / 2 - pad_y) / scale)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(iw, x2), min(ih, y2)
+                tl = x1 + y1
+                if tl < best_score:
+                    best_score = tl
+                    best = (x1, y1, x2 - x1, y2 - y1)
+
+            if best is None:
+                return None
+            from PyQt5 import QtCore
+            return QtCore.QRect(best[0], best[1], best[2], best[3])
+        except Exception as e:
+            print(f"[YOLO] Inference error: {e}")
+            return None
+
+
+# =========================================================
 # B.  InspectionEngine  — named check steps
 # =========================================================
 class InspectionEngine:
@@ -1023,34 +1117,24 @@ class InspectionEngine:
                             threshold: int = 128,
                             min_white_ratio: float = 0.20) -> bool:
         """
-        Check left and right of mold for lead frame presence.
-        Boxes are 1/3 mold width, full mold height, centred on mold edges.
+        Check the lead (frame) area to the left of the mold for IC presence.
+        Lead box: W/2 × H, centred at (acx - aw*3//4, acy) — matches
+        the frame template derived in save_frame_recipe.
 
         Returns True  → leads present, proceed to font inspection.
         Returns False → no leads (work dropped), skip with pass result.
         """
-        side_w  = aw // 3
-        half_sw = side_w // 2
-        mold_x1 = acx - aw // 2
-        mold_x2 = acx + aw // 2
-        mold_y1 = acy - ah // 2
-        mold_y2 = acy + ah // 2
-
-        def _white_ratio(x1, y1, x2, y2) -> float:
-            x1 = max(0, x1);  y1 = max(0, y1)
-            x2 = min(iw, x2); y2 = min(ih, y2)
-            if x2 <= x1 or y2 <= y1:
-                return 0.0
-            roi = image_gray[y1:y2, x1:x2]
-            white = np.count_nonzero(roi >= threshold)
-            return white / max(roi.size, 1)
-
-        left_ratio  = _white_ratio(mold_x1 - half_sw, mold_y1,
-                                mold_x1 + half_sw, mold_y2)
-        right_ratio = _white_ratio(mold_x2 - half_sw, mold_y1,
-                                mold_x2 + half_sw, mold_y2)
-
-        return (left_ratio >= min_white_ratio) or (right_ratio >= min_white_ratio)
+        fw   = aw // 2
+        fcx  = acx - aw * 3 // 4
+        x1   = max(0,  fcx - fw // 2)
+        y1   = max(0,  acy - ah // 2)
+        x2   = min(iw, fcx + fw // 2)
+        y2   = min(ih, acy + ah // 2)
+        if x2 <= x1 or y2 <= y1:
+            return False
+        roi   = image_gray[y1:y2, x1:x2]
+        white = np.count_nonzero(roi >= threshold)
+        return (white / max(roi.size, 1)) >= min_white_ratio
 
     @staticmethod
     def _check_similarity(canvas:      np.ndarray,
@@ -1715,7 +1799,8 @@ class InspectionController:
         self._eng   = InspectionEngine()
         self.cache:          dict[str, dict] = {}
         self.results:        list[dict]      = []
-        self._ocr_templates: dict[str, dict] = {}   # all saved templates for OCR
+        self._ocr_templates: dict[str, dict] = {}
+        self.yolo = YOLOMoldDetector()
 
     # ---- internal: encode one ROI section for the recipe ----
     @staticmethod
@@ -1753,34 +1838,50 @@ class InspectionController:
     # ---- frame recipe save ----
     def save_frame_recipe(self,
                           image_bgr:    np.ndarray,
-                          frame_rect:   QtCore.QRect,
-                          mold_a_rect:  QtCore.QRect,
-                          mold_b_rect:  QtCore.QRect,
+                          mold_rect:    QtCore.QRect,
                           grid_letters: list) -> bool:
         """
-        Extract contours for all three regions and write pin_recipe.json.
-        Slot positions are auto-computed from mold canvas size at inspect time.
-        grid_letters : list of exactly 9 strings (empty = skip), row-major
-                       in camera space (IC is 90° CCW from upright).
+        Derive frame (lead) rect from YOLO mold bbox and write pin_recipe.json.
+
+        Frame box geometry (derived from mold W × H):
+          size   : (W//2) × H
+          centre : (mcx - W*3//4, mcy)   — sits over leads to the left
+
+        Lead presence box = same area as frame box (leads ARE the frame).
+
+        grid_letters : list of exactly 9 strings (empty = skip), row-major.
         Returns True on success.
         """
         try:
-            fcx = frame_rect.x() + frame_rect.width()  // 2
-            fcy = frame_rect.y() + frame_rect.height() // 2
+            ih, iw = image_bgr.shape[:2]
+            mw  = mold_rect.width()
+            mh  = mold_rect.height()
+            mcx = mold_rect.x() + mw // 2
+            mcy = mold_rect.y() + mh // 2
 
-            def _mold_offset(r: QtCore.QRect) -> tuple:
-                mcx = r.x() + r.width()  // 2
-                mcy = r.y() + r.height() // 2
-                return (mcx - fcx, mcy - fcy)
+            # derive frame rect (left lead area)
+            fw  = mw // 2
+            fh  = mh
+            fcx = mcx - mw * 3 // 4
+            fcy = mcy
+            fx  = max(0, fcx - fw // 2)
+            fy  = max(0, fcy - fh // 2)
+            fw  = min(fw, iw - fx)
+            fh  = min(fh, ih - fy)
+            frame_rect = QtCore.QRect(fx, fy, fw, fh)
+
+            # mold offset relative to frame centre
+            mold_offset = (mcx - fcx, mcy - fcy)
 
             frame_sec  = self._encode_section(image_bgr, frame_rect)
             mold_a_sec = self._encode_section(
-                image_bgr, mold_a_rect, offset=_mold_offset(mold_a_rect))
+                image_bgr, mold_rect, offset=mold_offset)
+            # mold_b reuses mold_a (single-mold setup)
             mold_b_sec = self._encode_section(
-                image_bgr, mold_b_rect, offset=_mold_offset(mold_b_rect))
+                image_bgr, mold_rect, offset=mold_offset)
 
             recipe = {
-                "version":      4,
+                "version":      5,
                 "frame":        frame_sec,
                 "mold_a":       mold_a_sec,
                 "mold_b":       mold_b_sec,
@@ -3237,23 +3338,13 @@ class SetupPreviewDialog(QtWidgets.QDialog):
 # =========================================================
 class FrameTemplatePanel(QtWidgets.QWidget):
     """
-    Floating always-on-top panel — guides through 3 sequential steps.
+    Floating always-on-top panel — single-step YOLO mold detection confirm.
 
-    Step 0 — FRAME  : rubber-band draw
-    Step 1 — MOLD A : rubber-band draw (constrained near frame)
-    Step 2 — MOLD B : rubber-band draw (constrained near frame)
+    Shows detected mold bbox overlay; user clicks Confirm to save or
+    Retry to re-run detection.  Cancel aborts.
     """
 
-    _STEP_LABELS = [
-        ("Step 1 / 2  —  FRAME",
-         "Draw the lead frame region on the image."),
-        ("Step 2 / 2  —  MOLD A Position",
-         "Draw Mold A region on the image.\nMust be within the highlighted zone."),
-        # ("Step 3 / 3  —  MOLD B Position",  — mold B disabled for single-mold test
-        #  "Draw Mold B region on the image.\nMust be within the highlighted zone."),
-    ]
-
-    def __init__(self, on_confirm, on_cancel, parent=None):
+    def __init__(self, on_confirm, on_retry, on_cancel, parent=None):
         super().__init__(
             parent,
             QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint |
@@ -3264,37 +3355,37 @@ class FrameTemplatePanel(QtWidgets.QWidget):
         self.setFixedWidth(340)
 
         self._on_confirm = on_confirm
+        self._on_retry   = on_retry
         self._on_cancel  = on_cancel
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setSpacing(10)
         lay.setContentsMargins(14, 14, 14, 14)
 
-        self._lbl_title = QtWidgets.QLabel()
+        self._lbl_title = QtWidgets.QLabel("Auto Mold Detection")
         self._lbl_title.setStyleSheet(
             "font-size:13px;font-weight:bold;color:#00e5ff")
         self._lbl_title.setAlignment(QtCore.Qt.AlignCenter)
         lay.addWidget(self._lbl_title)
 
-        self._lbl_inst = QtWidgets.QLabel()
-        self._lbl_inst.setStyleSheet("color:#cccccc;font-size:11px")
-        self._lbl_inst.setAlignment(QtCore.Qt.AlignCenter)
-        self._lbl_inst.setWordWrap(True)
-        lay.addWidget(self._lbl_inst)
-
-        self._lbl_status = QtWidgets.QLabel("Draw a rectangle on the image.")
-        self._lbl_status.setStyleSheet("color:#888888;font-size:10px")
+        self._lbl_status = QtWidgets.QLabel("Detecting…")
+        self._lbl_status.setStyleSheet("color:#cccccc;font-size:11px")
         self._lbl_status.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl_status.setWordWrap(True)
         lay.addWidget(self._lbl_status)
 
         lay.addSpacing(4)
 
         btn_row = QtWidgets.QHBoxLayout()
-        self._btn_confirm = QtWidgets.QPushButton("Confirm")
+        self._btn_confirm = QtWidgets.QPushButton("Save Template")
+        self._btn_retry   = QtWidgets.QPushButton("Retry")
         self._btn_cancel  = QtWidgets.QPushButton("Cancel")
 
         self._btn_confirm.setStyleSheet(
             "background:#005f6b;color:#fff;font-weight:bold;"
+            "padding:6px 14px;border-radius:4px")
+        self._btn_retry.setStyleSheet(
+            "background:#4a3a00;color:#fff;font-weight:bold;"
             "padding:6px 14px;border-radius:4px")
         self._btn_cancel.setStyleSheet(
             "background:#4a1a1a;color:#fff;font-weight:bold;"
@@ -3302,31 +3393,40 @@ class FrameTemplatePanel(QtWidgets.QWidget):
 
         self._btn_confirm.setEnabled(False)
         self._btn_confirm.clicked.connect(self._on_confirm)
+        self._btn_retry.clicked.connect(self._on_retry)
         self._btn_cancel.clicked.connect(self._on_cancel)
 
         btn_row.addStretch()
         btn_row.addWidget(self._btn_confirm)
+        btn_row.addWidget(self._btn_retry)
         btn_row.addWidget(self._btn_cancel)
         btn_row.addStretch()
         lay.addLayout(btn_row)
 
         self.adjustSize()
-        self.set_step(0, can_confirm=False)
 
-    def set_step(self, step: int, can_confirm: bool):
-        title, inst = self._STEP_LABELS[step]
-        self._lbl_title.setText(title)
-        self._lbl_inst.setText(inst)
+    def set_detected(self, rect_str: str):
+        """Call after successful detection with a bbox description string."""
+        self._lbl_status.setText(
+            f"Mold detected:\n{rect_str}\n\nFrame (lead) box auto-derived.")
+        self._lbl_status.setStyleSheet("color:#88ff88;font-size:11px")
+        self._btn_confirm.setEnabled(True)
 
-        if can_confirm:
-            self._lbl_status.setText("Rect drawn.  Click Confirm to proceed.")
-            self._lbl_status.setStyleSheet("color:#00e5ff;font-size:10px")
-        else:
-            self._lbl_status.setText("Draw a rectangle on the image.")
-            self._lbl_status.setStyleSheet("color:#888888;font-size:10px")
+    def set_no_detection(self):
+        """Call when YOLO finds nothing."""
+        self._lbl_status.setText(
+            "No mold detected.\nCheck image or model file,\nthen click Retry.")
+        self._lbl_status.setStyleSheet("color:#ffaa44;font-size:11px")
+        self._btn_confirm.setEnabled(False)
 
-        self._btn_confirm.setEnabled(can_confirm)
-        self._btn_confirm.setText("Finish" if step == 1 else "Confirm")  # step 2→1 (mold B disabled)
+    def set_no_model(self):
+        """Call when YOLO model is not available."""
+        self._lbl_status.setText(
+            "YOLO model not ready.\n"
+            f"Place {YOLO_MODEL_PATH} in the project folder.")
+        self._lbl_status.setStyleSheet("color:#ff4444;font-size:11px")
+        self._btn_confirm.setEnabled(False)
+        self._btn_retry.setEnabled(False)
 
     def closeEvent(self, e):
         self._on_cancel()
@@ -3637,11 +3737,9 @@ class MainWindow(QtWidgets.QWidget):
         self._mode    = None   # "frame" | "font" | "mask" | None
         self._pending = None   # pending font template name
 
-        # Frame template creation — 3-step state
-        self._frame_step:  int              = 0
+        # Frame template creation state
         self._frame_rects: list             = [None, None, None]
         self._frame_panel: FrameTemplatePanel | None = None
-        # Overlay tag keys for each step so re-draw replaces the right box
         self._FRAME_TAGS = ["FRAME", "MOLD_A", "MOLD_B"]
 
         # Mask work-in-progress
@@ -3762,7 +3860,7 @@ class MainWindow(QtWidgets.QWidget):
 
         
     # ----------------------------------------------------------
-    # Frame template creation — 3-step sequence
+    # Frame template creation — YOLO auto-detect single step
     # ----------------------------------------------------------
     def _start_frame(self):
         if self._image is None:
@@ -3779,13 +3877,13 @@ class MainWindow(QtWidgets.QWidget):
                 "Example:  ,9,H,B,,6,W,8,7")
             return
 
-        self._frame_step  = 0
         self._frame_rects = [None, None, None]
         self._mode        = "frame"
         self._clear_frame_overlays()
 
         self._frame_panel = FrameTemplatePanel(
             on_confirm = self._on_frame_confirm,
+            on_retry   = self._on_frame_retry,
             on_cancel  = self._on_frame_cancel,
             parent     = self,
         )
@@ -3794,65 +3892,56 @@ class MainWindow(QtWidgets.QWidget):
         self._frame_panel.move(geo.right() - pw - 20, geo.top() + 60)
         self._frame_panel.show()
 
-        self._view.set_draw_mode(True)
-        self._view.set_constraint_rect(None)
-        self._panel.log("Frame template — Step 1/2: Draw FRAME rect.", "#00e5ff")
+        self._panel.log("Auto-detecting mold…", "#00e5ff")
+        self._run_yolo_detection()
+
+    def _run_yolo_detection(self):
+        """Run YOLO on current image; update panel and overlay."""
+        if not self._ctrl.yolo.is_ready():
+            self._frame_panel.set_no_model()
+            self._panel.log(
+                f"YOLO model not ready — place {YOLO_MODEL_PATH} in project folder.",
+                "#ff4444")
+            return
+
+        mold_rect = self._ctrl.yolo.detect_top_left(self._image)
+        self._clear_frame_overlays()
+
+        if mold_rect is None:
+            self._frame_rects[0] = None
+            self._frame_panel.set_no_detection()
+            self._panel.log("YOLO: no mold detected.", "#ffaa44")
+            return
+
+        self._frame_rects[0] = mold_rect
+
+        # draw mold bbox overlay (cyan)
+        self._view.add_overlay(mold_rect, QtGui.QColor(0, 224, 255), "MOLD_A", "dash")
+
+        # draw derived frame (lead) box overlay (yellow)
+        mw, mh = mold_rect.width(), mold_rect.height()
+        mcx = mold_rect.x() + mw // 2
+        mcy = mold_rect.y() + mh // 2
+        fw  = mw // 2
+        fcx = mcx - mw * 3 // 4
+        frame_rect = QtCore.QRect(fcx - fw // 2, mcy - mh // 2, fw, mh)
+        self._view.add_overlay(frame_rect, QtGui.QColor(255, 220, 0), "FRAME", "dash")
+
+        desc = f"x={mold_rect.x()}, y={mold_rect.y()}, {mw}×{mh} px"
+        self._frame_panel.set_detected(desc)
+        self._panel.log(f"YOLO: mold detected — {desc}", "#88ff88")
+
+    def _on_frame_retry(self):
+        self._panel.log("Retrying detection…", "#00e5ff")
+        self._run_yolo_detection()
 
     def _on_frame_confirm(self):
-        if self._frame_rects[self._frame_step] is None:
+        if self._frame_rects[0] is None:
             return
-        if self._frame_step < 1:  # < 2 — mold B step disabled for single-mold test
-            self._frame_step += 1
-            self._frame_panel.set_step(self._frame_step, can_confirm=False)
-            self._view.set_draw_mode(True)
-            self._view.set_constraint_rect(self._mold_a_constraint_rect())
-            # else: self._view.set_constraint_rect(self._mold_b_constraint_rect())  — mold B disabled
-            step_name = self._FRAME_TAGS[self._frame_step]
-            self._panel.log(
-                f"Frame template — Step {self._frame_step+1}/2:"
-                f" Draw {step_name} rect (within yellow zone).", "#00e5ff")
-        else:
-            self._finish_frame()
-
-    def _mold_a_constraint_rect(self) -> QtCore.QRect | None:
-        """
-        Constraint zone for MOLD A — single mold per frame.
-        Width   : 1.3 * frame_height
-        X       : left = frame right edge
-        Y       : same height and Y position as the frame template
-        """
-        fr = self._frame_rects[0]
-        if fr is None:
-            return None
-        ih, iw = self._image.shape[:2]
-        zone = int(1.3 * fr.height())
-        x1 = max(0,  fr.x() + fr.width())
-        x2 = min(iw, x1 + zone)
-        y1 = max(0,  fr.y())
-        y2 = min(ih, fr.y() + fr.height())
-        return QtCore.QRect(x1, y1, x2 - x1, y2 - y1)
-
-    def _mold_b_constraint_rect(self) -> QtCore.QRect | None:
-        """
-        Constraint zone for MOLD B (below frame centre).
-        Same size and X as MOLD A, Y mirrored around frame centre.
-        Y       : top = frame centre Y  (zone sits below centre)
-        """
-        fr = self._frame_rects[0]
-        if fr is None:
-            return None
-        ih, iw = self._image.shape[:2]
-        zone = int(1.3 * fr.height())
-        fcy  =  int(fr.y() + fr.height()/ 2.2)
-        x1 = max(0,  fr.x() + fr.width())
-        y1 = fcy                               # top = frame centre Y
-        y2 = min(ih, y1 + zone)
-        x2 = min(iw, x1 + zone)
-        return QtCore.QRect(x1, y1, x2 - x1, y2 - y1)
+        self._finish_frame()
 
     def _on_frame_cancel(self):
         self._clear_frame_overlays()
-        self._view.set_draw_mode(False)
         self._view.set_constraint_rect(None)
         self._mode        = None
         self._frame_rects = [None, None, None]
@@ -3862,7 +3951,6 @@ class MainWindow(QtWidgets.QWidget):
         self._panel.log("Frame template creation cancelled.", "#888888")
 
     def _finish_frame(self):
-        self._view.set_draw_mode(False)
         self._view.set_constraint_rect(None)
         self._mode = None
         if self._frame_panel:
@@ -3874,13 +3962,10 @@ class MainWindow(QtWidgets.QWidget):
         ok = self._ctrl.save_frame_recipe(
             self._image,
             self._frame_rects[0],
-            self._frame_rects[1],
-            self._frame_rects[1],   # mold B disabled — reuse mold A rect as placeholder
             grid_letters = letters,
         )
         if ok:
-            self._panel.log(
-                "Frame recipe saved (FRAME + MOLD A + MOLD B).", "#88ff88")
+            self._panel.log("Frame recipe saved (auto-derived from YOLO bbox).", "#88ff88")
             try:
                 recipe = self._ctrl.load_frame_recipe()
                 FrameRecipePreviewDialog(recipe, parent=self).exec_()
@@ -3965,38 +4050,8 @@ class MainWindow(QtWidgets.QWidget):
         self._mode    = None
 
     def _on_frame_roi(self, rect: QtCore.QRect):
-        x = max(0, rect.x())
-        y = max(0, rect.y())
-        w = min(rect.width(),  self._image.shape[1] - x)
-        h = min(rect.height(), self._image.shape[0] - y)
-        if w < 4 or h < 4:
-            return
-
-        clipped = QtCore.QRect(x, y, w, h)
-
-        # For mold steps (1 and 2): validate centre is within constraint zone
-        if self._frame_step > 0:
-            czone = self._mold_a_constraint_rect() if self._frame_step == 1 \
-                    else self._mold_b_constraint_rect()
-            if czone is not None:
-                cx = x + w // 2
-                cy = y + h // 2
-                if not czone.contains(cx, cy):
-                    self._panel.log(
-                        "Mold rect is outside the allowed zone (yellow border). "
-                        "Draw within the highlighted area.", "#ff4444")
-                    self._view.set_draw_mode(True)
-                    return
-
-        tag = self._FRAME_TAGS[self._frame_step]
-        self._view._overlays = [
-            ov for ov in self._view._overlays if ov[2] != tag]
-        self._view.add_overlay(clipped, QtGui.QColor(0, 224, 255), tag, "dash")
-
-        self._frame_rects[self._frame_step] = clipped
-        if self._frame_panel:
-            self._frame_panel.set_step(self._frame_step, can_confirm=True)
-        self._view.set_draw_mode(True)
+        # Frame mode is now YOLO-only; rubber-band draws in frame mode are ignored.
+        pass
 
     # ----------------------------------------------------------
     # Masking
