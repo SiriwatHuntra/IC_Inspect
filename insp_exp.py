@@ -2576,23 +2576,20 @@ class InspectionController:
 
             roi = image_bgr[ly1:ly2, lx1:lx2]
 
-            # ── Extract contours once — shared by OCR + defect check ─
+            # ── Extract contours once — reused by defect check ───────
             gray_slot = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) \
                         if roi.ndim == 3 else roi
             slot_contours, slot_canvas = self._eng._check_presence(gray_slot, mold_size)
-            ocr_char, ocr_conf = self._eng.ocr_identify(
-                slot_canvas, slot_contours, letter, self._ocr_templates)
 
-            # ── Empty slot: unexpected-mark check only ────────────────
+            # ── Empty slot: OCR + unexpected-mark check ───────────────
             if not letter:
-                # Guard rail: truly empty OR OCR unidentifiable → pass immediately.
-                # "?" covers: no contours, low confidence, and circular reflections
-                # that the gap check demotes to "?" (e.g. IC surface glare).
+                # OCR runs here for empty slots — needed for mark detection.
+                ocr_char, ocr_conf = self._eng.ocr_identify(
+                    slot_canvas, slot_contours, "", self._ocr_templates)
+
                 if not slot_contours or ocr_char == "?":
                     continue
 
-                # Something was identified — only fail if it looks like a real
-                # laser mark (thin strokes), not an IC surface reflection (blob).
                 if self._eng._is_laser_mark(slot_canvas):
                     results.append({
                         "frame_idx":   f_idx + 1,
@@ -2614,7 +2611,7 @@ class InspectionController:
                         "roi_canvas":  slot_canvas,
                     })
                     ResultAnnotator.draw_letter(display, results[-1])
-                continue  # no defect check on empty slots
+                continue
 
             # ── Letter slot: defect check ─────────────────────────────
             tmpl = self.cache.get(letter)
@@ -2624,8 +2621,6 @@ class InspectionController:
             exp_dx = dx
             exp_dy = dy
 
-            # Use mold_size stored at template save time — ensures kernel
-            # parameters match exactly between save and runtime.
             tmpl_mold_size = tmpl.get("mold_size", mold_size)
 
             t0 = time.perf_counter()
@@ -2661,6 +2656,20 @@ class InspectionController:
                         lx1, ly1, lx2, ly2 = rlx1, rly1, rlx2, rly2
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
+
+            # ── OCR on best canvas (after _check_holes cleanup) ───────
+            # compare_roi may return a cleaned canvas via res["roi_canvas"].
+            # Using it gives OCR the same input quality as the defect scorer.
+            ocr_canvas = res.get("roi_canvas")
+            if ocr_canvas is not None and np.any(ocr_canvas):
+                h_oc, w_oc = ocr_canvas.shape[:2]
+                ocr_cnts, _ = ContourTemplate._find_contours(
+                    ocr_canvas, h_oc, w_oc)
+            else:
+                ocr_canvas = slot_canvas
+                ocr_cnts   = slot_contours
+            ocr_char, ocr_conf = self._eng.ocr_identify(
+                ocr_canvas, ocr_cnts, letter, self._ocr_templates)
 
             results.append({
                 "frame_idx":   f_idx + 1,
