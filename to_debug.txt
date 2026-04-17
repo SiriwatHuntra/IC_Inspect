@@ -1,0 +1,51 @@
+IC Frame Laser-Mark Inspection — Debug Notes
+=============================================
+Created: 2026-04-16
+
+KNOWN ISSUES
+------------
+[ ] Shift detection: large shifts cause false-empty contour detection
+    - Root cause: contour search window does not expand when shift is large
+    - Proposed fix: expand ROI by shift_px before contour extraction
+
+[ ] Rotation detection: PCA approach planned on combined mold contours
+    - Not yet coded; per-letter rotation check is wrong (all letters rotate as one unit)
+
+[ ] _step1_find_frames multi-scale TM ~729ms bottleneck
+    - Proposed: fixed ROI crop or reduced scale range
+    - Acceptable for now if trigger rate is low
+
+[ ] Threshold tuning (lead presence gate = 20% at 128)
+    - Not validated on real production images yet
+
+PENDING VALIDATION
+------------------
+[ ] Canvas IoU weights (0.70 / 0.20 / 0.10) — needs real NG sample set
+[ ] SVM_CONF_FIRST=0.60 / SVM_CONF_RETRY=0.45 — placeholder, not trained yet
+[ ] Camera exposure range — CAMERA_EXPOSURE_US=8000µs baseline, may need tuning
+
+REMOVED / CLEANED UP
+--------------------
+[x] MockIOWorker — removed, was test-only
+[x] Export CSV button — replaced with auto-append RunWorker._append_csv()
+[x] grid_letters QLineEdit — replaced with 3x3 slot grid in RightPanel
+
+AUTO LOG FILES
+--------------
+  program_logs/program_YYYYMMDD.log  — TODO: wire Python logging (not yet done)
+  NG_log/NG_YYYYMMDD.csv             — TODO: wire NG-only CSV (not yet done)
+  run_log/result_YYYYMMDD.csv        — auto-appended per frame by RunWorker._append_csv()
+
+DEBUG PNG NAMING CONVENTION
+---------------------------
+  _0_gray              raw grayscale input
+  _1_thresh            after threshold / tophat+Otsu
+  _2_raw_contours      all contours before area filter
+  _3_filtered_contours after area filter
+  _4_canvas            final 64x64 comparison canvas
+
+NOTES
+-----
+- Save ↔ compare pipeline MUST match — any change to extraction logic requires full template re-save
+- CHAIN_APPROX_NONE is mandatory — TC89_KCOS collapses diagonal strokes (e.g. "7")
+- mold_size kernel (~150-160px) not font ROI (~40-50px) — do not mix
