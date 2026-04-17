@@ -11,6 +11,7 @@ templates/
 # Logs and run output
 run_log/
 program_logs/
+debug/
 NG_log/
 *.log
 *.csv
