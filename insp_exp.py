@@ -92,11 +92,6 @@ FONT_HOLE_AREA_TOLERANCE   = 0.30
 MARK_MAX_FILL_RATIO       = 0.65  # non_zero / bbox_area  — blobs fill > 65%
 MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 18%
 
-# ---- Grid localisation (3-tier: adaptive → recipe → heuristic) ----
-GRID_EXPAND_MARGIN = 0.12   # fraction of mold_size to expand full-mold crop for adaptive pass
-GRID_MIN_CNTS      = 2      # minimum contours to trust adaptive bbox
-GRID_FALLBACK_FRAC = 0.85   # last-resort: grid = mold × this
-
 # ---- HOG descriptor (shared: template load + runtime OCR) ----
 # win 64×64 → 7×7 block positions × 4 cells × 9 bins = 1764-dim vector
 _HOG_WIN  = (64, 64)
@@ -1255,39 +1250,6 @@ class InspectionEngine:
 
         return True
 
-    @staticmethod
-    def _detect_grid_origin(gray_expanded: np.ndarray,
-                            mold_size: int,
-                            mold_w: int,
-                            mold_h: int) -> tuple:
-        """
-        Run full-mold font detection on an already-expanded gray crop to find
-        the actual print-area bounding box.
-
-        Expansion ensures characters near mold edges are not clipped by the
-        _thresh_font border mask.
-
-        Returns (grid_cx, grid_cy, cell_w, cell_h) in crop-local pixel coords
-        where (grid_cx, grid_cy) is the centre of the 3x3 print area.
-        Returns None when fewer than GRID_MIN_CNTS contours pass area filter
-        or the combined bbox is too small to be trusted.
-        """
-        thresh = ContourTemplate._thresh_font(gray_expanded, mold_size)
-        clean  = ContourTemplate._morph_font(thresh, mold_size)
-        cnts, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_NONE)
-        cnts = [c for c in cnts if cv2.contourArea(c) > MIN_CONTOUR_AREA * 4]
-        if len(cnts) < GRID_MIN_CNTS:
-            return None
-        all_pts        = np.vstack(cnts)
-        bx, by, bw, bh = cv2.boundingRect(all_pts)
-        min_dim        = mold_size // 5
-        if bw < min_dim or bh < min_dim:
-            return None
-        cell_w = max(mold_size // 6, bw // 3)
-        cell_h = max(mold_size // 6, bh // 3)
-        return bx + bw // 2, by + bh // 2, cell_w, cell_h
-
     def _check_holes(self,
                     gray:             np.ndarray,
                     roi_outer:        np.ndarray,
@@ -1918,37 +1880,12 @@ class InspectionController:
             mold_b_sec = self._encode_section(
                 image_bgr, mold_rect, offset=mold_offset)
 
-            # ── Grid calibration: detect actual print-area bbox at save time ──
-            mold_size = min(mw, mh)
-            expand    = int(mold_size * GRID_EXPAND_MARGIN)
-            mx, my    = mold_rect.x(), mold_rect.y()
-            ex1 = max(0, mx - expand);  ey1 = max(0, my - expand)
-            ex2 = min(iw, mx + mw + expand); ey2 = min(ih, my + mh + expand)
-            src_gray  = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY) \
-                        if image_bgr.ndim == 3 else image_bgr
-            expanded  = src_gray[ey1:ey2, ex1:ex2]
-            grid_cal  = None
-            det = self._eng._detect_grid_origin(expanded, mold_size, mw, mh)
-            if det is not None:
-                gcx_crop, gcy_crop, pw, ph = det
-                # convert crop-local to mold-centre-relative offsets
-                grid_cal = {
-                    "origin_dx": int(ex1 + gcx_crop - mcx),
-                    "origin_dy": int(ey1 + gcy_crop - mcy),
-                    "pitch_x":   int(pw),
-                    "pitch_y":   int(ph),
-                }
-                print(f"[Recipe] grid_cal saved: {grid_cal}")
-            else:
-                print("[Recipe] grid_cal: adaptive detection failed — recipe will use heuristic fallback")
-
             recipe = {
-                "version":      6,
+                "version":      5,
                 "frame":        frame_sec,
                 "mold_a":       mold_a_sec,
                 "mold_b":       mold_b_sec,
                 "grid_letters": grid_letters,
-                "grid_cal":     grid_cal,
             }
             with open(self.RECIPE_FILE, "w") as f:
                 json.dump(recipe, f)
@@ -1973,7 +1910,6 @@ class InspectionController:
             "mold_a":       self._decode_section(raw["mold_a"]),
             "mold_b":       self._decode_section(raw["mold_b"]),
             "grid_letters": raw.get("grid_letters", [""] * 9),
-            "grid_cal":     raw.get("grid_cal", None),   # None on v5 recipes
         }
         return result
 
@@ -2119,9 +2055,7 @@ class InspectionController:
                     f_idx, area["label"], iw, ih,
                     mold_size = mold_size,
                     mold_w    = aw,
-                    mold_h    = ah,
-                    grid_cal  = area.get("grid_cal"),
-                    fscale    = area.get("fscale", 1.0))
+                    mold_h    = ah)
                 mold_ms = (time.perf_counter() - t0_mold) * 1000
 
                 # Tag each result with IC number
@@ -2197,7 +2131,6 @@ class InspectionController:
                 "contours":   mold["contours"],
                 "canvas":     mold["canvas"],
                 "grid":       recipe.get("grid_letters", []),
-                "grid_cal":   recipe.get("grid_cal", None),
             })
         return areas
 
@@ -2207,9 +2140,7 @@ class InspectionController:
                          iw, ih,
                          mold_size: int   = 150,
                          mold_w:    int   = 150,
-                         mold_h:    int   = 150,
-                         grid_cal:  dict  = None,
-                         fscale:    float = 1.0) -> list:
+                         mold_h:    int   = 150) -> list:
         results = []
 
         # ── Lead presence gate ───────────────────────────────────
@@ -2219,46 +2150,6 @@ class InspectionController:
         leads_present = self._eng._check_lead_presence(
             src_gray, acx, acy, mold_w, mold_h, iw, ih)
 
-        # ── 3-tier grid localisation ──────────────────────────────
-        # Tier 1: adaptive — full-mold contour pass on expanded crop.
-        #   Expand by GRID_EXPAND_MARGIN so characters near the mold rim
-        #   are not clipped by _thresh_font's border mask.
-        grid_cx = acx
-        grid_cy = acy
-        cell_w  = cell_h = None
-        tier    = "heuristic"
-
-        expand = int(mold_size * GRID_EXPAND_MARGIN)
-        ex1 = max(0,  acx - mold_w // 2 - expand)
-        ey1 = max(0,  acy - mold_h // 2 - expand)
-        ex2 = min(iw, acx + mold_w // 2 + expand)
-        ey2 = min(ih, acy + mold_h // 2 + expand)
-        expanded_gray = src_gray[ey1:ey2, ex1:ex2]
-
-        det = self._eng._detect_grid_origin(expanded_gray, mold_size, mold_w, mold_h)
-        if det is not None:
-            gcx_crop, gcy_crop, cell_w, cell_h = det
-            grid_cx = ex1 + gcx_crop
-            grid_cy = ey1 + gcy_crop
-            tier    = "adaptive"
-
-        # Tier 2: stored recipe calibration (scaled by fscale).
-        if cell_w is None and grid_cal is not None:
-            grid_cx = acx + int(grid_cal["origin_dx"] * fscale)
-            grid_cy = acy + int(grid_cal["origin_dy"] * fscale)
-            cell_w  = max(mold_size // 6, int(grid_cal["pitch_x"] * fscale))
-            cell_h  = max(mold_size // 6, int(grid_cal["pitch_y"] * fscale))
-            tier    = "recipe"
-
-        # Tier 3: heuristic fallback (original 85% rule).
-        if cell_w is None:
-            cell_w = int(mold_w * GRID_FALLBACK_FRAC / 3)
-            cell_h = int(mold_h * GRID_FALLBACK_FRAC / 3)
-            tier   = "heuristic"
-
-        roi_w = int(cell_w * 1.2)
-        roi_h = int(cell_h * 1.2)
-
         if not leads_present:
             # Work dropped — return pass results for all active slots
             for slot_idx, letter in enumerate(grid_letters):
@@ -2266,8 +2157,8 @@ class InspectionController:
                     continue
                 row = slot_idx // 3
                 col = slot_idx  % 3
-                dx  = (col - 1) * cell_w
-                dy  = (row - 1) * cell_h
+                dx  = (col - 1) * int(mold_w * 0.85 / 3)
+                dy  = (row - 1) * int(mold_h * 0.85 / 3)
                 results.append({
                     "frame_idx":   f_idx + 1,
                     "mold":        mold_label,
@@ -2279,8 +2170,8 @@ class InspectionController:
                     "shift_ratio": 0.0,
                     "defect_step": 0,
                     "reason":      "no_lead_skip",
-                    "cell_cx":     grid_cx + dx,
-                    "cell_cy":     grid_cy + dy,
+                    "cell_cx":     acx + dx,
+                    "cell_cy":     acy + dy,
                     "elapsed_ms":  0.0,
                     "lx1": 0, "ly1": 0, "lx2": 0, "ly2": 0,
                     "roi_canvas":  None,
@@ -2288,6 +2179,14 @@ class InspectionController:
             return results
 
         # ── Normal font inspection ────────────────────────────────
+        grid_w   = mold_w * 0.85
+        grid_h   = mold_h * 0.85
+        cell_w   = int(grid_w / 3)
+        cell_h   = int(grid_h / 3)
+
+        roi_w    = int(cell_w * 1.2)
+        roi_h    = int(cell_h * 1.2)
+
         for slot_idx, letter in enumerate(grid_letters):
             letter = letter.upper() if letter else ""
 
@@ -2297,8 +2196,8 @@ class InspectionController:
             dx = (col - 1) * cell_w
             dy = (row - 1) * cell_h
 
-            cell_cx = grid_cx + dx
-            cell_cy = grid_cy + dy
+            cell_cx = acx + dx
+            cell_cy = acy + dy
 
             half_w = roi_w // 2
             half_h = roi_h // 2
@@ -3573,10 +3472,10 @@ class RightPanel(QtWidgets.QWidget):
         self.spin_pin_score = self._bind_fspin("pin_score_threshold", fl_pin,
                                                "Min score")
         self.spin_max_matches = self._bind_ispin("max_matches", fl_pin,
-                                                 "IC/Frame")
+                                                 "Max frames")
         note_pin = QtWidgets.QLabel(
             "Min score: lower = more permissive detection.\n"
-            "IC/Frame: 6 for multi-frame machine, 1 for single.")
+            "Max frames: 6 for multi-frame machine, 1 for single.")
         note_pin.setStyleSheet("color:#888;font-size:9px")
         note_pin.setWordWrap(True)
         fl_pin.addRow("", note_pin)
