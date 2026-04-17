@@ -71,7 +71,7 @@ PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in resu
 PIN_IOU_THR     = 0.50   # NMS overlap threshold
 
 MIN_CONTOUR_AREA = 1
-IMAGE_SOURCE_DIR  = "image_source"
+IMAGE_SOURCE_DIR  = "image_source/"
 OUTPUT_DIR        = "Inspection_result"
 
 # Camera
@@ -85,6 +85,12 @@ FONT_SHIFT_RATIO_MAX       = 0.20
 FONT_ASPECT_TOLERANCE      = 0.25
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
+
+# ---- Reflection / False-mark Filter (empty slots only) ----
+# Laser marks are thin strokes; IC surface reflections are blobs.
+# Both checks must pass for a contour to be reported as unexpected mark.
+MARK_MAX_FILL_RATIO       = 0.65  # non_zero / bbox_area  — blobs fill > 65%
+MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 18%
 
 # ---- HOG descriptor (shared: template load + runtime OCR) ----
 # win 64×64 → 7×7 block positions × 4 cells × 9 bins = 1764-dim vector
@@ -122,6 +128,8 @@ def _compute_hog(canvas: np.ndarray) -> np.ndarray:
 OCR_CONF_EXPECTED  = 0.88   # fast path: return immediately if ≥ this
 OCR_EARLY_EXIT_IOC = 0.82   # skip secondary group if primary best ≥ this
 OCR_MIN_CONF       = 0.55   # below this → report "?" (unreadable)
+OCR_CONF_GAP_MIN   = 0.10   # best must exceed 2nd-best by this — filters circular reflections
+                             # that score similarly on "2","0","O","8" (small gap → "?")
 
 
 # =========================================================
@@ -477,41 +485,6 @@ class MachineIO:
                 pass
             
 # =========================================================
-# MOCK IO WORKER  — simulates external recipe signal
-# =========================================================
-class MockIOWorker(QtCore.QThread):
-    """
-    Simulates an external IO signal that delivers a grid_letters recipe.
-    In production this would read from a serial port, socket, or PLC.
-
-    Signals
-    -------
-    sig_recipe(list)  : emits list of 9 strings when a recipe is received
-    """
-    sig_recipe = QtCore.pyqtSignal(list)
-
-    # Hardcoded mock payload — replace with real IO read in production
-    MOCK_RECIPE = ["7", "8", "W", "6", "", "8", "H", "9", ""]
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._stop_flag = False
-
-    def stop(self):
-        self._stop_flag = True
-
-    def run(self):
-        """
-        Mock: wait 2 s then emit one recipe signal and exit.
-        Production: loop reading IO, emit on each new recipe received.
-        """
-        for _ in range(40):          # 40 × 50 ms = 2 s
-            if self._stop_flag:
-                return
-            self.msleep(50)
-        if not self._stop_flag:
-            self.sig_recipe.emit(list(self.MOCK_RECIPE))
-# =========================================================
 # DRAW HELPERS
 # =========================================================
 def cv2_draw_dashed_rect(img: np.ndarray, pt1: tuple, pt2: tuple,
@@ -588,6 +561,44 @@ class ContourTemplate:
         return binary
 
     @staticmethod
+    def _hysteresis(tophat:     np.ndarray,
+                    high_ratio: float = 0.60,
+                    low_ratio:  float = 0.25) -> np.ndarray:
+        """
+        Two-threshold hysteresis on the top-hat image.
+
+        Otsu is used to find a stable high anchor automatically — no manual
+        tuning required.  The low threshold extends downward from there.
+
+        high_val = otsu_val * high_ratio  →  definite stroke pixels
+        low_val  = otsu_val * low_ratio   →  candidate pixels
+
+        A candidate pixel is kept only if it belongs to a connected
+        component that contains at least one definite pixel.
+        Isolated dim noise (no strong neighbour) is discarded.
+
+        high_ratio : 0.60  — fraction of Otsu value for "definite" gate
+        low_ratio  : 0.25  — fraction of Otsu value for "candidate" gate
+        """
+        otsu_val, _ = cv2.threshold(
+            tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        high_val  = max(1, int(otsu_val * high_ratio))
+        low_val   = max(1, int(otsu_val * low_ratio))
+
+        definite  = (tophat >= high_val).astype(np.uint8) * 255
+        candidate = (tophat >= low_val ).astype(np.uint8) * 255
+
+        n, labels = cv2.connectedComponents(candidate, connectivity=8)
+
+        result = np.zeros_like(candidate)
+        for i in range(1, n):
+            comp = labels == i
+            if np.any(definite[comp]):
+                result[comp] = 255
+        return result
+
+    @staticmethod
     def _thresh_font(gray: np.ndarray, mold_size: int = 150) -> np.ndarray:
         # ── Step 1 : Noise filter ─────────────────────────────────
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -599,7 +610,7 @@ class ContourTemplate:
             cv2.MORPH_ELLIPSE, (k_size, k_size))
         tophat  = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, kernel)
 
-        # ── Step 3 : Otsu on top-hat result ──────────────────────
+        # ── Step 3 : Otsu threshold ───────────────────────────────
         _, binary = cv2.threshold(
             tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
@@ -631,10 +642,16 @@ class ContourTemplate:
 
     @staticmethod
     def _morph_font(binary: np.ndarray, mold_size: int = 150) -> np.ndarray:
-        k_size = max(2, mold_size // 50)            # ~3px at mold=150 — anchored to mold_size
-        out    = cv2.morphologyEx(                  # same anchor as _thresh_font → save/runtime match
-            binary, cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (k_size, k_size)))
+        # OPEN first  — kills isolated speck noise before stitching
+        # CLOSE after — bridges stroke gaps with a larger kernel
+        k_open  = max(2, mold_size // 40)           # ~4px at mold=150
+        k_close = max(3, mold_size // 20)           # ~7-8px at mold=150
+        out = cv2.morphologyEx(
+            binary, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (k_open,  k_open)))
+        out = cv2.morphologyEx(
+            out,    cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close)))
         return out
 
     # =========================================================
@@ -921,6 +938,100 @@ def _encode_canvas(canvas: np.ndarray) -> str:
 
 
 # =========================================================
+# B.  YOLOMoldDetector  — mold bbox detection via OpenVINO
+# =========================================================
+YOLO_MODEL_XML = "Mold_detector_openvino_model/Mold_detector.xml"
+
+class YOLOMoldDetector:
+    """
+    Wraps Mold_detector OpenVINO IR model (YOLO8, single class "IC").
+    detect_top_left() returns the top-left-most bbox as QRect.
+    Falls back gracefully if model file is missing or inference fails.
+    Output layout: [1, 5, 8400]  (cx, cy, w, h, conf) — no built-in NMS.
+    """
+    _INPUT_SIZE = 640
+
+    def __init__(self):
+        self._compiled = None
+        self._ready    = False
+        try:
+            import openvino as ov
+            if os.path.exists(YOLO_MODEL_XML):
+                core  = ov.Core()
+                model = core.read_model(YOLO_MODEL_XML)
+                self._compiled = core.compile_model(model, "CPU", {
+                    "INFERENCE_PRECISION_HINT": "f32",
+                    "PERFORMANCE_HINT":         "LATENCY",
+                })
+                self._ready = True
+                print(f"[YOLO] OpenVINO model loaded: {YOLO_MODEL_XML}")
+            else:
+                print(f"[YOLO] Model not found: {YOLO_MODEL_XML}")
+        except Exception as e:
+            print(f"[YOLO] Load failed: {e}")
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def detect_top_left(self, image_bgr: np.ndarray,
+                        conf_thr: float = 0.40):
+        """
+        Run inference and return the top-left-most detection as QRect.
+        Top-left-most = lowest (x1 + y1) sum.
+        Returns QRect on success, None if no detection or model not ready.
+        """
+        if not self._ready or self._compiled is None:
+            return None
+        try:
+            if image_bgr.ndim == 2:
+                image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
+            ih, iw = image_bgr.shape[:2]
+            sz = self._INPUT_SIZE
+
+            # letterbox resize to sz×sz
+            scale   = min(sz / iw, sz / ih)
+            nw, nh  = int(iw * scale), int(ih * scale)
+            resized = cv2.resize(image_bgr, (nw, nh))
+            canvas  = np.full((sz, sz, 3), 114, dtype=np.uint8)
+            pad_x   = (sz - nw) // 2
+            pad_y   = (sz - nh) // 2
+            canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+
+            blob = canvas[:, :, ::-1].astype(np.float32) / 255.0
+            blob = blob.transpose(2, 0, 1)[np.newaxis]      # [1,3,640,640]
+
+            result = self._compiled(blob)
+            preds  = result[0][0].T                          # [8400, 5]
+            mask   = preds[:, 4] >= conf_thr
+            preds  = preds[mask]
+            if len(preds) == 0:
+                return None
+
+            best       = None
+            best_score = float("inf")
+            for row in preds:
+                cx, cy, bw, bh = row[:4]
+                x1 = int((cx - bw / 2 - pad_x) / scale)
+                y1 = int((cy - bh / 2 - pad_y) / scale)
+                x2 = int((cx + bw / 2 - pad_x) / scale)
+                y2 = int((cy + bh / 2 - pad_y) / scale)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(iw, x2), min(ih, y2)
+                tl = x1 + y1
+                if tl < best_score:
+                    best_score = tl
+                    best = (x1, y1, x2 - x1, y2 - y1)
+
+            if best is None:
+                return None
+            from PyQt5 import QtCore
+            return QtCore.QRect(best[0], best[1], best[2], best[3])
+        except Exception as e:
+            print(f"[YOLO] Inference error: {e}")
+            return None
+
+
+# =========================================================
 # B.  InspectionEngine  — named check steps
 # =========================================================
 class InspectionEngine:
@@ -1006,34 +1117,24 @@ class InspectionEngine:
                             threshold: int = 128,
                             min_white_ratio: float = 0.20) -> bool:
         """
-        Check left and right of mold for lead frame presence.
-        Boxes are 1/3 mold width, full mold height, centred on mold edges.
+        Check the lead (frame) area to the left of the mold for IC presence.
+        Lead box: W/2 × H, centred at (acx - aw*3//4, acy) — matches
+        the frame template derived in save_frame_recipe.
 
         Returns True  → leads present, proceed to font inspection.
         Returns False → no leads (work dropped), skip with pass result.
         """
-        side_w  = aw // 3
-        half_sw = side_w // 2
-        mold_x1 = acx - aw // 2
-        mold_x2 = acx + aw // 2
-        mold_y1 = acy - ah // 2
-        mold_y2 = acy + ah // 2
-
-        def _white_ratio(x1, y1, x2, y2) -> float:
-            x1 = max(0, x1);  y1 = max(0, y1)
-            x2 = min(iw, x2); y2 = min(ih, y2)
-            if x2 <= x1 or y2 <= y1:
-                return 0.0
-            roi = image_gray[y1:y2, x1:x2]
-            white = np.count_nonzero(roi >= threshold)
-            return white / max(roi.size, 1)
-
-        left_ratio  = _white_ratio(mold_x1 - half_sw, mold_y1,
-                                mold_x1 + half_sw, mold_y2)
-        right_ratio = _white_ratio(mold_x2 - half_sw, mold_y1,
-                                mold_x2 + half_sw, mold_y2)
-
-        return (left_ratio >= min_white_ratio) or (right_ratio >= min_white_ratio)
+        fw   = aw // 2
+        fcx  = acx - aw * 3 // 4
+        x1   = max(0,  fcx - fw // 2)
+        y1   = max(0,  acy - ah // 2)
+        x2   = min(iw, fcx + fw // 2)
+        y2   = min(ih, acy + ah // 2)
+        if x2 <= x1 or y2 <= y1:
+            return False
+        roi   = image_gray[y1:y2, x1:x2]
+        white = np.count_nonzero(roi >= threshold)
+        return (white / max(roi.size, 1)) >= min_white_ratio
 
     @staticmethod
     def _check_similarity(canvas:      np.ndarray,
@@ -1104,6 +1205,50 @@ class InspectionEngine:
         if q_hog is None or tmpl_hog is None:
             return 0.0
         return float(np.clip(np.dot(q_hog, tmpl_hog), 0.0, 1.0))
+
+    @staticmethod
+    def _is_laser_mark(canvas: np.ndarray) -> bool:
+        """
+        Return True if canvas looks like a genuine thin-stroke laser mark.
+        Return False if it resembles an IC surface reflection (blob).
+
+        Used only for EMPTY slot unexpected-mark detection — prevents
+        medium-area specular reflections from being reported as marks.
+
+        Two checks (both must pass):
+          1. Fill ratio  — laser strokes fill < MARK_MAX_FILL_RATIO of bbox
+          2. Stroke thinness — max inscribed circle radius / slot size
+                               < MARK_MAX_THICKNESS_RATIO
+
+        A ring-shaped reflection passes check 1 (ring ≈ low fill) but
+        fails check 2 (ring wall is thicker than a laser stroke).
+        A solid blob fails check 1 immediately.
+        """
+        if canvas is None:
+            return False
+        white = int(cv2.countNonZero(canvas))
+        if white == 0:
+            return False
+
+        pts = cv2.findNonZero(canvas)
+        if pts is None:
+            return False
+        _, _, bw, bh = cv2.boundingRect(pts)
+        if bw == 0 or bh == 0:
+            return False
+
+        # Check 1: fill ratio
+        fill_ratio = white / max(bw * bh, 1)
+        if fill_ratio > MARK_MAX_FILL_RATIO:
+            return False
+
+        # Check 2: stroke thinness via distance transform
+        dist      = cv2.distanceTransform(canvas, cv2.DIST_L2, 3)
+        slot_size = float(max(canvas.shape[0], canvas.shape[1]))
+        if dist.max() / max(slot_size, 1.0) > MARK_MAX_THICKNESS_RATIO:
+            return False
+
+        return True
 
     def _check_holes(self,
                     gray:             np.ndarray,
@@ -1202,29 +1347,36 @@ class InspectionEngine:
 
         # ── Empty slot: no expected char — flat scan, no group ordering ──
         if not expected_char:
-            best_char = "?"
-            best_conf = 0.0
+            best_char   = "?"
+            best_conf   = 0.0
+            second_conf = 0.0
             for name, tmpl in all_templates.items():
                 score = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
                 if score > best_conf:
-                    best_conf = score
-                    best_char = name
+                    second_conf = best_conf
+                    best_conf   = score
+                    best_char   = name
+                elif score > second_conf:
+                    second_conf = score
             if best_conf < OCR_MIN_CONF:
                 return "?", round(best_conf, 4)
+            if best_conf - second_conf < OCR_CONF_GAP_MIN:
+                return "?", round(best_conf, 4)   # ambiguous — likely circular reflection
             return best_char, round(best_conf, 4)
 
-        # ── Stage 1: expected char first ─────────────────────────
+        # ── Stage 1: expected char fast path ─────────────────────
         exp_conf = 0.0
         exp_tmpl = all_templates.get(expected_char)
         if exp_tmpl is not None:
             exp_conf = InspectionEngine._hog_cosine(q_hog, exp_tmpl.get("hog_vec"))
 
         if exp_conf >= OCR_CONF_EXPECTED:
-            return expected_char, round(exp_conf, 4)
+            return expected_char, round(exp_conf, 4)   # very high confidence — bypass gap check
 
         # ── Stage 2: group search — seed with expected char result ─
-        best_char = expected_char if exp_conf >= OCR_MIN_CONF else "?"
-        best_conf = exp_conf
+        best_char   = expected_char if exp_conf >= OCR_MIN_CONF else "?"
+        best_conf   = exp_conf
+        second_conf = 0.0
 
         alpha_group   = {k: v for k, v in all_templates.items()
                          if k.isalpha() and k != expected_char}
@@ -1240,14 +1392,19 @@ class InspectionEngine:
             for name, tmpl in group.items():
                 score = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
                 if score > best_conf:
-                    best_conf = score
-                    best_char = name
+                    second_conf = best_conf
+                    best_conf   = score
+                    best_char   = name
+                elif score > second_conf:
+                    second_conf = score
 
             if best_conf >= OCR_EARLY_EXIT_IOC:
                 break   # confident enough — skip secondary group
 
         if best_conf < OCR_MIN_CONF:
             return "?", round(best_conf, 4)
+        if best_conf - second_conf < OCR_CONF_GAP_MIN:
+            return "?", round(best_conf, 4)   # ambiguous shape — likely reflection
 
         return best_char, round(best_conf, 4)
 
@@ -1642,7 +1799,8 @@ class InspectionController:
         self._eng   = InspectionEngine()
         self.cache:          dict[str, dict] = {}
         self.results:        list[dict]      = []
-        self._ocr_templates: dict[str, dict] = {}   # all saved templates for OCR
+        self._ocr_templates: dict[str, dict] = {}
+        self.yolo = YOLOMoldDetector()
 
     # ---- internal: encode one ROI section for the recipe ----
     @staticmethod
@@ -1680,34 +1838,50 @@ class InspectionController:
     # ---- frame recipe save ----
     def save_frame_recipe(self,
                           image_bgr:    np.ndarray,
-                          frame_rect:   QtCore.QRect,
-                          mold_a_rect:  QtCore.QRect,
-                          mold_b_rect:  QtCore.QRect,
+                          mold_rect:    QtCore.QRect,
                           grid_letters: list) -> bool:
         """
-        Extract contours for all three regions and write pin_recipe.json.
-        Slot positions are auto-computed from mold canvas size at inspect time.
-        grid_letters : list of exactly 9 strings (empty = skip), row-major
-                       in camera space (IC is 90° CCW from upright).
+        Derive frame (lead) rect from YOLO mold bbox and write pin_recipe.json.
+
+        Frame box geometry (derived from mold W × H):
+          size   : (W//2) × H
+          centre : (mcx - W*3//4, mcy)   — sits over leads to the left
+
+        Lead presence box = same area as frame box (leads ARE the frame).
+
+        grid_letters : list of exactly 9 strings (empty = skip), row-major.
         Returns True on success.
         """
         try:
-            fcx = frame_rect.x() + frame_rect.width()  // 2
-            fcy = frame_rect.y() + frame_rect.height() // 2
+            ih, iw = image_bgr.shape[:2]
+            mw  = mold_rect.width()
+            mh  = mold_rect.height()
+            mcx = mold_rect.x() + mw // 2
+            mcy = mold_rect.y() + mh // 2
 
-            def _mold_offset(r: QtCore.QRect) -> tuple:
-                mcx = r.x() + r.width()  // 2
-                mcy = r.y() + r.height() // 2
-                return (mcx - fcx, mcy - fcy)
+            # derive frame rect (left lead area)
+            fw  = mw // 2
+            fh  = mh
+            fcx = mcx - mw * 3 // 4
+            fcy = mcy
+            fx  = max(0, fcx - fw // 2)
+            fy  = max(0, fcy - fh // 2)
+            fw  = min(fw, iw - fx)
+            fh  = min(fh, ih - fy)
+            frame_rect = QtCore.QRect(fx, fy, fw, fh)
+
+            # mold offset relative to frame centre
+            mold_offset = (mcx - fcx, mcy - fcy)
 
             frame_sec  = self._encode_section(image_bgr, frame_rect)
             mold_a_sec = self._encode_section(
-                image_bgr, mold_a_rect, offset=_mold_offset(mold_a_rect))
+                image_bgr, mold_rect, offset=mold_offset)
+            # mold_b reuses mold_a (single-mold setup)
             mold_b_sec = self._encode_section(
-                image_bgr, mold_b_rect, offset=_mold_offset(mold_b_rect))
+                image_bgr, mold_rect, offset=mold_offset)
 
             recipe = {
-                "version":      4,
+                "version":      5,
                 "frame":        frame_sec,
                 "mold_a":       mold_a_sec,
                 "mold_b":       mold_b_sec,
@@ -2047,7 +2221,15 @@ class InspectionController:
 
             # ── Empty slot: unexpected-mark check only ────────────────
             if not letter:
-                if ocr_char != "?":
+                # Guard rail: truly empty OR OCR unidentifiable → pass immediately.
+                # "?" covers: no contours, low confidence, and circular reflections
+                # that the gap check demotes to "?" (e.g. IC surface glare).
+                if not slot_contours or ocr_char == "?":
+                    continue
+
+                # Something was identified — only fail if it looks like a real
+                # laser mark (thin strokes), not an IC surface reflection (blob).
+                if self._eng._is_laser_mark(slot_canvas):
                     results.append({
                         "frame_idx":   f_idx + 1,
                         "mold":        mold_label,
@@ -2206,6 +2388,41 @@ class RunWorker(QtCore.QThread):
         cv2.imwrite(ann_path, display_bgr)
         self._log(f"  NG saved: {ts}_R.png + {ts}.png", "#ffaa44")
 
+    def _append_csv(self, ic_groups: dict, image_name: str):
+        """
+        Auto-append one row per IC result to run_log/result_YYYYMMDD.csv.
+        Skips no-lead molds. Writes header on first entry of the day.
+        """
+        os.makedirs("run_log", exist_ok=True)
+        path = os.path.join("run_log", f"result_{datetime.now():%Y%m%d}.csv")
+        write_header = not os.path.exists(path)
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        try:
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if write_header:
+                    w.writerow(["timestamp", "image", "ic_num", "frame",
+                                "mold", "verdict", "ocr_string",
+                                "fail_causes", "elapsed_ms"])
+                for ic_num in sorted(ic_groups.keys()):
+                    group = ic_groups[ic_num]
+                    if all(r.get("reason") == "no_lead_skip" for r in group):
+                        continue
+                    r0      = group[0]
+                    passed  = all(r["pass"] for r in group)
+                    ocr_map = {r["slot"]: r.get("ocr_char", " ") for r in group}
+                    ocr_str = "".join(ocr_map.get(i, " ") for i in range(9))
+                    causes  = ";".join(
+                        f"slot{r['slot']}({r['letter']}):{r['reason']}"
+                        for r in group if not r["pass"])
+                    mold_ms = sum(r.get("elapsed_ms", 0.0) for r in group)
+                    w.writerow([ts, image_name, ic_num,
+                                r0.get("frame_idx", ""), r0.get("mold", ""),
+                                "PASS" if passed else "NG",
+                                ocr_str, causes, f"{mold_ms:.1f}"])
+        except Exception as e:
+            self._log(f"  CSV write error: {e}", "#ff4444")
+
     # ---- debug (folder) mode ----
     def _run_debug(self):
         files = self._image_io.list_images(IMAGE_SOURCE_DIR)
@@ -2300,6 +2517,7 @@ class RunWorker(QtCore.QThread):
             if not all_pass:
                 self._save_fail(img, result.display)
 
+            self._append_csv(ic_groups, fname)
             self._io.on_frame_result(result.passed, result.total)
             total_passed  += result.passed
             total_letters += result.total
@@ -2396,6 +2614,8 @@ class RunWorker(QtCore.QThread):
             if not all_pass:
                 self._save_fail(img, result.display)
 
+            ts_label = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._append_csv(ic_groups, f"cam_{ts_label}")
             self._io.on_frame_result(result.passed, result.total)
             total_passed  += result.passed
             total_letters += result.total
@@ -3118,23 +3338,13 @@ class SetupPreviewDialog(QtWidgets.QDialog):
 # =========================================================
 class FrameTemplatePanel(QtWidgets.QWidget):
     """
-    Floating always-on-top panel — guides through 3 sequential steps.
+    Floating always-on-top panel — single-step YOLO mold detection confirm.
 
-    Step 0 — FRAME  : rubber-band draw
-    Step 1 — MOLD A : rubber-band draw (constrained near frame)
-    Step 2 — MOLD B : rubber-band draw (constrained near frame)
+    Shows detected mold bbox overlay; user clicks Confirm to save or
+    Retry to re-run detection.  Cancel aborts.
     """
 
-    _STEP_LABELS = [
-        ("Step 1 / 2  —  FRAME",
-         "Draw the lead frame region on the image."),
-        ("Step 2 / 2  —  MOLD A Position",
-         "Draw Mold A region on the image.\nMust be within the highlighted zone."),
-        # ("Step 3 / 3  —  MOLD B Position",  — mold B disabled for single-mold test
-        #  "Draw Mold B region on the image.\nMust be within the highlighted zone."),
-    ]
-
-    def __init__(self, on_confirm, on_cancel, parent=None):
+    def __init__(self, on_confirm, on_retry, on_cancel, parent=None):
         super().__init__(
             parent,
             QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint |
@@ -3145,37 +3355,37 @@ class FrameTemplatePanel(QtWidgets.QWidget):
         self.setFixedWidth(340)
 
         self._on_confirm = on_confirm
+        self._on_retry   = on_retry
         self._on_cancel  = on_cancel
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setSpacing(10)
         lay.setContentsMargins(14, 14, 14, 14)
 
-        self._lbl_title = QtWidgets.QLabel()
+        self._lbl_title = QtWidgets.QLabel("Auto Mold Detection")
         self._lbl_title.setStyleSheet(
             "font-size:13px;font-weight:bold;color:#00e5ff")
         self._lbl_title.setAlignment(QtCore.Qt.AlignCenter)
         lay.addWidget(self._lbl_title)
 
-        self._lbl_inst = QtWidgets.QLabel()
-        self._lbl_inst.setStyleSheet("color:#cccccc;font-size:11px")
-        self._lbl_inst.setAlignment(QtCore.Qt.AlignCenter)
-        self._lbl_inst.setWordWrap(True)
-        lay.addWidget(self._lbl_inst)
-
-        self._lbl_status = QtWidgets.QLabel("Draw a rectangle on the image.")
-        self._lbl_status.setStyleSheet("color:#888888;font-size:10px")
+        self._lbl_status = QtWidgets.QLabel("Detecting…")
+        self._lbl_status.setStyleSheet("color:#cccccc;font-size:11px")
         self._lbl_status.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl_status.setWordWrap(True)
         lay.addWidget(self._lbl_status)
 
         lay.addSpacing(4)
 
         btn_row = QtWidgets.QHBoxLayout()
-        self._btn_confirm = QtWidgets.QPushButton("Confirm")
+        self._btn_confirm = QtWidgets.QPushButton("Save Template")
+        self._btn_retry   = QtWidgets.QPushButton("Retry")
         self._btn_cancel  = QtWidgets.QPushButton("Cancel")
 
         self._btn_confirm.setStyleSheet(
             "background:#005f6b;color:#fff;font-weight:bold;"
+            "padding:6px 14px;border-radius:4px")
+        self._btn_retry.setStyleSheet(
+            "background:#4a3a00;color:#fff;font-weight:bold;"
             "padding:6px 14px;border-radius:4px")
         self._btn_cancel.setStyleSheet(
             "background:#4a1a1a;color:#fff;font-weight:bold;"
@@ -3183,31 +3393,40 @@ class FrameTemplatePanel(QtWidgets.QWidget):
 
         self._btn_confirm.setEnabled(False)
         self._btn_confirm.clicked.connect(self._on_confirm)
+        self._btn_retry.clicked.connect(self._on_retry)
         self._btn_cancel.clicked.connect(self._on_cancel)
 
         btn_row.addStretch()
         btn_row.addWidget(self._btn_confirm)
+        btn_row.addWidget(self._btn_retry)
         btn_row.addWidget(self._btn_cancel)
         btn_row.addStretch()
         lay.addLayout(btn_row)
 
         self.adjustSize()
-        self.set_step(0, can_confirm=False)
 
-    def set_step(self, step: int, can_confirm: bool):
-        title, inst = self._STEP_LABELS[step]
-        self._lbl_title.setText(title)
-        self._lbl_inst.setText(inst)
+    def set_detected(self, rect_str: str):
+        """Call after successful detection with a bbox description string."""
+        self._lbl_status.setText(
+            f"Mold detected:\n{rect_str}\n\nFrame (lead) box auto-derived.")
+        self._lbl_status.setStyleSheet("color:#88ff88;font-size:11px")
+        self._btn_confirm.setEnabled(True)
 
-        if can_confirm:
-            self._lbl_status.setText("Rect drawn.  Click Confirm to proceed.")
-            self._lbl_status.setStyleSheet("color:#00e5ff;font-size:10px")
-        else:
-            self._lbl_status.setText("Draw a rectangle on the image.")
-            self._lbl_status.setStyleSheet("color:#888888;font-size:10px")
+    def set_no_detection(self):
+        """Call when YOLO finds nothing."""
+        self._lbl_status.setText(
+            "No mold detected.\nCheck image or model file,\nthen click Retry.")
+        self._lbl_status.setStyleSheet("color:#ffaa44;font-size:11px")
+        self._btn_confirm.setEnabled(False)
 
-        self._btn_confirm.setEnabled(can_confirm)
-        self._btn_confirm.setText("Finish" if step == 1 else "Confirm")  # step 2→1 (mold B disabled)
+    def set_no_model(self):
+        """Call when YOLO model is not available."""
+        self._lbl_status.setText(
+            "YOLO model not ready.\n"
+            f"Place {YOLO_MODEL_PATH} in the project folder.")
+        self._lbl_status.setStyleSheet("color:#ff4444;font-size:11px")
+        self._btn_confirm.setEnabled(False)
+        self._btn_retry.setEnabled(False)
 
     def closeEvent(self, e):
         self._on_cancel()
@@ -3274,33 +3493,58 @@ class RightPanel(QtWidgets.QWidget):
         fl_font.addRow("", note_font)
         lay.addWidget(gb_font)
 
-        # ── Grid Letters ──────────────────────────────────────
-        gb_gl = QtWidgets.QGroupBox("Grid Letters  (9 slots, comma-separated)")
-        fl_gl = QtWidgets.QVBoxLayout(gb_gl)
+        # ── Grid Letters — 3×3 slot grid ─────────────────────
+        gb_gl = QtWidgets.QGroupBox("Expected Slot Letters")
+        vl_gl = QtWidgets.QVBoxLayout(gb_gl)
         hint3 = QtWidgets.QLabel(
-            "Slots:  [1,2,3] / [4,5,6] / [7,8,9]   empty = skip")
+            "Fill each cell with the expected mark  (empty = skip)")
         hint3.setStyleSheet("color:#888;font-size:9px")
-        fl_gl.addWidget(hint3)
-        self.grid_letters_edit = QtWidgets.QLineEdit(
-            self._sm.get_str("grid_letters"))
-        self.grid_letters_edit.setFont(QtGui.QFont("Courier New", 9))
-        self.grid_letters_edit.setPlaceholderText(
-            "e.g.  A,B,C,,E,,G,,   (9 comma-sep, empty=skip)")
-        self.grid_letters_edit.textChanged.connect(self._on_grid_letters_changed)
-        fl_gl.addWidget(self.grid_letters_edit)
+        vl_gl.addWidget(hint3)
+
+        # Row-index labels + grid cells
+        grid_container = QtWidgets.QWidget()
+        grid_lay = QtWidgets.QGridLayout(grid_container)
+        grid_lay.setSpacing(4)
+        grid_lay.setContentsMargins(2, 2, 2, 2)
+
+        # Column headers
+        for col, lbl in enumerate(["Col 1", "Col 2", "Col 3"]):
+            hdr = QtWidgets.QLabel(lbl)
+            hdr.setAlignment(QtCore.Qt.AlignCenter)
+            hdr.setStyleSheet("color:#888;font-size:8px")
+            grid_lay.addWidget(hdr, 0, col + 1)
+
+        self._slot_cells: list = []
+        saved_parts = self._sm.get_str("grid_letters").split(",")
+        while len(saved_parts) < 9:
+            saved_parts.append("")
+
+        for row in range(3):
+            # Row label
+            row_lbl = QtWidgets.QLabel(f"Row {row+1}")
+            row_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            row_lbl.setStyleSheet("color:#888;font-size:8px")
+            grid_lay.addWidget(row_lbl, row + 1, 0)
+
+            for col in range(3):
+                slot_idx = row * 3 + col
+                cell = QtWidgets.QLineEdit()
+                cell.setMaxLength(3)
+                cell.setFixedSize(54, 28)
+                cell.setAlignment(QtCore.Qt.AlignCenter)
+                cell.setFont(QtGui.QFont("Courier New", 10))
+                cell.setToolTip(f"Slot {slot_idx + 1}  (row {row+1}, col {col+1})")
+                val = saved_parts[slot_idx].strip()
+                cell.setText(val)
+                cell.textChanged.connect(self._on_grid_cell_changed)
+                grid_lay.addWidget(cell, row + 1, col + 1)
+                self._slot_cells.append(cell)
+
+        vl_gl.addWidget(grid_container)
         self._io_recipe_lbl = QtWidgets.QLabel("IO recipe: —")
         self._io_recipe_lbl.setStyleSheet("color:#888;font-size:9px")
-        fl_gl.addWidget(self._io_recipe_lbl)
+        vl_gl.addWidget(self._io_recipe_lbl)
         lay.addWidget(gb_gl)
-
-        # ── Frame Recipe Info ─────────────────────────────────
-        gb_ri = QtWidgets.QGroupBox("Frame Recipe")
-        fl_ri = QtWidgets.QVBoxLayout(gb_ri)
-        self._recipe_lbl = QtWidgets.QLabel("No recipe on disk.")
-        self._recipe_lbl.setStyleSheet("color:#888;font-size:9px")
-        self._recipe_lbl.setWordWrap(True)
-        fl_ri.addWidget(self._recipe_lbl)
-        lay.addWidget(gb_ri)
 
         # ── Camera ────────────────────────────────────────────
         gb_cam = QtWidgets.QGroupBox("Camera")
@@ -3406,9 +3650,14 @@ class RightPanel(QtWidgets.QWidget):
             spin.setValue(sm.get(key))
             spin.blockSignals(False)
 
-        self.grid_letters_edit.blockSignals(True)
-        self.grid_letters_edit.setText(sm.get_str("grid_letters"))
-        self.grid_letters_edit.blockSignals(False)
+        parts = sm.get_str("grid_letters").split(",")
+        while len(parts) < 9:
+            parts.append("")
+        for i, cell in enumerate(self._slot_cells):
+            cell.blockSignals(True)
+            val = parts[i].strip()
+            cell.setText(val)
+            cell.blockSignals(False)
 
     def pin_search_params(self) -> dict:
         sm = self._sm
@@ -3424,37 +3673,12 @@ class RightPanel(QtWidgets.QWidget):
         """
         return ct.list_templates()
 
-    def refresh_recipe_info(self, recipe: dict | None):
-        """
-        Update the Frame Recipe read-only display.
-        Pass None to show 'No recipe on disk.'
-        """
-        if recipe is None:
-            self._recipe_lbl.setText("No recipe on disk.")
-            self._recipe_lbl.setStyleSheet("color:#888;font-size:9px")
-            return
-
-        def _sec_info(sec: dict, label: str) -> str:
-            x, y, w, h = sec.get("contour", [0, 0, 0, 0])
-            off = sec.get("offset")
-            if off:
-                return (f"{label}: {w}x{h} px  "
-                        f"offset ({off[0]:+d}, {off[1]:+d})")
-            return f"{label}: {w}x{h} px  at ({x},{y})"
-
-        lines = [
-            _sec_info(recipe["frame"],  "FRAME"),
-            _sec_info(recipe["mold_a"], "MOLD A"),
-            _sec_info(recipe["mold_b"], "MOLD B"),
-        ]
-        self._recipe_lbl.setText("\n".join(lines))
-        self._recipe_lbl.setStyleSheet("color:#aaddff;font-size:9px")
-
-    def _on_grid_letters_changed(self, text: str):
-        self._sm.set_str("grid_letters", text)
+    def _on_grid_cell_changed(self):
+        letters = self.grid_letters()
+        self._sm.set_str("grid_letters", ",".join(letters))
         self._sm.save()
         if self._grid_changed_cb:
-            self._grid_changed_cb(self.grid_letters())
+            self._grid_changed_cb(letters)
         
     def set_io_recipe_label(self, letters: list):
         """Update the IO recipe status label."""
@@ -3467,17 +3691,24 @@ class RightPanel(QtWidgets.QWidget):
         self._grid_changed_cb = cb
 
     def grid_letters(self) -> list:
-        """
-        Parse grid_letters field.
-        Returns list of exactly 9 strings. Empty string = skip.
-        """
-        raw   = self.grid_letters_edit.text()
-        parts = raw.split(",")
-        # Pad or trim to exactly 9
-        parts = parts[:9]
+        """Returns list of exactly 9 strings. Empty string = skip."""
+        result = []
+        for c in self._slot_cells:
+            v = c.text().strip().upper()
+            result.append("" if v == "" else v)
+        return result
+
+    def set_slot_cells(self, letters: list):
+        """Populate all 9 slot cells from an external list (e.g. IO recipe)."""
+        parts = list(letters)
         while len(parts) < 9:
             parts.append("")
-        return [p.strip().upper() for p in parts]
+        for i, cell in enumerate(self._slot_cells):
+            cell.blockSignals(True)
+            val = parts[i].strip().upper()
+            cell.setText(val)
+            cell.blockSignals(False)
+        self._on_grid_cell_changed()
 
 
 # =========================================================
@@ -3498,7 +3729,6 @@ class MainWindow(QtWidgets.QWidget):
         self._sm    = SettingsManager(SETTINGS_FILE)
         self._grid_changed_cb = None
         self._ctrl  = InspectionController(self._sm)
-        self._mock_io_worker: MockIOWorker | None = None
         self._current_grid: list = []
         self._io_recipe:    list = []        # last recipe received from IO
         self._run_from_io:  bool = False     # True = run triggered by MachineIO
@@ -3507,11 +3737,9 @@ class MainWindow(QtWidgets.QWidget):
         self._mode    = None   # "frame" | "font" | "mask" | None
         self._pending = None   # pending font template name
 
-        # Frame template creation — 3-step state
-        self._frame_step:  int              = 0
+        # Frame template creation state
         self._frame_rects: list             = [None, None, None]
         self._frame_panel: FrameTemplatePanel | None = None
-        # Overlay tag keys for each step so re-draw replaces the right box
         self._FRAME_TAGS = ["FRAME", "MOLD_A", "MOLD_B"]
 
         # Mask work-in-progress
@@ -3547,11 +3775,6 @@ class MainWindow(QtWidgets.QWidget):
 
         if self._ctrl.has_frame_recipe():
             self._panel.log("Frame recipe found on disk.", "#aaddff")
-            try:
-                self._panel.refresh_recipe_info(
-                    self._ctrl.load_frame_recipe())
-            except Exception:
-                pass
 
     # ----------------------------------------------------------
     def _build_ui(self):
@@ -3612,8 +3835,6 @@ class MainWindow(QtWidgets.QWidget):
         btn("⚙ Load Settings",  self._load_settings, "#555500")
         btn("Save Settings",  self._save_settings, "#555500")
         sep()
-        btn("Export CSV", self._export_csv)
-        btn("Mock IO Recipe", self._trigger_mock_io, "#334455")
         bar.addStretch()
         return bar
 
@@ -3639,7 +3860,7 @@ class MainWindow(QtWidgets.QWidget):
 
         
     # ----------------------------------------------------------
-    # Frame template creation — 3-step sequence
+    # Frame template creation — YOLO auto-detect single step
     # ----------------------------------------------------------
     def _start_frame(self):
         if self._image is None:
@@ -3656,13 +3877,13 @@ class MainWindow(QtWidgets.QWidget):
                 "Example:  ,9,H,B,,6,W,8,7")
             return
 
-        self._frame_step  = 0
         self._frame_rects = [None, None, None]
         self._mode        = "frame"
         self._clear_frame_overlays()
 
         self._frame_panel = FrameTemplatePanel(
             on_confirm = self._on_frame_confirm,
+            on_retry   = self._on_frame_retry,
             on_cancel  = self._on_frame_cancel,
             parent     = self,
         )
@@ -3671,65 +3892,56 @@ class MainWindow(QtWidgets.QWidget):
         self._frame_panel.move(geo.right() - pw - 20, geo.top() + 60)
         self._frame_panel.show()
 
-        self._view.set_draw_mode(True)
-        self._view.set_constraint_rect(None)
-        self._panel.log("Frame template — Step 1/2: Draw FRAME rect.", "#00e5ff")
+        self._panel.log("Auto-detecting mold…", "#00e5ff")
+        self._run_yolo_detection()
+
+    def _run_yolo_detection(self):
+        """Run YOLO on current image; update panel and overlay."""
+        if not self._ctrl.yolo.is_ready():
+            self._frame_panel.set_no_model()
+            self._panel.log(
+                f"YOLO model not ready — place {YOLO_MODEL_PATH} in project folder.",
+                "#ff4444")
+            return
+
+        mold_rect = self._ctrl.yolo.detect_top_left(self._image)
+        self._clear_frame_overlays()
+
+        if mold_rect is None:
+            self._frame_rects[0] = None
+            self._frame_panel.set_no_detection()
+            self._panel.log("YOLO: no mold detected.", "#ffaa44")
+            return
+
+        self._frame_rects[0] = mold_rect
+
+        # draw mold bbox overlay (cyan)
+        self._view.add_overlay(mold_rect, QtGui.QColor(0, 224, 255), "MOLD_A", "dash")
+
+        # draw derived frame (lead) box overlay (yellow)
+        mw, mh = mold_rect.width(), mold_rect.height()
+        mcx = mold_rect.x() + mw // 2
+        mcy = mold_rect.y() + mh // 2
+        fw  = mw // 2
+        fcx = mcx - mw * 3 // 4
+        frame_rect = QtCore.QRect(fcx - fw // 2, mcy - mh // 2, fw, mh)
+        self._view.add_overlay(frame_rect, QtGui.QColor(255, 220, 0), "FRAME", "dash")
+
+        desc = f"x={mold_rect.x()}, y={mold_rect.y()}, {mw}×{mh} px"
+        self._frame_panel.set_detected(desc)
+        self._panel.log(f"YOLO: mold detected — {desc}", "#88ff88")
+
+    def _on_frame_retry(self):
+        self._panel.log("Retrying detection…", "#00e5ff")
+        self._run_yolo_detection()
 
     def _on_frame_confirm(self):
-        if self._frame_rects[self._frame_step] is None:
+        if self._frame_rects[0] is None:
             return
-        if self._frame_step < 1:  # < 2 — mold B step disabled for single-mold test
-            self._frame_step += 1
-            self._frame_panel.set_step(self._frame_step, can_confirm=False)
-            self._view.set_draw_mode(True)
-            self._view.set_constraint_rect(self._mold_a_constraint_rect())
-            # else: self._view.set_constraint_rect(self._mold_b_constraint_rect())  — mold B disabled
-            step_name = self._FRAME_TAGS[self._frame_step]
-            self._panel.log(
-                f"Frame template — Step {self._frame_step+1}/2:"
-                f" Draw {step_name} rect (within yellow zone).", "#00e5ff")
-        else:
-            self._finish_frame()
-
-    def _mold_a_constraint_rect(self) -> QtCore.QRect | None:
-        """
-        Constraint zone for MOLD A — single mold per frame.
-        Width   : 1.3 * frame_height
-        X       : left = frame right edge
-        Y       : same height and Y position as the frame template
-        """
-        fr = self._frame_rects[0]
-        if fr is None:
-            return None
-        ih, iw = self._image.shape[:2]
-        zone = int(1.3 * fr.height())
-        x1 = max(0,  fr.x() + fr.width())
-        x2 = min(iw, x1 + zone)
-        y1 = max(0,  fr.y())
-        y2 = min(ih, fr.y() + fr.height())
-        return QtCore.QRect(x1, y1, x2 - x1, y2 - y1)
-
-    def _mold_b_constraint_rect(self) -> QtCore.QRect | None:
-        """
-        Constraint zone for MOLD B (below frame centre).
-        Same size and X as MOLD A, Y mirrored around frame centre.
-        Y       : top = frame centre Y  (zone sits below centre)
-        """
-        fr = self._frame_rects[0]
-        if fr is None:
-            return None
-        ih, iw = self._image.shape[:2]
-        zone = int(1.3 * fr.height())
-        fcy  =  int(fr.y() + fr.height()/ 2.2)
-        x1 = max(0,  fr.x() + fr.width())
-        y1 = fcy                               # top = frame centre Y
-        y2 = min(ih, y1 + zone)
-        x2 = min(iw, x1 + zone)
-        return QtCore.QRect(x1, y1, x2 - x1, y2 - y1)
+        self._finish_frame()
 
     def _on_frame_cancel(self):
         self._clear_frame_overlays()
-        self._view.set_draw_mode(False)
         self._view.set_constraint_rect(None)
         self._mode        = None
         self._frame_rects = [None, None, None]
@@ -3739,7 +3951,6 @@ class MainWindow(QtWidgets.QWidget):
         self._panel.log("Frame template creation cancelled.", "#888888")
 
     def _finish_frame(self):
-        self._view.set_draw_mode(False)
         self._view.set_constraint_rect(None)
         self._mode = None
         if self._frame_panel:
@@ -3751,16 +3962,12 @@ class MainWindow(QtWidgets.QWidget):
         ok = self._ctrl.save_frame_recipe(
             self._image,
             self._frame_rects[0],
-            self._frame_rects[1],
-            self._frame_rects[1],   # mold B disabled — reuse mold A rect as placeholder
             grid_letters = letters,
         )
         if ok:
-            self._panel.log(
-                "Frame recipe saved (FRAME + MOLD A + MOLD B).", "#88ff88")
+            self._panel.log("Frame recipe saved (auto-derived from YOLO bbox).", "#88ff88")
             try:
                 recipe = self._ctrl.load_frame_recipe()
-                self._panel.refresh_recipe_info(recipe)
                 FrameRecipePreviewDialog(recipe, parent=self).exec_()
             except Exception:
                 pass
@@ -3843,38 +4050,8 @@ class MainWindow(QtWidgets.QWidget):
         self._mode    = None
 
     def _on_frame_roi(self, rect: QtCore.QRect):
-        x = max(0, rect.x())
-        y = max(0, rect.y())
-        w = min(rect.width(),  self._image.shape[1] - x)
-        h = min(rect.height(), self._image.shape[0] - y)
-        if w < 4 or h < 4:
-            return
-
-        clipped = QtCore.QRect(x, y, w, h)
-
-        # For mold steps (1 and 2): validate centre is within constraint zone
-        if self._frame_step > 0:
-            czone = self._mold_a_constraint_rect() if self._frame_step == 1 \
-                    else self._mold_b_constraint_rect()
-            if czone is not None:
-                cx = x + w // 2
-                cy = y + h // 2
-                if not czone.contains(cx, cy):
-                    self._panel.log(
-                        "Mold rect is outside the allowed zone (yellow border). "
-                        "Draw within the highlighted area.", "#ff4444")
-                    self._view.set_draw_mode(True)
-                    return
-
-        tag = self._FRAME_TAGS[self._frame_step]
-        self._view._overlays = [
-            ov for ov in self._view._overlays if ov[2] != tag]
-        self._view.add_overlay(clipped, QtGui.QColor(0, 224, 255), tag, "dash")
-
-        self._frame_rects[self._frame_step] = clipped
-        if self._frame_panel:
-            self._frame_panel.set_step(self._frame_step, can_confirm=True)
-        self._view.set_draw_mode(True)
+        # Frame mode is now YOLO-only; rubber-band draws in frame mode are ignored.
+        pass
 
     # ----------------------------------------------------------
     # Masking
@@ -4099,21 +4276,11 @@ class MainWindow(QtWidgets.QWidget):
         except Exception as e:
             self._panel.log(f"Grid update error: {e}", "#ff4444")
 
-    def _trigger_mock_io(self):
-        """Fire the mock IO worker — simulates external recipe delivery."""
-        if self._mock_io_worker and self._mock_io_worker.isRunning():
-            self._panel.log("Mock IO already running.", "#ffaa44")
-            return
-        self._mock_io_worker = MockIOWorker(self)
-        self._mock_io_worker.sig_recipe.connect(self._on_io_recipe_received)
-        self._mock_io_worker.start()
-        self._panel.log("Mock IO started — recipe arrives in ~2s.", "#aaddff")
-
     def _on_io_recipe_received(self, letters: list):
-        """Slot: called when MockIOWorker delivers a recipe."""
+        """Slot: called when external IO delivers a recipe."""
         self._io_recipe = list(letters)
         text = ",".join(letters)
-        self._panel.grid_letters_edit.setText(text)
+        self._panel.set_slot_cells(letters)
         self._panel.set_io_recipe_label(letters)
         self._panel.log(f"IO recipe received: {text}", "#88ffcc")
         
@@ -4147,24 +4314,6 @@ class MainWindow(QtWidgets.QWidget):
         except Exception as e:
             self._panel.log(f"Settings save error: {e}", "#ff4444")
 
-    # ----------------------------------------------------------
-    # Export / save
-    # ----------------------------------------------------------
-    def _export_csv(self):
-        if not self._ctrl.results:
-            self._panel.log("No results yet.", "#ffaa44"); return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save CSV",
-            f"result_{datetime.now():%Y%m%d_%H%M%S}.csv",
-            "CSV (*.csv)")
-        if not path:
-            return
-        keys = list(self._ctrl.results[0].keys())
-        with open(path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=keys)
-            w.writeheader()
-            w.writerows(self._ctrl.results)
-        self._panel.log(f"CSV -> {path}", "#88ff88")
 
 # =========================================================
 # ENTRY POINT
