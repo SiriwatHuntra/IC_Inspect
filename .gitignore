@@ -11,6 +11,7 @@ templates/
 # Logs and run output
 run_log/
 program_logs/
+debug/
 NG_log/
 *.log
 *.csv
@@ -20,6 +21,7 @@ inspection_settings.txt
 
 # ML model artifacts
 svm_model.pkl
+templates/
 training_data/
 .claude/
 
