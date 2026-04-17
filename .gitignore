@@ -2,6 +2,7 @@
 image_source/
 Inspection_result/
 debug/
+templates/
 *.bmp
 *.jpg
 *.jpeg
@@ -16,9 +17,14 @@ NG_log/
 *.json
 inspection_settings.txt
 
+
 # ML model artifacts
 svm_model.pkl
 training_data/
+.claude/
+
+#Testing field
+quickTest.py
 
 # Python
 __pycache__/
