@@ -1286,6 +1286,8 @@ class InspectionEngine:
         Input : contour (np.int32), n — number of sample points
         Output: float32 ndarray shape (n,), values in [0, 1]  or  None
         """
+        if contour is None:
+            return None
         pts    = contour.reshape(-1, 2).astype(np.float32)
         diffs  = np.diff(pts, axis=0, append=pts[:1])
         segs   = np.hypot(diffs[:, 0], diffs[:, 1])
@@ -1691,7 +1693,8 @@ class InspectionEngine:
         # ── Pre-compute query features once ───────────────────────
         outer    = contours[0] if contours else None
         q_hog    = _compute_hog(canvas)
-        q_signal = InspectionEngine._resample_contour_signal(outer)
+        q_signal = InspectionEngine._resample_contour_signal(outer) \
+                   if outer is not None else None
         q_approx = InspectionEngine._approx_features(outer) \
                    if outer is not None else None
 
