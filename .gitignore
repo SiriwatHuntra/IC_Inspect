@@ -20,6 +20,7 @@ inspection_settings.txt
 
 # ML model artifacts
 svm_model.pkl
+templates/
 training_data/
 .claude/
 
