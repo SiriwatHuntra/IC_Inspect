@@ -13,6 +13,8 @@ program_logs/
 NG_log/
 *.log
 *.csv
+*.json
+inspection_settings.txt
 
 # ML model artifacts
 svm_model.pkl
