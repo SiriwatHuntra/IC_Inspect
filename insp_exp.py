@@ -1659,24 +1659,28 @@ class InspectionEngine:
 
     @staticmethod
     def ocr_identify(canvas:        np.ndarray,
+                     contours:      list,
                      expected_char: str,
                      all_templates: dict) -> tuple:
         """
-        OCR identification via HOG cosine similarity against all saved templates.
+        OCR identification using the same multi-descriptor scorer as compare_roi.
 
-        HOG vector computed once per slot — reused across all template comparisons.
-        Templates carry pre-computed hog_vec (set at cache load time).
+        Query features pre-computed once — reused across all template comparisons.
+        Skeleton descriptors omitted (ximgproc absent); weights redistributed to
+        HOG, filled IoU, contour signal, and polygon approx.
+
+        Effective weights (skeleton absent):
+          HOG     0.40   filled IoU  0.25   signal  0.20   approx  0.15
 
         Three-stage search:
 
         Stage 1 — Expected char fast path
-            Score the expected character's template directly.
-            If cosine >= OCR_CONF_EXPECTED (0.88) return immediately.
+            Score expected template directly.
+            If score >= OCR_CONF_EXPECTED (0.88) return immediately.
 
         Stage 2 — Group search (fallback)
-            Templates split into alpha (A-Z) and numeric/special groups.
-            Expected char excluded (already scored) but score seeded as
-            starting best. Early exit if best reaches OCR_EARLY_EXIT_IOC (0.82).
+            Alpha / numeric groups ordered by expected char type.
+            Early exit if best reaches OCR_EARLY_EXIT_IOC (0.82).
 
         Returns (char: str, conf: float).
         Returns ("?", conf) if nothing clears OCR_MIN_CONF (0.55).
@@ -1684,16 +1688,29 @@ class InspectionEngine:
         if not all_templates or canvas is None:
             return "?", 0.0
 
-        # Pre-compute query HOG once — reused for every template comparison
-        q_hog = _compute_hog(canvas)
+        # ── Pre-compute query features once ───────────────────────
+        outer    = contours[0] if contours else None
+        q_hog    = _compute_hog(canvas)
+        q_signal = InspectionEngine._resample_contour_signal(outer)
+        q_approx = InspectionEngine._approx_features(outer) \
+                   if outer is not None else None
 
-        # ── Empty slot: no expected char — flat scan, no group ordering ──
+        def _score(tmpl: dict) -> float:
+            hog    = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
+            filled = InspectionEngine._check_similarity(canvas, tmpl.get("canvas"))
+            signal = InspectionEngine._contour_signal_sim(q_signal,
+                                                          tmpl.get("contour_signal"))
+            approx = InspectionEngine._approx_score(q_approx,
+                                                    tmpl.get("approx_feat"))
+            return hog * 0.40 + filled * 0.25 + signal * 0.20 + approx * 0.15
+
+        # ── Empty slot: flat scan, no group ordering ───────────────
         if not expected_char:
             best_char   = "?"
             best_conf   = 0.0
             second_conf = 0.0
             for name, tmpl in all_templates.items():
-                score = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
+                score = _score(tmpl)
                 if score > best_conf:
                     second_conf = best_conf
                     best_conf   = score
@@ -1703,19 +1720,19 @@ class InspectionEngine:
             if best_conf < OCR_MIN_CONF:
                 return "?", round(best_conf, 4)
             if best_conf - second_conf < OCR_CONF_GAP_MIN:
-                return "?", round(best_conf, 4)   # ambiguous — likely circular reflection
+                return "?", round(best_conf, 4)
             return best_char, round(best_conf, 4)
 
-        # ── Stage 1: expected char fast path ─────────────────────
+        # ── Stage 1: expected char fast path ──────────────────────
         exp_conf = 0.0
         exp_tmpl = all_templates.get(expected_char)
         if exp_tmpl is not None:
-            exp_conf = InspectionEngine._hog_cosine(q_hog, exp_tmpl.get("hog_vec"))
+            exp_conf = _score(exp_tmpl)
 
         if exp_conf >= OCR_CONF_EXPECTED:
-            return expected_char, round(exp_conf, 4)   # very high confidence — bypass gap check
+            return expected_char, round(exp_conf, 4)
 
-        # ── Stage 2: group search — seed with expected char result ─
+        # ── Stage 2: group search — seeded with expected char ──────
         best_char   = expected_char if exp_conf >= OCR_MIN_CONF else "?"
         best_conf   = exp_conf
         second_conf = 0.0
@@ -1725,28 +1742,25 @@ class InspectionEngine:
         numeric_group = {k: v for k, v in all_templates.items()
                          if not k.isalpha() and k != expected_char}
 
-        if expected_char.isalpha():
-            groups = [alpha_group, numeric_group]
-        else:
-            groups = [numeric_group, alpha_group]
+        groups = [alpha_group, numeric_group] if expected_char.isalpha() \
+                 else [numeric_group, alpha_group]
 
         for group in groups:
             for name, tmpl in group.items():
-                score = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
+                score = _score(tmpl)
                 if score > best_conf:
                     second_conf = best_conf
                     best_conf   = score
                     best_char   = name
                 elif score > second_conf:
                     second_conf = score
-
             if best_conf >= OCR_EARLY_EXIT_IOC:
-                break   # confident enough — skip secondary group
+                break
 
         if best_conf < OCR_MIN_CONF:
             return "?", round(best_conf, 4)
         if best_conf - second_conf < OCR_CONF_GAP_MIN:
-            return "?", round(best_conf, 4)   # ambiguous shape — likely reflection
+            return "?", round(best_conf, 4)
 
         return best_char, round(best_conf, 4)
 
@@ -2564,7 +2578,7 @@ class InspectionController:
                         if roi.ndim == 3 else roi
             slot_contours, slot_canvas = self._eng._check_presence(gray_slot, mold_size)
             ocr_char, ocr_conf = self._eng.ocr_identify(
-                slot_canvas, letter, self._ocr_templates)
+                slot_canvas, slot_contours, letter, self._ocr_templates)
 
             # ── Empty slot: unexpected-mark check only ────────────────
             if not letter:
@@ -3770,7 +3784,7 @@ class FrameTemplatePanel(QtWidgets.QWidget):
         """Call when YOLO model is not available."""
         self._lbl_status.setText(
             "YOLO model not ready.\n"
-            f"Place {YOLO_MODEL_PATH} in the project folder.")
+            f"Place {YOLO_MODEL_XML} in the project folder.")
         self._lbl_status.setStyleSheet("color:#ff4444;font-size:11px")
         self._btn_confirm.setEnabled(False)
         self._btn_retry.setEnabled(False)
@@ -4261,7 +4275,7 @@ class MainWindow(QtWidgets.QWidget):
         if not self._ctrl.yolo.is_ready():
             self._frame_panel.set_no_model()
             self._panel.log(
-                f"YOLO model not ready — place {YOLO_MODEL_PATH} in project folder.",
+                f"YOLO model not ready — place {YOLO_MODEL_XML} in project folder.",
                 "#ff4444")
             return
 
