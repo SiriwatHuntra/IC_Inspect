@@ -145,6 +145,9 @@ _SETTINGS_DEFAULTS = [
     ("font_confidence_min",  0.60,  0.30,  1.00,  True ),
     ("max_matches",             6,     1,    12,  False),
     ("camera_exposure_us",  8000,   100, 100000,  False),
+    ("grid_scale",           0.85,  0.50,  1.20,  True ),
+    ("grid_x_frac",          0.00, -0.30,  0.30,  True ),
+    ("grid_y_frac",          0.00, -0.30,  0.30,  True ),
 ]
 
 _STRING_DEFAULTS = {
@@ -2150,6 +2153,17 @@ class InspectionController:
         leads_present = self._eng._check_lead_presence(
             src_gray, acx, acy, mold_w, mold_h, iw, ih)
 
+        # ── Grid geometry (tunable) ───────────────────────────────
+        g_scale  = float(self._sm.get("grid_scale"))
+        g_x_frac = float(self._sm.get("grid_x_frac"))
+        g_y_frac = float(self._sm.get("grid_y_frac"))
+        grid_cx  = acx + int(mold_w * g_x_frac)
+        grid_cy  = acy + int(mold_h * g_y_frac)
+        cell_w   = int(mold_w * g_scale / 3)
+        cell_h   = int(mold_h * g_scale / 3)
+        roi_w    = int(cell_w * 1.2)
+        roi_h    = int(cell_h * 1.2)
+
         if not leads_present:
             # Work dropped — return pass results for all active slots
             for slot_idx, letter in enumerate(grid_letters):
@@ -2157,8 +2171,8 @@ class InspectionController:
                     continue
                 row = slot_idx // 3
                 col = slot_idx  % 3
-                dx  = (col - 1) * int(mold_w * 0.85 / 3)
-                dy  = (row - 1) * int(mold_h * 0.85 / 3)
+                dx  = (col - 1) * cell_w
+                dy  = (row - 1) * cell_h
                 results.append({
                     "frame_idx":   f_idx + 1,
                     "mold":        mold_label,
@@ -2170,8 +2184,8 @@ class InspectionController:
                     "shift_ratio": 0.0,
                     "defect_step": 0,
                     "reason":      "no_lead_skip",
-                    "cell_cx":     acx + dx,
-                    "cell_cy":     acy + dy,
+                    "cell_cx":     grid_cx + dx,
+                    "cell_cy":     grid_cy + dy,
                     "elapsed_ms":  0.0,
                     "lx1": 0, "ly1": 0, "lx2": 0, "ly2": 0,
                     "roi_canvas":  None,
@@ -2179,14 +2193,6 @@ class InspectionController:
             return results
 
         # ── Normal font inspection ────────────────────────────────
-        grid_w   = mold_w * 0.85
-        grid_h   = mold_h * 0.85
-        cell_w   = int(grid_w / 3)
-        cell_h   = int(grid_h / 3)
-
-        roi_w    = int(cell_w * 1.2)
-        roi_h    = int(cell_h * 1.2)
-
         for slot_idx, letter in enumerate(grid_letters):
             letter = letter.upper() if letter else ""
 
@@ -2196,8 +2202,8 @@ class InspectionController:
             dx = (col - 1) * cell_w
             dy = (row - 1) * cell_h
 
-            cell_cx = acx + dx
-            cell_cy = acy + dy
+            cell_cx = grid_cx + dx
+            cell_cy = grid_cy + dy
 
             half_w = roi_w // 2
             half_h = roi_h // 2
@@ -3492,6 +3498,20 @@ class RightPanel(QtWidgets.QWidget):
         note_font.setWordWrap(True)
         fl_font.addRow("", note_font)
         lay.addWidget(gb_font)
+
+        # ── Grid Position ─────────────────────────────────────
+        gb_grid = QtWidgets.QGroupBox("Grid Position")
+        fl_grid = QtWidgets.QFormLayout(gb_grid)
+        self.spin_grid_scale = self._bind_fspin("grid_scale",  fl_grid, "Scale")
+        self.spin_grid_x     = self._bind_fspin("grid_x_frac", fl_grid, "X offset")
+        self.spin_grid_y     = self._bind_fspin("grid_y_frac", fl_grid, "Y offset")
+        note_grid = QtWidgets.QLabel(
+            "Scale: fraction of mold covered by 3×3 grid (0.85 = 85%).\n"
+            "X/Y offset: shift grid centre as fraction of mold size.")
+        note_grid.setStyleSheet("color:#888;font-size:9px")
+        note_grid.setWordWrap(True)
+        fl_grid.addRow("", note_grid)
+        lay.addWidget(gb_grid)
 
         # ── Grid Letters — 3×3 slot grid ─────────────────────
         gb_gl = QtWidgets.QGroupBox("Expected Slot Letters")
