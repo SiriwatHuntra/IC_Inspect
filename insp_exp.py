@@ -1289,14 +1289,16 @@ class InspectionEngine:
         pts    = contour.reshape(-1, 2).astype(np.float32)
         diffs  = np.diff(pts, axis=0, append=pts[:1])
         segs   = np.hypot(diffs[:, 0], diffs[:, 1])
-        cumlen = np.concatenate([[0.0], np.cumsum(segs)])
+        cumlen = np.concatenate([[0.0], np.cumsum(segs)])   # shape N+1
         total  = float(cumlen[-1])
         if total < 1.0:
             return None
+        # Extend pts to N+1 by wrapping first point — matches cumlen length
+        pts_ext  = np.vstack([pts, pts[:1]])
         targets  = np.linspace(0.0, total, n, endpoint=False)
         resampled = np.column_stack([
-            np.interp(targets, cumlen, pts[:, 0]),
-            np.interp(targets, cumlen, pts[:, 1]),
+            np.interp(targets, cumlen, pts_ext[:, 0]),
+            np.interp(targets, cumlen, pts_ext[:, 1]),
         ])
         cx, cy  = resampled.mean(axis=0)
         radii   = np.hypot(resampled[:, 0] - cx, resampled[:, 1] - cy)
