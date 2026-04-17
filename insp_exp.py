@@ -938,36 +938,35 @@ def _encode_canvas(canvas: np.ndarray) -> str:
 
 
 # =========================================================
-# B.  YOLOMoldDetector  — mold bbox detection via YOLO8
+# B.  YOLOMoldDetector  — mold bbox detection via OpenVINO
 # =========================================================
-YOLO_MODEL_PATH = "Mold_detector.onnx"
+YOLO_MODEL_XML = "Mold_detector_openvino_model/Mold_detector.xml"
 
 class YOLOMoldDetector:
     """
-    Wraps Mold_detector.onnx (exported from YOLO8, single class "IC").
+    Wraps Mold_detector OpenVINO IR model (YOLO8, single class "IC").
     detect_top_left() returns the top-left-most bbox as QRect.
     Falls back gracefully if model file is missing or inference fails.
-
-    Export on a PC with PyTorch:
-        from ultralytics import YOLO
-        YOLO("Mold_detector.pt").export(format="onnx", imgsz=640)
+    Output layout: [1, 5, 8400]  (cx, cy, w, h, conf) — no built-in NMS.
     """
     _INPUT_SIZE = 640
 
     def __init__(self):
-        self._session = None
-        self._ready   = False
+        self._compiled = None
+        self._ready    = False
         try:
-            import onnxruntime as ort
-            if os.path.exists(YOLO_MODEL_PATH):
-                self._session = ort.InferenceSession(
-                    YOLO_MODEL_PATH,
-                    providers=["CPUExecutionProvider"])
-                self._input_name  = self._session.get_inputs()[0].name
+            import openvino as ov
+            if os.path.exists(YOLO_MODEL_XML):
+                core  = ov.Core()
+                model = core.read_model(YOLO_MODEL_XML)
+                self._compiled = core.compile_model(model, "CPU", {
+                    "INFERENCE_PRECISION_HINT": "f32",
+                    "PERFORMANCE_HINT":         "LATENCY",
+                })
                 self._ready = True
-                print(f"[YOLO] ONNX model loaded: {YOLO_MODEL_PATH}")
+                print(f"[YOLO] OpenVINO model loaded: {YOLO_MODEL_XML}")
             else:
-                print(f"[YOLO] Model file not found: {YOLO_MODEL_PATH}")
+                print(f"[YOLO] Model not found: {YOLO_MODEL_XML}")
         except Exception as e:
             print(f"[YOLO] Load failed: {e}")
 
@@ -981,15 +980,17 @@ class YOLOMoldDetector:
         Top-left-most = lowest (x1 + y1) sum.
         Returns QRect on success, None if no detection or model not ready.
         """
-        if not self._ready or self._session is None:
+        if not self._ready or self._compiled is None:
             return None
         try:
+            if image_bgr.ndim == 2:
+                image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
             ih, iw = image_bgr.shape[:2]
             sz = self._INPUT_SIZE
 
             # letterbox resize to sz×sz
-            scale  = min(sz / iw, sz / ih)
-            nw, nh = int(iw * scale), int(ih * scale)
+            scale   = min(sz / iw, sz / ih)
+            nw, nh  = int(iw * scale), int(ih * scale)
             resized = cv2.resize(image_bgr, (nw, nh))
             canvas  = np.full((sz, sz, 3), 114, dtype=np.uint8)
             pad_x   = (sz - nw) // 2
@@ -997,17 +998,16 @@ class YOLOMoldDetector:
             canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
 
             blob = canvas[:, :, ::-1].astype(np.float32) / 255.0
-            blob = blob.transpose(2, 0, 1)[np.newaxis]
+            blob = blob.transpose(2, 0, 1)[np.newaxis]      # [1,3,640,640]
 
-            outputs = self._session.run(None, {self._input_name: blob})
-            # YOLOv8 ONNX output: [1, 5, N]  (cx, cy, w, h, conf)
-            preds = outputs[0][0].T          # → [N, 5]
-            mask  = preds[:, 4] >= conf_thr
-            preds = preds[mask]
+            result = self._compiled(blob)
+            preds  = result[0][0].T                          # [8400, 5]
+            mask   = preds[:, 4] >= conf_thr
+            preds  = preds[mask]
             if len(preds) == 0:
                 return None
 
-            best = None
+            best       = None
             best_score = float("inf")
             for row in preds:
                 cx, cy, bw, bh = row[:4]
