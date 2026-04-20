@@ -1057,17 +1057,17 @@ class YOLOMoldDetector:
     def detect_all(self, image_bgr: np.ndarray,
                    conf_thr: float = 0.40) -> list:
         """
-        Return all detections as list of QRect sorted Y-row first then X-col.
-        Row snapping uses median bbox height for grouping.
+        Return all detections as list of QRect sorted X-col first then Y-row.
+        Column snapping uses median bbox width for grouping.
         Returns [] if model not ready or no detections.
         """
         boxes = self._run_inference(image_bgr, conf_thr)
         if not boxes:
             return []
-        median_h  = sorted(b[3] for b in boxes)[len(boxes) // 2]
-        row_snap  = max(1, median_h // 2)
+        median_w  = sorted(b[2] for b in boxes)[len(boxes) // 2]
+        col_snap  = max(1, median_w // 2)
         boxes_sorted = sorted(boxes,
-                              key=lambda b: (round(b[1] / row_snap), b[0]))
+                              key=lambda b: (round(b[0] / col_snap), b[1]))
         from PyQt5 import QtCore
         return [QtCore.QRect(x, y, w, h) for x, y, w, h in boxes_sorted]
 
@@ -2545,12 +2545,12 @@ class InspectionController:
         if not matches:
             return []
 
-        ROW_SNAP = max(1, anchor_tmpl.get("canvas_h", 60) // 2)
         COL_SNAP = max(1, anchor_tmpl.get("canvas_w", 60) // 2)
+        ROW_SNAP = max(1, anchor_tmpl.get("canvas_h", 60) // 2)
 
         return sorted(matches,
-                      key=lambda m: (round(m[1] / ROW_SNAP),
-                                     round(m[0] / COL_SNAP)))
+                      key=lambda m: (round(m[0] / COL_SNAP),
+                                     round(m[1] / ROW_SNAP)))
 
     def _step2_locate_molds(self, recipe, anc_cx, anc_cy, fscale, iw, ih, f_idx):
         """
