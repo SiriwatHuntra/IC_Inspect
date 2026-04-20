@@ -2130,11 +2130,17 @@ class ResultAnnotator:
         cv2_draw_dashed_rect(
             display, (ax1, ay1), (ax2, ay2),
             ResultAnnotator.COLOR_MOLD, 1)
+        
+        if mold_label == "A":
+            f_idx = f_idx*2 +1
+        else:
+            f_idx = f_idx*2 +2
         cv2.putText(display,
-                    f"F{f_idx+1}[{elapsed_ms:.1f}ms]",
+                    f"F{f_idx}[{elapsed_ms:.1f}ms]",
                     (ax1 + 2, ay1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                     ResultAnnotator.COLOR_MOLD, 1)
+        
 
     # ---- Letter ------------------------------------------------------
     @staticmethod
@@ -2156,9 +2162,7 @@ class ResultAnnotator:
         # ── Compact label: "A: 0.98" ──────────────────────────────
         if letter:
             lbl = f"{letter}: {confidence:.2f}"
-            lbl = f"{letter}: {confidence:.2f}"
         else:
-            lbl = f"!{ocr_char}: {ocr_conf:.2f}"
             lbl = f"!{ocr_char}: {ocr_conf:.2f}"
         cv2.putText(display, lbl,
                     (lx1, max(ly1 - 3, 8)),
@@ -2506,7 +2510,8 @@ class InspectionController:
                 acx, acy  = area["cx"],  area["cy"]
                 aw,  ah   = area["w"],   area["h"]
                 mold_size = min(aw, ah)
-                ic_num    = f_idx * 2 + m_idx   # A=2i, B=2i+1  (0-based)
+                ic_num    = f_idx * 2 + m_idx + 1  # A=2i+1, B=2i+2  (1-based)
+
 
                 # Per-mold pin presence check before font inspection
                 pin_key       = "pin_a" if area["label"] == "A" else "pin_b"
