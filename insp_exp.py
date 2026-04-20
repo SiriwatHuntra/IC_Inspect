@@ -2799,6 +2799,20 @@ class InspectionController:
                 "roi_canvas":  res["roi_canvas"],
             })
 
+            # ── Per-slot diagnostic for any failure ─────────────────
+            if not res["pass"]:
+                step = res["defect_step"]
+                print(
+                    f"[DIAG] F{f_idx+1}-{mold_label} s{slot_idx}({letter})"
+                    f" step={step}"
+                    f" shift={res['shift_px']:.1f}px(ratio={res['shift_ratio']:.3f})"
+                    f" conf={res['confidence']:.3f}"
+                    f" | {res['reason']}")
+                if step == 1:
+                    pfx = f"debug/FAIL_F{f_idx+1}_{mold_label}_s{slot_idx}_{letter}"
+                    ContourTemplate.extract_font_template(
+                        gray_slot, mold_size=mold_size, debug_prefix=pfx)
+
             ResultAnnotator.draw_letter(display, results[-1])
 
         return results
