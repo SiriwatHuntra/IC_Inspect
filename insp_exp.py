@@ -65,8 +65,9 @@ class InspectionResult:
 # CONFIG
 # =========================================================
 DEBUG_MODE     = True
-PIN_ROI_W      = 120       # fixed capture size in image-space px
-PIN_ROI_H      = 150
+PIN_ROI_W          = 120       # fixed capture size in image-space px
+PIN_ROI_H          = 150
+PIN_PRESENCE_IOU   = 0.90      # IoU threshold for lead/pin presence check
 PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in result map
 PIN_IOU_THR     = 0.50   # NMS overlap threshold
 
@@ -360,7 +361,7 @@ class BaslerCamera:
     
     def warmup(self):
         """Grab and discard CAMERA_WARMUP_FRAMES frames to stabilise sensor."""
-        for i in range(CAMERA_WARMUP_FRAMES):
+        for _ in range(CAMERA_WARMUP_FRAMES):
             self.grab()
         print(f"[Camera] Warmup done ({CAMERA_WARMUP_FRAMES} frames discarded).")
 
@@ -986,62 +987,73 @@ class YOLOMoldDetector:
     def is_ready(self) -> bool:
         return self._ready
 
-    def detect_top_left(self, image_bgr: np.ndarray,
-                        conf_thr: float = 0.40):
+    def _run_inference(self, image_bgr: np.ndarray, conf_thr: float) -> list:
         """
-        Run inference and return the top-left-most detection as QRect.
-        Top-left-most = lowest (x1 + y1) sum.
-        Returns QRect on success, None if no detection or model not ready.
+        Run OpenVINO inference; return list of (x1, y1, w, h) in image coords.
+        Returns [] if model not ready or no detections above conf_thr.
         """
         if not self._ready or self._compiled is None:
-            return None
+            return []
         try:
             if image_bgr.ndim == 2:
                 image_bgr = cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
             ih, iw = image_bgr.shape[:2]
             sz = self._INPUT_SIZE
 
-            # letterbox resize to sz×sz
             scale   = min(sz / iw, sz / ih)
             nw, nh  = int(iw * scale), int(ih * scale)
             resized = cv2.resize(image_bgr, (nw, nh))
-            canvas  = np.full((sz, sz, 3), 114, dtype=np.uint8)
+            pad_buf = np.full((sz, sz, 3), 114, dtype=np.uint8)
             pad_x   = (sz - nw) // 2
             pad_y   = (sz - nh) // 2
-            canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
+            pad_buf[pad_y:pad_y + nh, pad_x:pad_x + nw] = resized
 
-            blob = canvas[:, :, ::-1].astype(np.float32) / 255.0
-            blob = blob.transpose(2, 0, 1)[np.newaxis]      # [1,3,640,640]
-
+            blob   = pad_buf[:, :, ::-1].astype(np.float32) / 255.0
+            blob   = blob.transpose(2, 0, 1)[np.newaxis]
             result = self._compiled(blob)
             preds  = result[0][0].T                          # [8400, 5]
-            mask   = preds[:, 4] >= conf_thr
-            preds  = preds[mask]
-            if len(preds) == 0:
-                return None
+            preds  = preds[preds[:, 4] >= conf_thr]
 
-            best       = None
-            best_score = float("inf")
+            boxes = []
             for row in preds:
                 cx, cy, bw, bh = row[:4]
-                x1 = int((cx - bw / 2 - pad_x) / scale)
-                y1 = int((cy - bh / 2 - pad_y) / scale)
-                x2 = int((cx + bw / 2 - pad_x) / scale)
-                y2 = int((cy + bh / 2 - pad_y) / scale)
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(iw, x2), min(ih, y2)
-                tl = x1 + y1
-                if tl < best_score:
-                    best_score = tl
-                    best = (x1, y1, x2 - x1, y2 - y1)
-
-            if best is None:
-                return None
-            from PyQt5 import QtCore
-            return QtCore.QRect(best[0], best[1], best[2], best[3])
+                x1 = max(0,  int((cx - bw / 2 - pad_x) / scale))
+                y1 = max(0,  int((cy - bh / 2 - pad_y) / scale))
+                x2 = min(iw, int((cx + bw / 2 - pad_x) / scale))
+                y2 = min(ih, int((cy + bh / 2 - pad_y) / scale))
+                if x2 > x1 and y2 > y1:
+                    boxes.append((x1, y1, x2 - x1, y2 - y1))
+            return boxes
         except Exception as e:
             print(f"[YOLO] Inference error: {e}")
+            return []
+
+    def detect_top_left(self, image_bgr: np.ndarray,
+                        conf_thr: float = 0.40):
+        """Return top-left-most detection as QRect (lowest x1+y1). None if none."""
+        boxes = self._run_inference(image_bgr, conf_thr)
+        if not boxes:
             return None
+        x1, y1, w, h = min(boxes, key=lambda b: b[0] + b[1])
+        from PyQt5 import QtCore
+        return QtCore.QRect(x1, y1, w, h)
+
+    def detect_all(self, image_bgr: np.ndarray,
+                   conf_thr: float = 0.40) -> list:
+        """
+        Return all detections as list of QRect sorted Y-row first then X-col.
+        Row snapping uses median bbox height for grouping.
+        Returns [] if model not ready or no detections.
+        """
+        boxes = self._run_inference(image_bgr, conf_thr)
+        if not boxes:
+            return []
+        median_h  = sorted(b[3] for b in boxes)[len(boxes) // 2]
+        row_snap  = max(1, median_h // 2)
+        boxes_sorted = sorted(boxes,
+                              key=lambda b: (round(b[1] / row_snap), b[0]))
+        from PyQt5 import QtCore
+        return [QtCore.QRect(x, y, w, h) for x, y, w, h in boxes_sorted]
 
 
 # =========================================================
@@ -1123,31 +1135,50 @@ class InspectionEngine:
         return shift_px, shift_ratio
     
     @staticmethod
-    def _check_lead_presence(image_gray: np.ndarray,
-                            acx: int, acy: int,
-                            aw: int, ah: int,
-                            iw: int, ih: int,
-                            threshold: int = 128,
-                            min_white_ratio: float = 0.20) -> bool:
+    def check_pin_presence(image_gray: np.ndarray,
+                           anc_cx: int, anc_cy: int,
+                           recipe:  dict,
+                           iw: int, ih: int) -> bool:
         """
-        Check the lead (frame) area to the left of the mold for IC presence.
-        Lead box: W/2 × H, centred at (acx - aw*3//4, acy) — matches
-        the frame template derived in save_frame_recipe.
+        Check whether leads/pins are attached by comparing a live crop of the
+        pin ROI against the saved pin canvas template (centre-aligned IoU).
 
         Returns True  → leads present, proceed to font inspection.
         Returns False → no leads (work dropped), skip with pass result.
         """
-        fw   = aw // 2
-        fcx  = acx - aw * 3 // 4
-        x1   = max(0,  fcx - fw // 2)
-        y1   = max(0,  acy - ah // 2)
-        x2   = min(iw, fcx + fw // 2)
-        y2   = min(ih, acy + ah // 2)
+        pin_sec = recipe["pin"]
+        anc_sec = recipe["anchor"]
+
+        ax, ay, aw, ah = anc_sec["contour"]
+        px, py, pw, ph = pin_sec["contour"]
+
+        # offset from anchor centre to pin centre (save-time coords)
+        off_x = (px + pw // 2) - (ax + aw // 2)
+        off_y = (py + ph // 2) - (ay + ah // 2)
+
+        pcx = anc_cx + off_x
+        pcy = anc_cy + off_y
+        x1  = max(0,  pcx - pw // 2)
+        y1  = max(0,  pcy - ph // 2)
+        x2  = min(iw, x1 + pw)
+        y2  = min(ih, y1 + ph)
         if x2 <= x1 or y2 <= y1:
             return False
-        roi   = image_gray[y1:y2, x1:x2]
-        white = np.count_nonzero(roi >= threshold)
-        return (white / max(roi.size, 1)) >= min_white_ratio
+
+        roi = image_gray[y1:y2, x1:x2]
+        pin_canvas = pin_sec["canvas"]
+        ch, cw = pin_canvas.shape[:2]
+
+        roi_rs = cv2.resize(roi, (cw, ch), interpolation=cv2.INTER_AREA)
+        _, roi_bin = cv2.threshold(
+            roi_rs, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        intersection = int(np.count_nonzero(
+            cv2.bitwise_and(roi_bin, pin_canvas)))
+        union = int(np.count_nonzero(
+            cv2.bitwise_or(roi_bin, pin_canvas)))
+        iou = intersection / max(union, 1)
+        return iou >= PIN_PRESENCE_IOU
 
     @staticmethod
     def _check_similarity(canvas:      np.ndarray,
@@ -2201,59 +2232,80 @@ class InspectionController:
     # ---- frame recipe save ----
     def save_frame_recipe(self,
                           image_bgr:    np.ndarray,
-                          mold_rect:    QtCore.QRect,
+                          mold_a_rect:  QtCore.QRect,
+                          mold_b_rect:  QtCore.QRect,
                           grid_letters: list) -> bool:
         """
-        Derive frame (lead) rect from YOLO mold bbox and write pin_recipe.json.
+        Build and save v6 pin_recipe.json from a detected mold pair (A above B).
 
-        Frame box geometry (derived from mold W × H):
-          size   : (W//2) × H
-          centre : (mcx - W*3//4, mcy)   — sits over leads to the left
+        Anchor geometry (left-side carrier bar at mold B's Y level):
+          anchor.x1 = mold_A.x1 - aw * ANCHOR_LEFT_RATIO
+          anchor.y1 = mold_B.y1          (shifted down by pitch = B.y1 - A.y1)
+          anchor.w  = aw,  anchor.h = ah
 
-        Lead presence box = same area as frame box (leads ARE the frame).
+        Pin ROI (narrow left-side strip covering both A and B):
+          pin.cx = mold_A.x1 - PIN_GAP_RATIO*aw - PIN_W_RATIO*aw/2
+          pin.cy = midpoint of A-top to B-bottom
+          pin.w  = aw * PIN_W_RATIO,  pin.h = B-bottom - A-top
 
         grid_letters : list of exactly 9 strings (empty = skip), row-major.
         Returns True on success.
         """
+        ANCHOR_LEFT_RATIO = 0.75
+        PIN_GAP_RATIO     = 0.05
+        PIN_W_RATIO       = 0.20
+
         try:
             ih, iw = image_bgr.shape[:2]
-            mw  = mold_rect.width()
-            mh  = mold_rect.height()
-            mcx = mold_rect.x() + mw // 2
-            mcy = mold_rect.y() + mh // 2
 
-            # derive frame rect (left lead area)
-            fw  = int(mw * 0.7)
-            fh  = mh
-            fcx = mcx - int(mw * 0.85)
-            fcy = mcy
-            fx  = max(0, fcx - fw // 2)
-            fy  = max(0, fcy - fh // 2)
-            fw  = min(fw, iw - fx)
-            fh  = min(fh, ih - fy)
-            frame_rect = QtCore.QRect(fx, fy, fw, fh)
+            ax, ay = mold_a_rect.x(), mold_a_rect.y()
+            aw, ah = mold_a_rect.width(), mold_a_rect.height()
+            by = mold_b_rect.y()
 
-            # mold offset relative to frame centre
-            mold_offset = (mcx - fcx, mcy - fcy)
+            pitch_y = by - ay                           # B.top - A.top
 
-            frame_sec  = self._encode_section(image_bgr, frame_rect)
-            mold_a_sec = self._encode_section(
-                image_bgr, mold_rect, offset=mold_offset)
-            # mold_b reuses mold_a (single-mold setup)
-            mold_b_sec = self._encode_section(
-                image_bgr, mold_rect, offset=mold_offset)
+            # ── Anchor rect ──────────────────────────────────────────
+            anc_x = max(0,  ax - int(aw * ANCHOR_LEFT_RATIO))
+            anc_y = max(0,  ay + pitch_y)               # = by
+            anc_w = min(aw, iw - anc_x)
+            anc_h = min(ah, ih - anc_y)
+            anchor_rect = QtCore.QRect(anc_x, anc_y, anc_w, anc_h)
+
+            # offsets from anchor centre → mold centres
+            anc_cx = anc_x + anc_w // 2
+            anc_cy = anc_y + anc_h // 2
+            a_cx   = ax + aw // 2
+            a_cy   = ay + ah // 2
+            b_cy   = by + ah // 2
+            mold_a_shift = [a_cx - anc_cx,  a_cy - anc_cy]   # negative Y (above)
+            mold_b_shift = [a_cx - anc_cx,  b_cy - anc_cy]   # ≈ 0 Y
+
+            # ── Pin ROI rect ─────────────────────────────────────────
+            pin_w    = max(4, int(aw * PIN_W_RATIO))
+            full_h   = (by + ah) - ay                   # A-top to B-bottom
+            pin_cx = ax - int(aw * PIN_GAP_RATIO) - pin_w // 2
+            pin_x  = max(0,  pin_cx - pin_w // 2)
+            pin_y    = max(0,  ay)
+            pin_rect = QtCore.QRect(pin_x, pin_y,
+                                    min(pin_w, iw - pin_x),
+                                    min(full_h, ih - pin_y))
+
+            anchor_sec = self._encode_section(image_bgr, anchor_rect)
+            pin_sec    = self._encode_section(image_bgr, pin_rect)
 
             recipe = {
-                "version":      5,
-                "frame":        frame_sec,
-                "mold_a":       mold_a_sec,
-                "mold_b":       mold_b_sec,
+                "version":      6,
+                "mold_size":    [aw, ah],
+                "mold_a_shift": mold_a_shift,
+                "mold_b_shift": mold_b_shift,
+                "anchor":       anchor_sec,
+                "pin":          pin_sec,
                 "grid_letters": grid_letters,
             }
             with open(self.RECIPE_FILE, "w") as f:
                 json.dump(recipe, f)
 
-            self.cache.pop("FRAME", None)
+            self.cache.pop("ANCHOR", None)
             return True
 
         except Exception as e:
@@ -2267,29 +2319,29 @@ class InspectionController:
     def load_frame_recipe(self) -> dict:
         with open(self.RECIPE_FILE, "r") as f:
             raw = json.load(f)
-        result = {
-            "version":      raw.get("version", 1),
-            "frame":        self._decode_section(raw["frame"]),
-            "mold_a":       self._decode_section(raw["mold_a"]),
-            "mold_b":       self._decode_section(raw["mold_b"]),
+        version = raw.get("version", 1)
+        if version < 6:
+            raise ValueError(
+                f"pin_recipe.json is version {version} — "
+                f"please re-save the frame template (v6 required).")
+        return {
+            "version":      version,
+            "mold_size":    raw["mold_size"],
+            "mold_a_shift": raw["mold_a_shift"],
+            "mold_b_shift": raw["mold_b_shift"],
+            "anchor":       self._decode_section(raw["anchor"]),
+            "pin":          self._decode_section(raw["pin"]),
             "grid_letters": raw.get("grid_letters", [""] * 9),
         }
-        return result
 
     def get_frame_template(self) -> dict:
-        """Return frame section only (canvas ready for TM search)."""
-        recipe = self.load_frame_recipe()
-        return recipe["frame"]
+        """Return anchor section (canvas ready for TM search)."""
+        return self.load_frame_recipe()["anchor"]
 
     def get_mold_offsets(self) -> tuple:
-        """
-        Return (mold_a, mold_b) dicts each containing:
-          offset   : [dx, dy] from frame match centre
-          contours : list of np.int32 arrays
-          canvas   : uint8 grayscale ndarray
-        """
+        """Return (mold_a_shift, mold_b_shift) as [dx, dy] lists."""
         recipe = self.load_frame_recipe()
-        return recipe["mold_a"], recipe["mold_b"]
+        return recipe["mold_a_shift"], recipe["mold_b_shift"]
 
     # ---- font template save ----
     def save_font(self, name, roi_bgr, roi_rect,
@@ -2386,39 +2438,41 @@ class InspectionController:
         t0_total = time.perf_counter()
 
         matches = self._step1_find_frames(
-            image_bgr, recipe["frame"], pin_params, mask)
+            image_bgr, recipe["anchor"], pin_params, mask)
 
         if not matches:
-            print("[Pipeline] No frame matches found.")
+            print("[Pipeline] No anchor matches found.")
             return empty
 
         ih, iw = image_bgr.shape[:2]
 
-        # IC counter — increments A then B per frame position
-        ic_counter = 1
+        for f_idx, (anc_cx, anc_cy, fscore, fw, fh, fscale) in enumerate(matches):
+            ResultAnnotator.draw_frame(display, anc_cx, anc_cy, fw, fh, f_idx, fscore)
 
-        for f_idx, (fcx, fcy, fscore, fw, fh, fscale) in enumerate(matches):
-            ResultAnnotator.draw_frame(display, fcx, fcy, fw, fh, f_idx, fscore)
+            # Pin/lead presence check once per anchor (covers both A and B)
+            leads_present = self._eng.check_pin_presence(
+                src, anc_cx, anc_cy, recipe, iw, ih)
 
             mold_areas = self._step2_locate_molds(
-                recipe, fcx, fcy, fscale, iw, ih, f_idx)
+                recipe, anc_cx, anc_cy, fscale, iw, ih, f_idx)
 
             t0_frame = time.perf_counter()
 
-            for area in mold_areas:
+            for m_idx, area in enumerate(mold_areas):
                 acx, acy  = area["cx"],  area["cy"]
                 aw,  ah   = area["w"],   area["h"]
                 mold_size = min(aw, ah)
-                ic_num    = ic_counter
+                ic_num    = f_idx * 2 + m_idx   # A=2i, B=2i+1  (0-based)
 
                 t0_mold = time.perf_counter()
                 letter_results = self._step3_inspect_fonts(
                     src, display, acx, acy,
                     area["grid"],
                     f_idx, area["label"], iw, ih,
-                    mold_size = mold_size,
-                    mold_w    = aw,
-                    mold_h    = ah)
+                    mold_size     = mold_size,
+                    mold_w        = aw,
+                    mold_h        = ah,
+                    leads_present = leads_present)
                 mold_ms = (time.perf_counter() - t0_mold) * 1000
 
                 # Tag each result with IC number
@@ -2429,7 +2483,6 @@ class InspectionController:
                                         f_idx, area["label"],
                                         elapsed_ms=mold_ms)
                 self.results.extend(letter_results)
-                ic_counter += 1
 
             frame_ms = (time.perf_counter() - t0_frame) * 1000
 
@@ -2451,9 +2504,14 @@ class InspectionController:
         result.total_ms = total_ms
         return result
 
-    def _step1_find_frames(self, image_bgr, frame_tmpl, pin_params, mask):
+    def _step1_find_frames(self, image_bgr, anchor_tmpl, pin_params, mask):
+        """
+        Find all anchor template hits; sort Y-row first then X-col.
+        Returns list of (anchor_cx, anchor_cy, score, w, h, scale) — same
+        tuple shape as before so run() loop is unchanged.
+        """
         matches = self._eng.find_all_pin_templates(
-            image_bgr, frame_tmpl,
+            image_bgr, anchor_tmpl,
             score_thr   = pin_params["score_thr"],
             max_matches = pin_params["max_matches"],
             mask        = mask,
@@ -2461,39 +2519,38 @@ class InspectionController:
         if not matches:
             return []
 
-        COL_SNAP = frame_tmpl.get("canvas_w", 60) // 2
-        ROW_SNAP = frame_tmpl.get("canvas_h", 60) // 2
+        ROW_SNAP = max(1, anchor_tmpl.get("canvas_h", 60) // 2)
+        COL_SNAP = max(1, anchor_tmpl.get("canvas_w", 60) // 2)
 
-        matches = sorted(matches,
-                        key=lambda m: (round(m[0] / max(COL_SNAP, 1)),
-                                        round(m[1] / max(ROW_SNAP, 1))))
-        return matches
+        return sorted(matches,
+                      key=lambda m: (round(m[1] / ROW_SNAP),
+                                     round(m[0] / COL_SNAP)))
 
-    def _step2_locate_molds(self, recipe, fcx, fcy, fscale, iw, ih, f_idx):
-        areas = []
-        for key, label in [("mold_a", "A")]:  # ("mold_b", "B") — mold B disabled for single-mold test
-            mold = recipe[key]
-            odx, ody    = mold["offset"]
-            canvas_w    = mold["canvas_w"]
-            canvas_h    = mold["canvas_h"]
-            acx = fcx + int(round(odx * fscale))
-            acy = fcy + int(round(ody * fscale))
-            aw  = int(round(canvas_w * fscale))
-            ah  = int(round(canvas_h * fscale))
+    def _step2_locate_molds(self, recipe, anc_cx, anc_cy, fscale, iw, ih, f_idx):
+        """
+        Derive mold A and mold B centres from anchor hit + stored shifts.
+        Returns list of two area dicts (A first, then B).
+        """
+        aw, ah     = recipe["mold_size"]
+        aw         = int(round(aw * fscale))
+        ah         = int(round(ah * fscale))
+        grid       = recipe.get("grid_letters", [])
+        areas      = []
+
+        for label, shift_key in [("A", "mold_a_shift"), ("B", "mold_b_shift")]:
+            dx, dy = recipe[shift_key]
+            acx = anc_cx + int(round(dx * fscale))
+            acy = anc_cy + int(round(dy * fscale))
             acx = max(aw // 2, min(iw - aw // 2, acx))
             acy = max(ah // 2, min(ih - ah // 2, acy))
             areas.append({
-                "label":      label,
-                "cx":         acx,
-                "cy":         acy,
-                "w":          aw,
-                "h":          ah,
-                "fscale":     fscale,
-                "canvas_w":   canvas_w,   # raw (unscaled) stored dims
-                "canvas_h":   canvas_h,
-                "contours":   mold["contours"],
-                "canvas":     mold["canvas"],
-                "grid":       recipe.get("grid_letters", []),
+                "label":    label,
+                "cx":       acx,
+                "cy":       acy,
+                "w":        aw,
+                "h":        ah,
+                "fscale":   fscale,
+                "grid":     grid,
             })
         return areas
 
@@ -2501,17 +2558,11 @@ class InspectionController:
                          acx, acy, grid_letters,
                          f_idx, mold_label,
                          iw, ih,
-                         mold_size: int   = 150,
-                         mold_w:    int   = 150,
-                         mold_h:    int   = 150) -> list:
+                         mold_size:     int  = 150,
+                         mold_w:        int  = 150,
+                         mold_h:        int  = 150,
+                         leads_present: bool = True) -> list:
         results = []
-
-        # ── Lead presence gate ───────────────────────────────────
-        src_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY) \
-                if image_bgr.ndim == 3 else image_bgr
-
-        leads_present = self._eng._check_lead_presence(
-            src_gray, acx, acy, mold_w, mold_h, iw, ih)
 
         # ── Grid geometry (tunable) ───────────────────────────────
         g_scale  = float(self._sm.get("grid_scale"))
@@ -4129,7 +4180,7 @@ class MainWindow(QtWidgets.QWidget):
         # Frame template creation state
         self._frame_rects: list             = [None, None, None]
         self._frame_panel: FrameTemplatePanel | None = None
-        self._FRAME_TAGS = ["FRAME", "MOLD_A", "MOLD_B"]
+        self._FRAME_TAGS = ["MOLD_A", "MOLD_B", "ANCHOR", "PIN_ROI"]
 
         # Mask work-in-progress
         self._mask_wip    = None
@@ -4285,7 +4336,7 @@ class MainWindow(QtWidgets.QWidget):
         self._run_yolo_detection()
 
     def _run_yolo_detection(self):
-        """Run YOLO on current image; update panel and overlay."""
+        """Detect all molds; use top pair (A above B) to build anchor + pin overlays."""
         if not self._ctrl.yolo.is_ready():
             self._frame_panel.set_no_model()
             self._panel.log(
@@ -4293,39 +4344,55 @@ class MainWindow(QtWidgets.QWidget):
                 "#ff4444")
             return
 
-        mold_rect = self._ctrl.yolo.detect_top_left(self._image)
+        all_rects = self._ctrl.yolo.detect_all(self._image)
         self._clear_frame_overlays()
 
-        if mold_rect is None:
+        if len(all_rects) < 2:
             self._frame_rects[0] = None
+            self._frame_rects[1] = None
             self._frame_panel.set_no_detection()
-            self._panel.log("YOLO: no mold detected.", "#ffaa44")
+            self._panel.log(
+                f"YOLO: need ≥2 molds, got {len(all_rects)}.", "#ffaa44")
             return
 
-        self._frame_rects[0] = mold_rect
+        rect_a = all_rects[0]
+        rect_b = all_rects[1]
+        self._frame_rects[0] = rect_a
+        self._frame_rects[1] = rect_b
 
-        # draw mold bbox overlay (cyan)
-        self._view.add_overlay(mold_rect, QtGui.QColor(0, 224, 255), "MOLD_A", "dash")
+        aw, ah = rect_a.width(), rect_a.height()
+        ax, ay = rect_a.x(),     rect_a.y()
+        by = rect_b.y()
+        pitch_y = by - ay
 
-        # draw derived frame (lead) box overlay (yellow)
-        mw, mh = mold_rect.width(), mold_rect.height()
-        mcx = mold_rect.x() + mw // 2
-        mcy = mold_rect.y() + mh // 2
-        fw  = int(mw * 0.7)
-        fcx = mcx - int(mw * 0.85)
-        frame_rect = QtCore.QRect(fcx - fw // 2, mcy - mh // 2, fw, mh)
-        self._view.add_overlay(frame_rect, QtGui.QColor(255, 220, 0), "FRAME", "dash")
+        # anchor rect (left strip at mold B Y level)
+        anc_x = max(0, ax - int(aw * 0.75))
+        anc_y = max(0, ay + pitch_y)
+        anchor_rect = QtCore.QRect(anc_x, anc_y, aw, ah)
 
-        desc = f"x={mold_rect.x()}, y={mold_rect.y()}, {mw}×{mh} px"
+        # pin ROI rect (narrow left strip covering full AB height)
+        pin_w   = max(4, int(aw * 0.20))
+        full_h  = (by + ah) - ay
+        pin_cx  = ax - int(aw * 0.05) - pin_w // 2
+        pin_rect = QtCore.QRect(max(0, pin_cx - pin_w // 2), ay, pin_w, full_h)
+
+        self._view.add_overlay(rect_a,      QtGui.QColor(0, 224, 255),  "MOLD_A",  "dash")
+        self._view.add_overlay(rect_b,      QtGui.QColor(0, 180, 255),  "MOLD_B",  "dash")
+        self._view.add_overlay(anchor_rect, QtGui.QColor(255, 220, 0),  "ANCHOR",  "dash")
+        self._view.add_overlay(pin_rect,    QtGui.QColor(255, 100, 200), "PIN_ROI", "dash")
+
+        desc = (f"A: {aw}×{ah}px  B: {rect_b.width()}×{rect_b.height()}px  "
+                f"pitch={pitch_y}px  total={len(all_rects)} molds")
         self._frame_panel.set_detected(desc)
-        self._panel.log(f"YOLO: mold detected — {desc}", "#88ff88")
+        self._panel.log(f"YOLO: pair detected — {desc}", "#88ff88")
 
     def _on_frame_retry(self):
         self._panel.log("Retrying detection…", "#00e5ff")
         self._run_yolo_detection()
 
     def _on_frame_confirm(self):
-        if self._frame_rects[0] is None:
+        if self._frame_rects[0] is None or self._frame_rects[1] is None:
+            self._panel.log("Need both mold A and B detected before confirming.", "#ffaa44")
             return
         self._finish_frame()
 
@@ -4351,6 +4418,7 @@ class MainWindow(QtWidgets.QWidget):
         ok = self._ctrl.save_frame_recipe(
             self._image,
             self._frame_rects[0],
+            self._frame_rects[1],
             grid_letters = letters,
         )
         if ok:
@@ -4438,7 +4506,7 @@ class MainWindow(QtWidgets.QWidget):
         self._pending = None
         self._mode    = None
 
-    def _on_frame_roi(self, rect: QtCore.QRect):
+    def _on_frame_roi(self, _rect: QtCore.QRect):
         # Frame mode is now YOLO-only; rubber-band draws in frame mode are ignored.
         pass
 
