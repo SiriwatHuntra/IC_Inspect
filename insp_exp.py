@@ -70,7 +70,10 @@ PIN_ROI_H      = 150
 PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in result map
 PIN_IOU_THR     = 0.50   # NMS overlap threshold
 
-MIN_CONTOUR_AREA = 1
+MIN_CONTOUR_AREA     = 1
+MIN_CONTOUR_SOLIDITY = 0.45   # convex-hull fill ratio; rough surface noise < 0.35
+MIN_CONTOUR_EXTENT   = 0.20   # area / bounding-rect; sparse blobs fail this
+MIN_CONTOUR_REL_AREA = 0.003  # fraction of ROI area; rejects sub-0.3% specks
 IMAGE_SOURCE_DIR  = "image_source/"
 OUTPUT_DIR        = "Inspection_result"
 
@@ -672,15 +675,32 @@ class ContourTemplate:
 
         hierarchy = hierarchy[0]
 
-        # Find largest top-level contour
+        # Find largest top-level contour passing texture-noise filters
+        roi_area  = max(h * w, 1)
         best_idx  = -1
         best_area = 0.0
         for i, c in enumerate(raw_cnts):
             if hierarchy[i][3] != -1:
-                continue
+                continue                              # skip non-root contours
+
             area = cv2.contourArea(c)
             if area < MIN_CONTOUR_AREA:
                 continue
+
+            # ── Relative area: reject sub-pixel specks ────────────
+            if area / roi_area < MIN_CONTOUR_REL_AREA:
+                continue
+
+            # ── Solidity: reject jagged rough-surface noise ───────
+            hull_area = cv2.contourArea(cv2.convexHull(c))
+            if area / max(hull_area, 1) < MIN_CONTOUR_SOLIDITY:
+                continue
+
+            # ── Extent: reject sparse irregular blobs ─────────────
+            _, _, bw, bh = cv2.boundingRect(c)
+            if area / max(bw * bh, 1) < MIN_CONTOUR_EXTENT:
+                continue
+
             if area > best_area:
                 best_area = area
                 best_idx  = i
