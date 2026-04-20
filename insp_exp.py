@@ -607,8 +607,9 @@ class ContourTemplate:
 
     @staticmethod
     def _thresh_font(gray: np.ndarray, mold_size: int = 150) -> np.ndarray:
-        # ── Step 1 : Noise filter ─────────────────────────────────
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        # ── Step 1 : Noise filter — kernel scaled to mold size ────
+        k_blur = max(5, (mold_size // 20) | 1)   # ~7px at mold=150
+        blur = cv2.GaussianBlur(gray, (k_blur, k_blur), 0)
 
         # ── Step 2 : White top-hat — isolates bright strokes ─────
         # Kernel anchored to mold_size, not ROI size
