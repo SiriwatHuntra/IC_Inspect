@@ -537,7 +537,7 @@ class ContourTemplate:
         _thresh_frame -> _morph_frame -> _find_contours
 
       extract_font_template(gray, mold_size)
-        _thresh_font  -> _morph_font  -> _find_contours_font
+        _thresh_font  -> _morph_font  -> _find_contours
 
     Each threshold / morph block is a separate @staticmethod.
     Swap any block independently without touching the others.
@@ -607,28 +607,22 @@ class ContourTemplate:
 
     @staticmethod
     def _thresh_font(gray: np.ndarray, mold_size: int = 150) -> np.ndarray:
-        # ── Step 1 : TopHat + BlackHat fusion ────────────────────
-        k_hat  = max(7, (mold_size // 12) | 1)         # ~13px at mold=150  (was //8 ≈18px)
-        k_el   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_hat, k_hat))
-        tophat   = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT,   k_el)
-        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, k_el)
-        fused    = cv2.add(tophat, blackhat)            # captures bright-on-dark AND dark-on-bright marks
+        # ── Step 1 : Noise filter — kernel scaled to mold size ────
+        k_blur = max(5, (mold_size // 20) | 1)   # ~7px at mold=150
+        blur = cv2.GaussianBlur(gray, (k_blur, k_blur), 0)
 
-        # ── Step 2 : Bilateral filter (edge-preserving denoise) ──
-        smooth = cv2.bilateralFilter(fused, d=5, sigmaColor=20, sigmaSpace=5)  # sigmaColor 40→20
+        # ── Step 2 : White top-hat — isolates bright strokes ─────
+        # Kernel anchored to mold_size, not ROI size
+        k_size = max(9, (mold_size // 8) | 1)          # odd, ~18px at mold=150
+        kernel  = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (k_size, k_size))
+        tophat  = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, kernel)
 
-        # ── Step 3 : CLAHE (local contrast normalisation) ────────
-        clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-        enhanced = clahe.apply(smooth)
+        # ── Step 3 : Otsu threshold ───────────────────────────────
+        _, binary = cv2.threshold(
+            tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # ── Step 4 : Adaptive threshold (Gaussian weighted mean) ─
-        blk    = max(11, (mold_size // 15) | 1)        # ~11px at mold=150
-        binary = cv2.adaptiveThreshold(
-            enhanced, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
-            blk, -2)                                    # C=-2: pixel must exceed local_mean+2  (was -5)
-
-        # ── Step 5 : Border mask ──────────────────────────────────
+        # ── Step 4 : Border mask — kill edge spikes ───────────────
         h, w   = binary.shape[:2]
         margin = max(3, mold_size // 50)
         mask   = np.zeros((h, w), dtype=np.uint8)
@@ -656,11 +650,10 @@ class ContourTemplate:
 
     @staticmethod
     def _morph_font(binary: np.ndarray, mold_size: int = 150) -> np.ndarray:
-        # Kernels sized to laser stroke width (~mold/50 per stroke pixel)
-        # OPEN  small  — removes sub-stroke specks without eroding strokes
-        # CLOSE larger — bridges intra-stroke gaps left by adaptive threshold
-        k_open  = max(2, mold_size // 60)           # ~2px at mold=150
-        k_close = max(3, mold_size // 40)           # ~4px at mold=150  (was //30 ≈5px)
+        # OPEN first  — kills isolated speck noise before stitching
+        # CLOSE after — bridges stroke gaps with a larger kernel
+        k_open  = max(2, mold_size // 40)           # ~4px at mold=150
+        k_close = max(3, mold_size // 20)           # ~7-8px at mold=150
         out = cv2.morphologyEx(
             binary, cv2.MORPH_OPEN,
             cv2.getStructuringElement(cv2.MORPH_RECT, (k_open,  k_open)))
@@ -735,94 +728,6 @@ class ContourTemplate:
         return contours, canvas
 
     # =========================================================
-    # FONT CONTOUR FINDER  (pre-filter + score — NOT largest area)
-    # =========================================================
-
-    @staticmethod
-    def _find_contours_font(binary:    np.ndarray,
-                            h:         int,
-                            w:         int,
-                            mold_size: int = 150) -> tuple:
-        raw_cnts, hierarchy = cv2.findContours(
-            binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
-
-        empty_canvas = np.zeros((h, w), dtype=np.uint8)
-
-        if not raw_cnts or hierarchy is None:
-            return [], empty_canvas
-
-        hierarchy = hierarchy[0]
-        roi_area  = max(h * w, 1)
-
-        # Expected character area: ~25% of one slot cell (mold_size/3)²
-        expected_area = max(1.0, (mold_size / 3.0) ** 2 * 0.25)
-
-        # ── Pre-filter: keep only stroke-like root contours ───────
-        candidates = []
-        for i, c in enumerate(raw_cnts):
-            if hierarchy[i][3] != -1:
-                continue                              # skip non-root
-
-            area = cv2.contourArea(c)
-            if area < MIN_CONTOUR_AREA:
-                continue
-            if area / roi_area < MIN_CONTOUR_REL_AREA:
-                continue
-            if area / roi_area > 0.50:               # too large → frame boundary / reflection
-                continue
-
-            hull      = cv2.convexHull(c)
-            hull_area = cv2.contourArea(hull)
-            solidity  = area / max(hull_area, 1)
-            if solidity < MIN_CONTOUR_SOLIDITY:
-                continue
-
-            _, _, bw, bh = cv2.boundingRect(c)
-            extent = area / max(bw * bh, 1)
-            if extent < MIN_CONTOUR_EXTENT:
-                continue
-
-            # Reject near-circular blobs (IC surface reflections, solder dots)
-            perimeter   = cv2.arcLength(c, True)
-            circularity = (4.0 * np.pi * area) / max(perimeter ** 2, 1.0)
-            if circularity > 0.75:
-                continue
-
-            candidates.append((i, c, area, solidity, extent))
-
-        if not candidates:
-            return [], empty_canvas
-
-        # ── Score: solidity × 0.40 + extent × 0.30 + size_proximity × 0.30 ──
-        best_score = -1.0
-        best_idx   = -1
-        for i, c, area, solidity, extent in candidates:
-            size_ratio  = area / expected_area
-            size_score  = 1.0 / (1.0 + abs(np.log(max(size_ratio, 1e-6))))
-            score       = solidity * 0.40 + extent * 0.30 + size_score * 0.30
-            if score > best_score:
-                best_score = score
-                best_idx   = i
-
-        if best_idx == -1:
-            return [], empty_canvas
-
-        # Root + direct children (holes inside the character)
-        contours = [raw_cnts[best_idx]]
-        children = []
-        for i, c in enumerate(raw_cnts):
-            if hierarchy[i][3] == best_idx:
-                children.append(c)
-                contours.append(c)
-
-        canvas = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(canvas, [contours[0]], -1, 255, cv2.FILLED)
-        if children:
-            cv2.drawContours(canvas, children, -1, 0, cv2.FILLED)
-
-        return contours, canvas
-
-    # =========================================================
     # NAMED ENTRY POINTS
     # =========================================================
 
@@ -857,7 +762,7 @@ class ContourTemplate:
                               debug_prefix: str = "") -> tuple:
         """
         Full pipeline for FONT / LETTER ROIs.
-          _thresh_font -> _morph_font -> _find_contours_font
+          _thresh_font -> _morph_font -> _find_contours
 
         Input : grayscale ndarray, mold_size (px) for kernel scaling
         Output: (contours, canvas, thresh_binary)
@@ -870,7 +775,7 @@ class ContourTemplate:
         if debug_prefix:
             _write_debug(debug_prefix, gray, thresh, clean)
 
-        contours, canvas = ContourTemplate._find_contours_font(clean, h, w, mold_size)
+        contours, canvas = ContourTemplate._find_contours(clean, h, w)
 
         if debug_prefix and contours:
             _write_debug_contours(debug_prefix, gray, contours, canvas)
@@ -2225,12 +2130,8 @@ class ResultAnnotator:
         cv2_draw_dashed_rect(
             display, (ax1, ay1), (ax2, ay2),
             ResultAnnotator.COLOR_MOLD, 1)
-        if mold_label == "A":
-            f_idx = f_idx*2 +1
-        else:
-            f_idx = f_idx*2 +2
         cv2.putText(display,
-                    f"F{f_idx}[{elapsed_ms:.1f}ms]",
+                    f"F{f_idx+1}[{elapsed_ms:.1f}ms]",
                     (ax1 + 2, ay1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                     ResultAnnotator.COLOR_MOLD, 1)
@@ -2605,7 +2506,7 @@ class InspectionController:
                 acx, acy  = area["cx"],  area["cy"]
                 aw,  ah   = area["w"],   area["h"]
                 mold_size = min(aw, ah)
-                ic_num    = f_idx * 2 + m_idx + 1  # A=2i+1, B=2i+2  (1-based)
+                ic_num    = f_idx * 2 + m_idx   # A=2i, B=2i+1  (0-based)
 
                 # Per-mold pin presence check before font inspection
                 pin_key       = "pin_a" if area["label"] == "A" else "pin_b"
