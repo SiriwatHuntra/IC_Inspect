@@ -72,7 +72,10 @@ PIN_EDGE_RATIO     = 0.10      # fraction of inner-ROI pixels that must be stron
 PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in result map
 PIN_IOU_THR     = 0.50   # NMS overlap threshold
 
-MIN_CONTOUR_AREA = 1
+MIN_CONTOUR_AREA     = 1
+MIN_CONTOUR_SOLIDITY = 0.45   # convex-hull fill ratio; rough surface noise < 0.35
+MIN_CONTOUR_EXTENT   = 0.20   # area / bounding-rect; sparse blobs fail this
+MIN_CONTOUR_REL_AREA = 0.003  # fraction of ROI area; rejects sub-0.3% specks
 IMAGE_SOURCE_DIR  = "image_source/"
 OUTPUT_DIR        = "Inspection_result"
 
@@ -128,7 +131,6 @@ def _compute_hog(canvas: np.ndarray) -> np.ndarray:
 
 # ---- OCR Constants (HOG cosine similarity — range 0.0–1.0) ----
 OCR_CONF_EXPECTED  = 0.88   # fast path: return immediately if ≥ this
-OCR_EARLY_EXIT_IOC = 0.82   # skip secondary group if primary best ≥ this
 OCR_MIN_CONF       = 0.55   # below this → report "?" (unreadable)
 OCR_CONF_GAP_MIN   = 0.10   # best must exceed 2nd-best by this — filters circular reflections
                              # that score similarly on "2","0","O","8" (small gap → "?")
@@ -675,15 +677,32 @@ class ContourTemplate:
 
         hierarchy = hierarchy[0]
 
-        # Find largest top-level contour
+        # Find largest top-level contour passing texture-noise filters
+        roi_area  = max(h * w, 1)
         best_idx  = -1
         best_area = 0.0
         for i, c in enumerate(raw_cnts):
             if hierarchy[i][3] != -1:
-                continue
+                continue                              # skip non-root contours
+
             area = cv2.contourArea(c)
             if area < MIN_CONTOUR_AREA:
                 continue
+
+            # ── Relative area: reject sub-pixel specks ────────────
+            if area / roi_area < MIN_CONTOUR_REL_AREA:
+                continue
+
+            # ── Solidity: reject jagged rough-surface noise ───────
+            hull_area = cv2.contourArea(cv2.convexHull(c))
+            if area / max(hull_area, 1) < MIN_CONTOUR_SOLIDITY:
+                continue
+
+            # ── Extent: reject sparse irregular blobs ─────────────
+            _, _, bw, bh = cv2.boundingRect(c)
+            if area / max(bw * bh, 1) < MIN_CONTOUR_EXTENT:
+                continue
+
             if area > best_area:
                 best_area = area
                 best_idx  = i
@@ -1737,7 +1756,7 @@ class InspectionEngine:
 
         Stage 2 — Group search (fallback)
             Alpha / numeric groups ordered by expected char type.
-            Early exit if best reaches OCR_EARLY_EXIT_IOC (0.82).
+            Skip next group only when best already exceeds exp_conf.
 
         Returns (char: str, conf: float).
         Returns ("?", conf) if nothing clears OCR_MIN_CONF (0.55).
@@ -1791,6 +1810,10 @@ class InspectionEngine:
             return expected_char, round(exp_conf, 4)
 
         # ── Stage 2: group search — seeded with expected char ──────
+        # Same-type group runs first (alpha→alpha, num→num).
+        # Each group is fully scored before deciding whether to continue.
+        # Skip remaining groups only when a template already beat exp_conf —
+        # a different-type match can never be more reliable than same-type.
         best_char   = expected_char if exp_conf >= OCR_MIN_CONF else "?"
         best_conf   = exp_conf
         second_conf = 0.0
@@ -1812,13 +1835,12 @@ class InspectionEngine:
                     best_char   = name
                 elif score > second_conf:
                     second_conf = score
-            if best_conf >= OCR_EARLY_EXIT_IOC:
+            # Full group scored — only skip next group if a winner beat exp_conf
+            if best_conf > exp_conf:
                 break
 
         if best_conf < OCR_MIN_CONF:
             return "?", round(best_conf, 4)
-        # Gap check only when best is NOT the expected char; if expected char wins,
-        # ambiguity vs similar-looking chars is irrelevant (confirmed match).
         if best_char != expected_char and best_conf - second_conf < OCR_CONF_GAP_MIN:
             return "?", round(best_conf, 4)
 
@@ -2108,7 +2130,7 @@ class ResultAnnotator:
             display, (ax1, ay1), (ax2, ay2),
             ResultAnnotator.COLOR_MOLD, 1)
         cv2.putText(display,
-                    f"F{f_idx+1}-{mold_label} [{elapsed_ms:.1f}ms]",
+                    f"F{f_idx+1}[{elapsed_ms:.1f}ms]",
                     (ax1 + 2, ay1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                     ResultAnnotator.COLOR_MOLD, 1)
@@ -2133,7 +2155,9 @@ class ResultAnnotator:
         # ── Compact label: "A: 0.98" ──────────────────────────────
         if letter:
             lbl = f"{letter}: {confidence:.2f}"
+            lbl = f"{letter}: {confidence:.2f}"
         else:
+            lbl = f"!{ocr_char}: {ocr_conf:.2f}"
             lbl = f"!{ocr_char}: {ocr_conf:.2f}"
         cv2.putText(display, lbl,
                     (lx1, max(ly1 - 3, 8)),
