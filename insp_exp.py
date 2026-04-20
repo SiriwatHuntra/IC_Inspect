@@ -2075,7 +2075,7 @@ class ResultAnnotator:
             display, (ax1, ay1), (ax2, ay2),
             ResultAnnotator.COLOR_MOLD, 1)
         cv2.putText(display,
-                    f"F{f_idx+1}-{mold_label} [{elapsed_ms:.1f}ms]",
+                    f"F{f_idx+1}[{elapsed_ms:.1f}ms]",
                     (ax1 + 2, ay1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                     ResultAnnotator.COLOR_MOLD, 1)
