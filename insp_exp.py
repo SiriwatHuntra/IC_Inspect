@@ -2099,21 +2099,12 @@ class ResultAnnotator:
 
         # ── Verdict label (above box) ─────────────────────────────
         if letter:
-            lbl = f"{letter}{'+'if passed else'-'} {confidence:.2f}"
+            lbl = f"{letter}: {confidence:.2f}"
         else:
-            lbl = f"!{ocr_char}"   # unexpected mark on empty slot
+            lbl = f"!{ocr_char}: {ocr_conf:.2f}"
         cv2.putText(display, lbl,
                     (lx1, max(ly1 - 3, 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, col, 1)
-
-        # ── OCR label (below box) ─────────────────────────────────
-        ocr_lbl = f"OCR:{ocr_char} {ocr_conf:.2f}"
-        cv2.putText(display, ocr_lbl,
-                    (lx1, ly2 + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.32,
-                    ResultAnnotator.COLOR_OCR, 1)
-
-        cv2.rectangle(display, (lx1, ly1), (lx2, ly2), col, 1)
 
         if roi_canvas is not None and roi_canvas.size > 0:
             canvas_h, canvas_w = roi_canvas.shape[:2]
