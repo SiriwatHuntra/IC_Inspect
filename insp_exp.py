@@ -987,9 +987,12 @@ class YOLOMoldDetector:
     def is_ready(self) -> bool:
         return self._ready
 
+    _NMS_IOU_THR = 0.45   # IoU threshold for NMS deduplication
+
     def _run_inference(self, image_bgr: np.ndarray, conf_thr: float) -> list:
         """
-        Run OpenVINO inference; return list of (x1, y1, w, h) in image coords.
+        Run OpenVINO inference with NMS; return list of (x1, y1, w, h) in image coords.
+        NMS is applied (IoU thr = _NMS_IOU_THR) so each physical mold yields one box.
         Returns [] if model not ready or no detections above conf_thr.
         """
         if not self._ready or self._compiled is None:
@@ -1013,8 +1016,10 @@ class YOLOMoldDetector:
             result = self._compiled(blob)
             preds  = result[0][0].T                          # [8400, 5]
             preds  = preds[preds[:, 4] >= conf_thr]
+            if len(preds) == 0:
+                return []
 
-            boxes = []
+            raw_boxes, scores = [], []
             for row in preds:
                 cx, cy, bw, bh = row[:4]
                 x1 = max(0,  int((cx - bw / 2 - pad_x) / scale))
@@ -1022,8 +1027,19 @@ class YOLOMoldDetector:
                 x2 = min(iw, int((cx + bw / 2 - pad_x) / scale))
                 y2 = min(ih, int((cy + bh / 2 - pad_y) / scale))
                 if x2 > x1 and y2 > y1:
-                    boxes.append((x1, y1, x2 - x1, y2 - y1))
-            return boxes
+                    raw_boxes.append([x1, y1, x2 - x1, y2 - y1])
+                    scores.append(float(row[4]))
+
+            if not raw_boxes:
+                return []
+
+            indices = cv2.dnn.NMSBoxes(
+                raw_boxes, scores, conf_thr, self._NMS_IOU_THR)
+            if len(indices) == 0:
+                return []
+
+            kept = indices.flatten() if hasattr(indices, "flatten") else list(indices)
+            return [tuple(raw_boxes[i]) for i in kept]
         except Exception as e:
             print(f"[YOLO] Inference error: {e}")
             return []
@@ -2251,9 +2267,8 @@ class InspectionController:
         grid_letters : list of exactly 9 strings (empty = skip), row-major.
         Returns True on success.
         """
-        ANCHOR_LEFT_RATIO = 0.75
-        PIN_GAP_RATIO     = 0.05
-        PIN_W_RATIO       = 0.20
+        PIN_GAP_RATIO = 0.05
+        PIN_W_RATIO   = 0.20
 
         try:
             ih, iw = image_bgr.shape[:2]
@@ -2262,13 +2277,16 @@ class InspectionController:
             aw, ah = mold_a_rect.width(), mold_a_rect.height()
             by = mold_b_rect.y()
 
-            pitch_y = by - ay                           # B.top - A.top
+            pitch_y  = by - ay                          # B.top - A.top
+            mcx_a    = ax + aw // 2                     # mold A centre X
 
-            # ── Anchor rect ──────────────────────────────────────────
-            anc_x = max(0,  ax - int(aw * ANCHOR_LEFT_RATIO))
-            anc_y = max(0,  ay + pitch_y)               # = by
-            anc_w = min(aw, iw - anc_x)
-            anc_h = min(ah, ih - anc_y)
+            # ── Anchor rect (same geometry as original frame template) ──
+            anc_cx = mcx_a - int(aw * 0.85)             # centre X
+            anc_w  = int(aw * 0.7)                      # width = 70% mold
+            anc_y  = max(0,  ay + pitch_y)              # top = mold B's top Y
+            anc_h  = min(ah, ih - anc_y)
+            anc_x  = max(0,  anc_cx - anc_w // 2)
+            anc_w  = min(anc_w, iw - anc_x)
             anchor_rect = QtCore.QRect(anc_x, anc_y, anc_w, anc_h)
 
             # offsets from anchor centre → mold centres
@@ -4360,15 +4378,17 @@ class MainWindow(QtWidgets.QWidget):
         self._frame_rects[0] = rect_a
         self._frame_rects[1] = rect_b
 
-        aw, ah = rect_a.width(), rect_a.height()
-        ax, ay = rect_a.x(),     rect_a.y()
-        by = rect_b.y()
+        aw, ah  = rect_a.width(), rect_a.height()
+        ax, ay  = rect_a.x(),    rect_a.y()
+        by      = rect_b.y()
         pitch_y = by - ay
+        mcx_a   = ax + aw // 2
 
-        # anchor rect (left strip at mold B Y level)
-        anc_x = max(0, ax - int(aw * 0.75))
-        anc_y = max(0, ay + pitch_y)
-        anchor_rect = QtCore.QRect(anc_x, anc_y, aw, ah)
+        # anchor rect (matches save_frame_recipe geometry)
+        anc_cx  = mcx_a - int(aw * 0.85)
+        anc_w   = int(aw * 0.7)
+        anc_y   = max(0, ay + pitch_y)
+        anchor_rect = QtCore.QRect(max(0, anc_cx - anc_w // 2), anc_y, anc_w, ah)
 
         # pin ROI rect (narrow left strip covering full AB height)
         pin_w   = max(4, int(aw * 0.20))
