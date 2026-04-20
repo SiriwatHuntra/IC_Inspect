@@ -67,7 +67,8 @@ class InspectionResult:
 DEBUG_MODE     = True
 PIN_ROI_W          = 120       # fixed capture size in image-space px
 PIN_ROI_H          = 150
-PIN_PRESENCE_IOU   = 0.90      # IoU threshold for lead/pin presence check
+PIN_SOBEL_MAG      = 30        # minimum Sobel Y magnitude counted as a strong edge
+PIN_EDGE_RATIO     = 0.10      # fraction of inner-ROI pixels that must be strong edges
 PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in result map
 PIN_IOU_THR     = 0.50   # NMS overlap threshold
 
@@ -1157,19 +1158,25 @@ class InspectionEngine:
                            anc_sec: dict,
                            iw: int, ih: int) -> bool:
         """
-        Check whether leads/pins are attached for one mold by comparing a live
-        crop of the pin ROI against the saved pin canvas template (IoU).
+        Detect thick horizontal pin stripes via Sobel Y strong-edge ratio.
+
+        Method:
+          1. Crop pin ROI using offset from anchor centre (save-time coords).
+          2. Strip a horizontal margin (~12% each side) to exclude frame-cut
+             artifacts at the ROI left/right edges.
+          3. Compute Sobel Y; count pixels with |gradient| > PIN_SOBEL_MAG
+             as a fraction of the inner ROI area.
+          4. Thick pin stripes span the full width → high ratio (~0.30+).
+             A few cut-tip marks are confined to edges (removed by margin)
+             or too sparse → low ratio (~0.01-0.05).
 
         pin_sec : recipe["pin_a"] or recipe["pin_b"]
         anc_sec : recipe["anchor"]
-
-        Returns True  → leads present, proceed to font inspection.
-        Returns False → no leads (work dropped), skip with pass result.
+        Returns True → pins present;  False → no pins (work dropped).
         """
         ax, ay, aw, ah = anc_sec["contour"]
         px, py, pw, ph = pin_sec["contour"]
 
-        # offset from anchor centre to pin centre (save-time coords)
         off_x = (px + pw // 2) - (ax + aw // 2)
         off_y = (py + ph // 2) - (ay + ah // 2)
 
@@ -1183,19 +1190,19 @@ class InspectionEngine:
             return False
 
         roi = image_gray[y1:y2, x1:x2]
-        pin_canvas = pin_sec["canvas"]
-        ch, cw = pin_canvas.shape[:2]
+        if roi.size == 0:
+            return False
 
-        roi_rs = cv2.resize(roi, (cw, ch), interpolation=cv2.INTER_AREA)
-        _, roi_bin = cv2.threshold(
-            roi_rs, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # strip left/right margin to exclude frame-cut edge artifacts
+        margin    = max(2, roi.shape[1] // 8)
+        roi_inner = roi[:, margin : roi.shape[1] - margin]
+        if roi_inner.shape[1] < 4:
+            roi_inner = roi                              # fallback if ROI too narrow
 
-        intersection = int(np.count_nonzero(
-            cv2.bitwise_and(roi_bin, pin_canvas)))
-        union = int(np.count_nonzero(
-            cv2.bitwise_or(roi_bin, pin_canvas)))
-        iou = intersection / max(union, 1)
-        return iou >= PIN_PRESENCE_IOU
+        sobel_y    = cv2.Sobel(roi_inner, cv2.CV_64F, 0, 1, ksize=3)
+        strong     = np.abs(sobel_y) > PIN_SOBEL_MAG
+        edge_ratio = float(strong.sum()) / strong.size
+        return edge_ratio >= PIN_EDGE_RATIO
 
     @staticmethod
     def _check_similarity(canvas:      np.ndarray,
