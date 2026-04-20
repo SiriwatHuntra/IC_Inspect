@@ -1153,18 +1153,19 @@ class InspectionEngine:
     @staticmethod
     def check_pin_presence(image_gray: np.ndarray,
                            anc_cx: int, anc_cy: int,
-                           recipe:  dict,
+                           pin_sec: dict,
+                           anc_sec: dict,
                            iw: int, ih: int) -> bool:
         """
-        Check whether leads/pins are attached by comparing a live crop of the
-        pin ROI against the saved pin canvas template (centre-aligned IoU).
+        Check whether leads/pins are attached for one mold by comparing a live
+        crop of the pin ROI against the saved pin canvas template (IoU).
+
+        pin_sec : recipe["pin_a"] or recipe["pin_b"]
+        anc_sec : recipe["anchor"]
 
         Returns True  → leads present, proceed to font inspection.
         Returns False → no leads (work dropped), skip with pass result.
         """
-        pin_sec = recipe["pin"]
-        anc_sec = recipe["anchor"]
-
         ax, ay, aw, ah = anc_sec["contour"]
         px, py, pw, ph = pin_sec["contour"]
 
@@ -2254,15 +2255,15 @@ class InspectionController:
         """
         Build and save v6 pin_recipe.json from a detected mold pair (A above B).
 
-        Anchor geometry (left-side carrier bar at mold B's Y level):
-          anchor.x1 = mold_A.x1 - aw * ANCHOR_LEFT_RATIO
-          anchor.y1 = mold_B.y1          (shifted down by pitch = B.y1 - A.y1)
-          anchor.w  = aw,  anchor.h = ah
+        Layout:
+          [pin_a] [A]
+          [anchor]           ← diagonal midpoint between A and B
+          [pin_b] [B]
 
-        Pin ROI (narrow left-side strip covering both A and B):
-          pin.cx = mold_A.x1 - PIN_GAP_RATIO*aw - PIN_W_RATIO*aw/2
-          pin.cy = midpoint of A-top to B-bottom
-          pin.w  = aw * PIN_W_RATIO,  pin.h = B-bottom - A-top
+        Anchor: centre X = mold_a_cx - aw*0.85, width = aw*0.7,
+                centre Y = midpoint(A_centre_Y, B_centre_Y)
+        Pin A/B: width = aw*0.20, height = ah, gap = aw*0.05 from mold left edge,
+                 each at their respective mold's centre Y.
 
         grid_letters : list of exactly 9 strings (empty = skip), row-major.
         Returns True on success.
@@ -2277,39 +2278,42 @@ class InspectionController:
             aw, ah = mold_a_rect.width(), mold_a_rect.height()
             by = mold_b_rect.y()
 
-            pitch_y  = by - ay                          # B.top - A.top
-            mcx_a    = ax + aw // 2                     # mold A centre X
+            mcx_a = ax + aw // 2
+            a_cx  = mcx_a
+            a_cy  = ay + ah // 2
+            b_cy  = by + ah // 2
 
-            # ── Anchor rect (same geometry as original frame template) ──
-            anc_cx = mcx_a - int(aw * 0.85)             # centre X
-            anc_w  = int(aw * 0.7)                      # width = 70% mold
-            anc_y  = max(0,  ay + pitch_y)              # top = mold B's top Y
-            anc_h  = min(ah, ih - anc_y)
-            anc_x  = max(0,  anc_cx - anc_w // 2)
-            anc_w  = min(anc_w, iw - anc_x)
+            # ── Anchor rect (diagonal midpoint between A and B) ───────
+            anc_cx  = mcx_a - int(aw * 0.85)
+            anc_cy  = (a_cy + b_cy) // 2               # midpoint of mold centres
+            anc_w   = int(aw * 0.7)
+            anc_h   = ah
+            anc_x   = max(0,  anc_cx - anc_w // 2)
+            anc_y   = max(0,  anc_cy - anc_h // 2)
+            anc_w   = min(anc_w, iw - anc_x)
+            anc_h   = min(anc_h, ih - anc_y)
+            anc_cx  = anc_x + anc_w // 2               # recompute after clamping
+            anc_cy  = anc_y + anc_h // 2
             anchor_rect = QtCore.QRect(anc_x, anc_y, anc_w, anc_h)
 
-            # offsets from anchor centre → mold centres
-            anc_cx = anc_x + anc_w // 2
-            anc_cy = anc_y + anc_h // 2
-            a_cx   = ax + aw // 2
-            a_cy   = ay + ah // 2
-            b_cy   = by + ah // 2
-            mold_a_shift = [a_cx - anc_cx,  a_cy - anc_cy]   # negative Y (above)
-            mold_b_shift = [a_cx - anc_cx,  b_cy - anc_cy]   # ≈ 0 Y
+            mold_a_shift = [a_cx - anc_cx,  a_cy - anc_cy]   # +x, -y
+            mold_b_shift = [a_cx - anc_cx,  b_cy - anc_cy]   # +x, +y
 
-            # ── Pin ROI rect ─────────────────────────────────────────
-            pin_w    = max(4, int(aw * PIN_W_RATIO))
-            full_h   = (by + ah) - ay                   # A-top to B-bottom
+            # ── Per-mold pin ROI (left of each mold, same width) ─────
+            pin_w = max(4, int(aw * PIN_W_RATIO))
             pin_cx = ax - int(aw * PIN_GAP_RATIO) - pin_w // 2
-            pin_x  = max(0,  pin_cx - pin_w // 2)
-            pin_y    = max(0,  ay)
-            pin_rect = QtCore.QRect(pin_x, pin_y,
-                                    min(pin_w, iw - pin_x),
-                                    min(full_h, ih - pin_y))
+            pin_lx = max(0, pin_cx - pin_w // 2)
+
+            pin_a_rect = QtCore.QRect(pin_lx, max(0, ay),
+                                      min(pin_w, iw - pin_lx),
+                                      min(ah, ih - ay))
+            pin_b_rect = QtCore.QRect(pin_lx, max(0, by),
+                                      min(pin_w, iw - pin_lx),
+                                      min(ah, ih - by))
 
             anchor_sec = self._encode_section(image_bgr, anchor_rect)
-            pin_sec    = self._encode_section(image_bgr, pin_rect)
+            pin_a_sec  = self._encode_section(image_bgr, pin_a_rect)
+            pin_b_sec  = self._encode_section(image_bgr, pin_b_rect)
 
             recipe = {
                 "version":      6,
@@ -2317,7 +2321,8 @@ class InspectionController:
                 "mold_a_shift": mold_a_shift,
                 "mold_b_shift": mold_b_shift,
                 "anchor":       anchor_sec,
-                "pin":          pin_sec,
+                "pin_a":        pin_a_sec,
+                "pin_b":        pin_b_sec,
                 "grid_letters": grid_letters,
             }
             with open(self.RECIPE_FILE, "w") as f:
@@ -2348,7 +2353,8 @@ class InspectionController:
             "mold_a_shift": raw["mold_a_shift"],
             "mold_b_shift": raw["mold_b_shift"],
             "anchor":       self._decode_section(raw["anchor"]),
-            "pin":          self._decode_section(raw["pin"]),
+            "pin_a":        self._decode_section(raw["pin_a"]),
+            "pin_b":        self._decode_section(raw["pin_b"]),
             "grid_letters": raw.get("grid_letters", [""] * 9),
         }
 
@@ -2467,10 +2473,6 @@ class InspectionController:
         for f_idx, (anc_cx, anc_cy, fscore, fw, fh, fscale) in enumerate(matches):
             ResultAnnotator.draw_frame(display, anc_cx, anc_cy, fw, fh, f_idx, fscore)
 
-            # Pin/lead presence check once per anchor (covers both A and B)
-            leads_present = self._eng.check_pin_presence(
-                src, anc_cx, anc_cy, recipe, iw, ih)
-
             mold_areas = self._step2_locate_molds(
                 recipe, anc_cx, anc_cy, fscale, iw, ih, f_idx)
 
@@ -2481,6 +2483,12 @@ class InspectionController:
                 aw,  ah   = area["w"],   area["h"]
                 mold_size = min(aw, ah)
                 ic_num    = f_idx * 2 + m_idx   # A=2i, B=2i+1  (0-based)
+
+                # Per-mold pin presence check before font inspection
+                pin_key       = "pin_a" if area["label"] == "A" else "pin_b"
+                leads_present = self._eng.check_pin_presence(
+                    src, anc_cx, anc_cy,
+                    recipe[pin_key], recipe["anchor"], iw, ih)
 
                 t0_mold = time.perf_counter()
                 letter_results = self._step3_inspect_fonts(
@@ -4198,7 +4206,8 @@ class MainWindow(QtWidgets.QWidget):
         # Frame template creation state
         self._frame_rects: list             = [None, None, None]
         self._frame_panel: FrameTemplatePanel | None = None
-        self._FRAME_TAGS = ["MOLD_A", "MOLD_B", "ANCHOR", "PIN_ROI"]
+        self._FRAME_TAGS  = ["MOLD_A", "MOLD_B", "ANCHOR", "PIN_A", "PIN_B"]
+        self._yolo_pair_offset: int         = 0    # retry cycles through pairs
 
         # Mask work-in-progress
         self._mask_wip    = None
@@ -4335,8 +4344,9 @@ class MainWindow(QtWidgets.QWidget):
                 "Example:  ,9,H,B,,6,W,8,7")
             return
 
-        self._frame_rects = [None, None, None]
-        self._mode        = "frame"
+        self._frame_rects      = [None, None, None]
+        self._yolo_pair_offset = 0
+        self._mode             = "frame"
         self._clear_frame_overlays()
 
         self._frame_panel = FrameTemplatePanel(
@@ -4365,49 +4375,60 @@ class MainWindow(QtWidgets.QWidget):
         all_rects = self._ctrl.yolo.detect_all(self._image)
         self._clear_frame_overlays()
 
-        if len(all_rects) < 2:
+        offset = self._yolo_pair_offset
+        needed = offset + 2               # need at least offset+1 and offset+2
+
+        if len(all_rects) < needed:
             self._frame_rects[0] = None
             self._frame_rects[1] = None
             self._frame_panel.set_no_detection()
             self._panel.log(
-                f"YOLO: need ≥2 molds, got {len(all_rects)}.", "#ffaa44")
+                f"YOLO: only {len(all_rects)} mold(s) detected, "
+                f"need ≥{needed} for pair offset {offset}.", "#ffaa44")
             return
 
-        rect_a = all_rects[0]
-        rect_b = all_rects[1]
+        rect_a = all_rects[offset]
+        rect_b = all_rects[offset + 1]
         self._frame_rects[0] = rect_a
         self._frame_rects[1] = rect_b
 
         aw, ah  = rect_a.width(), rect_a.height()
         ax, ay  = rect_a.x(),    rect_a.y()
         by      = rect_b.y()
-        pitch_y = by - ay
         mcx_a   = ax + aw // 2
+        a_cy    = ay + ah // 2
+        b_cy    = by + ah // 2
 
-        # anchor rect (matches save_frame_recipe geometry)
-        anc_cx  = mcx_a - int(aw * 0.85)
-        anc_w   = int(aw * 0.7)
-        anc_y   = max(0, ay + pitch_y)
-        anchor_rect = QtCore.QRect(max(0, anc_cx - anc_w // 2), anc_y, anc_w, ah)
+        # anchor — diagonal midpoint between A and B
+        anc_cx = mcx_a - int(aw * 0.85)
+        anc_cy = (a_cy + b_cy) // 2
+        anc_w  = int(aw * 0.7)
+        anchor_rect = QtCore.QRect(
+            max(0, anc_cx - anc_w // 2), max(0, anc_cy - ah // 2), anc_w, ah)
 
-        # pin ROI rect (narrow left strip covering full AB height)
-        pin_w   = max(4, int(aw * 0.20))
-        full_h  = (by + ah) - ay
-        pin_cx  = ax - int(aw * 0.05) - pin_w // 2
-        pin_rect = QtCore.QRect(max(0, pin_cx - pin_w // 2), ay, pin_w, full_h)
+        # per-mold pin strips (left of each mold)
+        pin_w  = max(4, int(aw * 0.20))
+        pin_cx = ax - int(aw * 0.05) - pin_w // 2
+        pin_lx = max(0, pin_cx - pin_w // 2)
+        pin_a_rect = QtCore.QRect(pin_lx, ay, pin_w, ah)
+        pin_b_rect = QtCore.QRect(pin_lx, by, pin_w, ah)
 
-        self._view.add_overlay(rect_a,      QtGui.QColor(0, 224, 255),  "MOLD_A",  "dash")
-        self._view.add_overlay(rect_b,      QtGui.QColor(0, 180, 255),  "MOLD_B",  "dash")
-        self._view.add_overlay(anchor_rect, QtGui.QColor(255, 220, 0),  "ANCHOR",  "dash")
-        self._view.add_overlay(pin_rect,    QtGui.QColor(255, 100, 200), "PIN_ROI", "dash")
+        self._view.add_overlay(rect_a,      QtGui.QColor(0,   224, 255), "MOLD_A", "dash")
+        self._view.add_overlay(rect_b,      QtGui.QColor(0,   180, 255), "MOLD_B", "dash")
+        self._view.add_overlay(anchor_rect, QtGui.QColor(255, 220, 0),   "ANCHOR", "dash")
+        self._view.add_overlay(pin_a_rect,  QtGui.QColor(255, 120, 200), "PIN_A",  "dash")
+        self._view.add_overlay(pin_b_rect,  QtGui.QColor(255, 120, 200), "PIN_B",  "dash")
 
-        desc = (f"A: {aw}×{ah}px  B: {rect_b.width()}×{rect_b.height()}px  "
-                f"pitch={pitch_y}px  total={len(all_rects)} molds")
+        desc = (f"Pair [{offset},{offset+1}]  "
+                f"A: {aw}×{ah}px  pitch={by - ay}px  "
+                f"total={len(all_rects)} molds")
         self._frame_panel.set_detected(desc)
-        self._panel.log(f"YOLO: pair detected — {desc}", "#88ff88")
+        self._panel.log(f"YOLO: {desc}", "#88ff88")
 
     def _on_frame_retry(self):
-        self._panel.log("Retrying detection…", "#00e5ff")
+        self._yolo_pair_offset += 1
+        self._panel.log(
+            f"Retrying — trying pair offset {self._yolo_pair_offset}…", "#00e5ff")
         self._run_yolo_detection()
 
     def _on_frame_confirm(self):
