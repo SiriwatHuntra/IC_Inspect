@@ -1762,7 +1762,9 @@ class InspectionEngine:
 
         if best_conf < OCR_MIN_CONF:
             return "?", round(best_conf, 4)
-        if best_conf - second_conf < OCR_CONF_GAP_MIN:
+        # Gap check only when best is NOT the expected char; if expected char wins,
+        # ambiguity vs similar-looking chars is irrelevant (confirmed match).
+        if best_char != expected_char and best_conf - second_conf < OCR_CONF_GAP_MIN:
             return "?", round(best_conf, 4)
 
         return best_char, round(best_conf, 4)
