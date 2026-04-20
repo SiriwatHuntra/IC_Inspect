@@ -81,7 +81,7 @@ CAMERA_EXPOSURE_US   = 8000     # µs — overridden by RightPanel at runtime
 
 # ---- Font Inspection Constants (hardcoded, not user-tunable) ----
 FONT_CONFIDENCE_MIN        = 0.60
-FONT_SHIFT_RATIO_MAX       = 0.20
+FONT_SHIFT_RATIO_MAX       = 0.30
 FONT_ASPECT_TOLERANCE      = 0.25
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
@@ -2223,9 +2223,9 @@ class InspectionController:
             mcy = mold_rect.y() + mh // 2
 
             # derive frame rect (left lead area)
-            fw  = mw // 2
+            fw  = int(mw * 0.7)
             fh  = mh
-            fcx = mcx - mw * 3 // 4
+            fcx = mcx - int(mw * 0.85)
             fcy = mcy
             fx  = max(0, fcx - fw // 2)
             fy  = max(0, fcy - fh // 2)
@@ -4311,8 +4311,8 @@ class MainWindow(QtWidgets.QWidget):
         mw, mh = mold_rect.width(), mold_rect.height()
         mcx = mold_rect.x() + mw // 2
         mcy = mold_rect.y() + mh // 2
-        fw  = mw // 2
-        fcx = mcx - mw * 3 // 4
+        fw  = int(mw * 0.7)
+        fcx = mcx - int(mw * 0.85)
         frame_rect = QtCore.QRect(fcx - fw // 2, mcy - mh // 2, fw, mh)
         self._view.add_overlay(frame_rect, QtGui.QColor(255, 220, 0), "FRAME", "dash")
 
