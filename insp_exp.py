@@ -126,7 +126,6 @@ def _compute_hog(canvas: np.ndarray) -> np.ndarray:
 
 # ---- OCR Constants (HOG cosine similarity — range 0.0–1.0) ----
 OCR_CONF_EXPECTED  = 0.88   # fast path: return immediately if ≥ this
-OCR_EARLY_EXIT_IOC = 0.82   # skip secondary group if primary best ≥ this
 OCR_MIN_CONF       = 0.55   # below this → report "?" (unreadable)
 OCR_CONF_GAP_MIN   = 0.10   # best must exceed 2nd-best by this — filters circular reflections
                              # that score similarly on "2","0","O","8" (small gap → "?")
@@ -1682,7 +1681,7 @@ class InspectionEngine:
 
         Stage 2 — Group search (fallback)
             Alpha / numeric groups ordered by expected char type.
-            Early exit if best reaches OCR_EARLY_EXIT_IOC (0.82).
+            Skip next group only when best already exceeds exp_conf.
 
         Returns (char: str, conf: float).
         Returns ("?", conf) if nothing clears OCR_MIN_CONF (0.55).
@@ -1736,6 +1735,10 @@ class InspectionEngine:
             return expected_char, round(exp_conf, 4)
 
         # ── Stage 2: group search — seeded with expected char ──────
+        # Same-type group runs first (alpha→alpha, num→num).
+        # Each group is fully scored before deciding whether to continue.
+        # Skip remaining groups only when a template already beat exp_conf —
+        # a different-type match can never be more reliable than same-type.
         best_char   = expected_char if exp_conf >= OCR_MIN_CONF else "?"
         best_conf   = exp_conf
         second_conf = 0.0
@@ -1757,13 +1760,12 @@ class InspectionEngine:
                     best_char   = name
                 elif score > second_conf:
                     second_conf = score
-            if best_conf >= OCR_EARLY_EXIT_IOC:
+            # Full group scored — only skip next group if a winner beat exp_conf
+            if best_conf > exp_conf:
                 break
 
         if best_conf < OCR_MIN_CONF:
             return "?", round(best_conf, 4)
-        # Gap check only when best is NOT the expected char; if expected char wins,
-        # ambiguity vs similar-looking chars is irrelevant (confirmed match).
         if best_char != expected_char and best_conf - second_conf < OCR_CONF_GAP_MIN:
             return "?", round(best_conf, 4)
 
