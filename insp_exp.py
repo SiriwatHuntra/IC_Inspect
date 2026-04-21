@@ -67,8 +67,8 @@ class InspectionResult:
 DEBUG_MODE     = True
 PIN_ROI_W          = 120       # fixed capture size in image-space px
 PIN_ROI_H          = 150
-PIN_SOBEL_MAG      = 30        # minimum Sobel Y magnitude counted as a strong edge
-PIN_EDGE_RATIO     = 0.10      # fraction of inner-ROI pixels that must be strong edges
+PIN_SOBEL_MAG      = 40        # minimum Sobel Y magnitude counted as a strong edge
+PIN_EDGE_RATIO     = 0.150      # fraction of inner-ROI pixels that must be strong edges
 PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in result map
 PIN_IOU_THR     = 0.50   # NMS overlap threshold
 
@@ -76,7 +76,7 @@ MIN_CONTOUR_AREA     = 1
 MIN_CONTOUR_SOLIDITY = 0.35   # convex-hull fill ratio; rough surface noise < 0.35; serif I ≈ 0.40
 MIN_CONTOUR_EXTENT   = 0.20   # area / bounding-rect; sparse blobs fail this
 MIN_CONTOUR_REL_AREA = 0.003  # fraction of ROI area; rejects sub-0.3% specks
-IMAGE_SOURCE_DIR  = "Aug/"
+IMAGE_SOURCE_DIR  = "image_source/"
 OUTPUT_DIR        = "Inspection_result"
 
 # Camera
