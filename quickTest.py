@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-IMG_PATH = "debug/8_0_gray.png"
+IMG_PATH = "debug/B_0_gray.png"
 MOLD_SIZE = 150
 
 

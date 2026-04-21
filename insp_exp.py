@@ -36,6 +36,7 @@ import csv
 import base64
 import cv2
 import numpy as np
+from collections import defaultdict
 from datetime import datetime
 from PyQt5 import QtWidgets, QtGui, QtCore
 from dataclasses import dataclass, field
@@ -2473,14 +2474,24 @@ class InspectionController:
 
         recipe = getattr(self, "_active_recipe", None)
         if recipe is None:
-            print("[Pipeline] prepare() not called or failed.")
+            print("[Pipeline] prepare() not called — no recipe loaded.")
             return empty
 
         pin_params = getattr(self, "_active_pin_params", None)
+        if pin_params is None:
+            print("[Pipeline] set_run_params() not called — using defaults.")
+            pin_params = {}
+
         t0_total = time.perf_counter()
 
+        try:
+            anchor_tmpl = recipe["anchor"]
+        except KeyError:
+            print("[Pipeline] Recipe missing 'anchor' key — re-save template.")
+            return empty
+
         matches = self._step1_find_frames(
-            image_bgr, recipe["anchor"], pin_params, mask)
+            image_bgr, anchor_tmpl, pin_params, mask)
 
         if not matches:
             print("[Pipeline] No anchor matches found.")
@@ -2800,7 +2811,7 @@ class InspectionController:
             })
 
             # ── Per-slot diagnostic for any failure ─────────────────
-            if not res["pass"]:
+            if not res["pass"] and DEBUG_MODE:
                 step = res["defect_step"]
                 print(
                     f"[DIAG] F{f_idx+1}-{mold_label} s{slot_idx}({letter})"
@@ -2845,7 +2856,8 @@ class RunWorker(QtCore.QThread):
                  run_from_io: bool = False,
                  io_recipe:   list = None,
                  ui_grid:     list = None,
-                 camera:      "BaslerCamera | None" = None):
+                 camera:      "BaslerCamera | None" = None,
+                 sm:          "SettingsManager | None" = None):
         super().__init__()
         self._ctrl        = ctrl
         self._io          = io
@@ -2855,6 +2867,7 @@ class RunWorker(QtCore.QThread):
         self._io_recipe   = io_recipe or []
         self._ui_grid     = ui_grid   or []
         self._camera      = camera
+        self._sm          = sm
         self._stop_flag   = False
 
     def stop(self):
@@ -2901,7 +2914,7 @@ class RunWorker(QtCore.QThread):
                                 "fail_causes", "elapsed_ms"])
                 for ic_num in sorted(ic_groups.keys()):
                     group = ic_groups[ic_num]
-                    if all(r.get("reason") == "no_lead_skip" for r in group):
+                    if all(r.get("reason") == "dropped" for r in group):
                         continue
                     r0      = group[0]
                     passed  = all(r["pass"] for r in group)
@@ -2958,8 +2971,6 @@ class RunWorker(QtCore.QThread):
             all_pass = (result.passed == result.total and result.total > 0)
 
             # ── Per-mold summary ──────────────────────────────────
-            # Group results by ic_num
-            from collections import defaultdict
             ic_groups: dict = defaultdict(list)
             for r in result.results:
                 ic_groups[r.get("ic_num", 0)].append(r)
@@ -2975,11 +2986,11 @@ class RunWorker(QtCore.QThread):
                 color    = "#88ff88" if passed else "#ff4444"
 
                 # Check no-lead
-                no_lead = all(r.get("reason") == "no_lead_skip" for r in group)
+                no_lead = all(r.get("reason") == "dropped" for r in group)
                 if no_lead:
                     self._log(
                         f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
-                        f"NO LEAD — skipped (pass)  "
+                        f"DROP WORK — skipped (pass)  "
                         f"[{mold_ms:.1f}ms]",
                         "#888888")
                     continue
@@ -3041,6 +3052,9 @@ class RunWorker(QtCore.QThread):
             if not triggered or self._stop_flag:
                 break
 
+            if self._sm is not None:
+                self._sm.save()
+
             self._io.set_busy(True)
 
             img = self._camera.grab()
@@ -3058,7 +3072,6 @@ class RunWorker(QtCore.QThread):
             all_pass = (result.passed == result.total and result.total > 0)
 
             # ── Per-mold summary ──────────────────────────────────
-            from collections import defaultdict
             ic_groups: dict = defaultdict(list)
             for r in result.results:
                 ic_groups[r.get("ic_num", 0)].append(r)
@@ -3073,11 +3086,11 @@ class RunWorker(QtCore.QThread):
                 verdict  = "PASS" if passed else "NG"
                 color    = "#88ff88" if passed else "#ff4444"
 
-                no_lead = all(r.get("reason") == "no_lead_skip" for r in group)
+                no_lead = all(r.get("reason") == "dropped" for r in group)
                 if no_lead:
                     self._log(
                         f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
-                        f"NO LEAD — skipped (pass)  "
+                        f"DROP WORK — skipped (pass)  "
                         f"[{mold_ms:.1f}ms]",
                         "#888888")
                     continue
@@ -4745,6 +4758,7 @@ class MainWindow(QtWidgets.QWidget):
             io_recipe   = list(self._io_recipe),
             ui_grid     = self._panel.grid_letters(),
             camera      = self._camera if not DEBUG_MODE else None,
+            sm          = sm,
         )
         self._worker.sig_image.connect(self._view.set_image)
         self._worker.sig_result.connect(self._panel.log)
