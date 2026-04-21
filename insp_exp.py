@@ -73,10 +73,10 @@ PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in resu
 PIN_IOU_THR     = 0.50   # NMS overlap threshold
 
 MIN_CONTOUR_AREA     = 1
-MIN_CONTOUR_SOLIDITY = 0.45   # convex-hull fill ratio; rough surface noise < 0.35
+MIN_CONTOUR_SOLIDITY = 0.35   # convex-hull fill ratio; rough surface noise < 0.35; serif I ≈ 0.40
 MIN_CONTOUR_EXTENT   = 0.20   # area / bounding-rect; sparse blobs fail this
 MIN_CONTOUR_REL_AREA = 0.003  # fraction of ROI area; rejects sub-0.3% specks
-IMAGE_SOURCE_DIR  = "image_source/"
+IMAGE_SOURCE_DIR  = "Aug/"
 OUTPUT_DIR        = "Inspection_result"
 
 # Camera
@@ -86,7 +86,7 @@ CAMERA_EXPOSURE_US   = 8000     # µs — overridden by RightPanel at runtime
 
 # ---- Font Inspection Constants (hardcoded, not user-tunable) ----
 FONT_CONFIDENCE_MIN        = 0.60
-FONT_SHIFT_RATIO_MAX       = 0.30
+FONT_SHIFT_RATIO_MAX       = 0.50
 FONT_ASPECT_TOLERANCE      = 0.25
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
@@ -607,22 +607,18 @@ class ContourTemplate:
 
     @staticmethod
     def _thresh_font(gray: np.ndarray, mold_size: int = 150) -> np.ndarray:
-        # ── Step 1 : Noise filter — kernel scaled to mold size ────
-        k_blur = max(5, (mold_size // 20) | 1)   # ~7px at mold=150
-        blur = cv2.GaussianBlur(gray, (k_blur, k_blur), 0)
+        # Step 1: bilateral filter — edge-preserving noise reduction
+        filtered = cv2.bilateralFilter(gray, 9, 50, 50)
 
-        # ── Step 2 : White top-hat — isolates bright strokes ─────
-        # Kernel anchored to mold_size, not ROI size
-        k_size = max(9, (mold_size // 8) | 1)          # odd, ~18px at mold=150
-        kernel  = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (k_size, k_size))
-        tophat  = cv2.morphologyEx(blur, cv2.MORPH_TOPHAT, kernel)
+        # Step 2: white top-hat — isolates bright strokes on dark background
+        k_size = max(9, (mold_size // 8) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+        tophat = cv2.morphologyEx(filtered, cv2.MORPH_TOPHAT, kernel)
 
-        # ── Step 3 : Otsu threshold ───────────────────────────────
-        _, binary = cv2.threshold(
-            tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Step 3: Otsu threshold
+        _, binary = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # ── Step 4 : Border mask — kill edge spikes ───────────────
+        # Step 4: border mask — suppress edge artifacts
         h, w   = binary.shape[:2]
         margin = max(3, mold_size // 50)
         mask   = np.zeros((h, w), dtype=np.uint8)
@@ -652,14 +648,16 @@ class ContourTemplate:
     def _morph_font(binary: np.ndarray, mold_size: int = 150) -> np.ndarray:
         # OPEN first  — kills isolated speck noise before stitching
         # CLOSE after — bridges stroke gaps with a larger kernel
-        k_open  = max(2, mold_size // 40)           # ~4px at mold=150
-        k_close = max(3, mold_size // 20)           # ~7-8px at mold=150
+        k_open  = max(2, mold_size // 60)           # ~2px at mold=150
+        k_close = max(2, mold_size // 50)           # ~3px at mold=150  — bridges small gaps only
+        # CLOSE first — fills 1-2px breaks (serif junctions) without closing letter holes
+        # OPEN after  — removes isolated noise blobs
         out = cv2.morphologyEx(
-            binary, cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (k_open,  k_open)))
-        out = cv2.morphologyEx(
-            out,    cv2.MORPH_CLOSE,
+            binary, cv2.MORPH_CLOSE,
             cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close)))
+        out = cv2.morphologyEx(
+            out,    cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (k_open,  k_open)))
         return out
 
     # =========================================================
@@ -1949,6 +1947,7 @@ class InspectionEngine:
 
         orig_roi_h, orig_roi_w = gray.shape[:2]
         roi_h, roi_w = gray.shape[:2]
+        roi_thresh = ContourTemplate._thresh_font(gray, mold_size)
 
         tmpl_contours = tmpl.get("contours", [])
 
@@ -1961,6 +1960,8 @@ class InspectionEngine:
                 "reason":      reason,
                 "defect_step": step,
                 "roi_canvas":  None,
+                "roi_thresh":  roi_thresh,
+                "tmpl_canvas": tmpl.get("canvas"),
                 "orig_roi_w":  orig_roi_w,
                 "orig_roi_h":  orig_roi_h,
             }
@@ -2042,6 +2043,8 @@ class InspectionEngine:
             "reason":      "OK",
             "defect_step": 0,
             "roi_canvas":  canvas,
+            "roi_thresh":  roi_thresh,
+            "tmpl_canvas": tmpl.get("canvas"),
             "orig_roi_w":  orig_roi_w,
             "orig_roi_h":  orig_roi_h,
         }
@@ -2146,59 +2149,50 @@ class ResultAnnotator:
     @staticmethod
     def draw_letter(display: np.ndarray,
                     result:  dict):
-        passed     = result["pass"]
-        letter     = result["letter"]
-        confidence = result["confidence"]
-        lx1        = result["lx1"]
-        ly1        = result["ly1"]
-        lx2        = result["lx2"]
-        ly2        = result["ly2"]
-        roi_canvas = result.get("roi_canvas")
-        ocr_char   = result.get("ocr_char", "?")
-        ocr_conf   = result.get("ocr_conf",  0.0)
+        passed      = result["pass"]
+        letter      = result["letter"]
+        confidence  = result["confidence"]
+        lx1         = result["lx1"]
+        ly1         = result["ly1"]
+        lx2         = result["lx2"]
+        ly2         = result["ly2"]
+        ocr_char    = result.get("ocr_char", "?")
+        ocr_conf    = result.get("ocr_conf",  0.0)
+        roi_thresh  = result.get("roi_thresh")
+        tmpl_canvas = result.get("tmpl_canvas")
 
-        col = ResultAnnotator.COLOR_PASS if passed else ResultAnnotator.COLOR_FAIL
+        col      = ResultAnnotator.COLOR_PASS if passed else ResultAnnotator.COLOR_FAIL
+        cell_w   = lx2 - lx1
+        cell_h   = ly2 - ly1
 
-        # ── Compact label: "A: 0.98" ──────────────────────────────
+        # ── Template ghost — dim gray edges show expected shape ───
+        if tmpl_canvas is not None and tmpl_canvas.size > 0 and cell_w > 0 and cell_h > 0:
+            trs = cv2.resize(tmpl_canvas, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
+            tcnts, _ = cv2.findContours(trs, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(display[ly1:ly2, lx1:lx2], tcnts, -1, (90, 90, 90), 1)
+
+        # ── Extracted edges — threshold contours in pass/fail color ──
+        if roi_thresh is not None and roi_thresh.size > 0 and cell_w > 0 and cell_h > 0:
+            rrs = cv2.resize(roi_thresh, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
+            rcnts, _ = cv2.findContours(rrs, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(display[ly1:ly2, lx1:lx2], rcnts, -1, col, 1)
+
+        # ── Label with black background ───────────────────────────
         if letter:
             lbl = f"{letter}: {confidence:.2f}"
         else:
             lbl = f"!{ocr_char}: {ocr_conf:.2f}"
-        cv2.putText(display, lbl,
-                    (lx1, max(ly1 - 3, 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, col, 1)
-
-        # ── Contour overlay (no bounding box) ────────────────────
-        if roi_canvas is not None and roi_canvas.size > 0:
-            canvas_h, canvas_w = roi_canvas.shape[:2]
-            cell_w = lx2 - lx1
-            cell_h = ly2 - ly1
-            scale_x = cell_w / max(canvas_w, 1)
-            scale_y = cell_h / max(canvas_h, 1)
-
-            # Outer contours
-            outer, _ = cv2.findContours(
-                roi_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # Inner contours (holes) — invert, exclude any touching canvas border
-            inner_all, _ = cv2.findContours(
-                cv2.bitwise_not(roi_canvas), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            inner = [
-                c for c in inner_all
-                if cv2.contourArea(c) >= MIN_CONTOUR_AREA
-                and not _touches_border(c, canvas_w, canvas_h)
-            ]
-
-            for cnts in (outer, inner):
-                if not cnts:
-                    continue
-                shifted = []
-                for c in cnts:
-                    scaled = c.astype(np.float32).copy()
-                    scaled[..., 0] = scaled[..., 0] * scale_x + lx1
-                    scaled[..., 1] = scaled[..., 1] * scale_y + ly1
-                    shifted.append(scaled.astype(np.int32))
-                cv2.drawContours(display, shifted, -1, col, 1)
+        font       = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.30
+        thickness  = 1
+        (tw, th), baseline = cv2.getTextSize(lbl, font, font_scale, thickness)
+        tx = lx1
+        ty = max(ly1 - 2, th + baseline)
+        cv2.rectangle(display,
+                      (tx, ty - th - baseline),
+                      (tx + tw, ty + baseline),
+                      (0, 0, 0), cv2.FILLED)
+        cv2.putText(display, lbl, (tx, ty), font, font_scale, col, thickness)
                 
     
 # =========================================================
@@ -2296,9 +2290,6 @@ class InspectionController:
         grid_letters : list of exactly 9 strings (empty = skip), row-major.
         Returns True on success.
         """
-        PIN_GAP_RATIO = 0.05
-        PIN_W_RATIO   = 0.20
-
         try:
             ih, iw = image_bgr.shape[:2]
 
@@ -2306,29 +2297,28 @@ class InspectionController:
             aw, ah = mold_a_rect.width(), mold_a_rect.height()
             by = mold_b_rect.y()
 
-            mcx_a = ax + aw // 2
-            a_cx  = mcx_a
+            a_cx  = ax + aw // 2
             a_cy  = ay + ah // 2
             b_cy  = by + ah // 2
 
-            # ── Anchor rect (diagonal midpoint between A and B) ───────
-            anc_cx  = mcx_a - int(aw * 0.85)
-            anc_cy  = (a_cy + b_cy) // 2               # midpoint of mold centres
-            anc_w   = int(aw * 0.7)
+            # ── Anchor rect — mold width, right edge flush with mold A left edge ──
+            anc_w   = aw
             anc_h   = ah
-            anc_x   = max(0,  anc_cx - anc_w // 2)
-            anc_y   = max(0,  anc_cy - anc_h // 2)
+            anc_x   = max(0, ax - aw)
+            anc_y   = max(0, (a_cy + b_cy) // 2 - anc_h // 2)
             anc_w   = min(anc_w, iw - anc_x)
             anc_h   = min(anc_h, ih - anc_y)
-            anc_cx  = anc_x + anc_w // 2               # recompute after clamping
+            anc_cx  = anc_x + anc_w // 2
             anc_cy  = anc_y + anc_h // 2
             anchor_rect = QtCore.QRect(anc_x, anc_y, anc_w, anc_h)
 
-            mold_a_shift = [a_cx - anc_cx,  a_cy - anc_cy]   # +x, -y
-            mold_b_shift = [a_cx - anc_cx,  b_cy - anc_cy]   # +x, +y
+            mold_a_shift = [a_cx - anc_cx,  a_cy - anc_cy]
+            mold_b_shift = [a_cx - anc_cx,  b_cy - anc_cy]
 
-            # ── Per-mold pin ROI (left of each mold, same width) ─────
-            pin_w = max(4, int(aw * PIN_W_RATIO))
+            # ── Per-mold pin ROI (left of each mold, narrow strip) ──────
+            PIN_GAP_RATIO = 0.05
+            PIN_W_RATIO   = 0.20
+            pin_w  = max(4, int(aw * PIN_W_RATIO))
             pin_cx = ax - int(aw * PIN_GAP_RATIO) - pin_w // 2
             pin_lx = max(0, pin_cx - pin_w // 2)
 
@@ -2631,7 +2621,7 @@ class InspectionController:
         roi_h    = int(cell_h * 1.2)
 
         if not leads_present:
-            # Work dropped — return pass results for all active slots
+            # Work dropped — pass all slots, draw single mold-level label
             for slot_idx, letter in enumerate(grid_letters):
                 if not letter:
                     continue
@@ -2649,13 +2639,23 @@ class InspectionController:
                     "shift_px":    0.0,
                     "shift_ratio": 0.0,
                     "defect_step": 0,
-                    "reason":      "no_lead_skip",
+                    "reason":      "dropped",
                     "cell_cx":     grid_cx + dx,
                     "cell_cy":     grid_cy + dy,
                     "elapsed_ms":  0.0,
                     "lx1": 0, "ly1": 0, "lx2": 0, "ly2": 0,
                     "roi_canvas":  None,
                 })
+
+            # Draw "Drop Work" label centred on mold
+            lbl = "Drop Work"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (tw, th), bl = cv2.getTextSize(lbl, font, 0.5, 1)
+            tx = acx - tw // 2
+            ty = acy + th // 2
+            cv2.rectangle(display, (tx - 2, ty - th - bl), (tx + tw + 2, ty + bl),
+                           (0, 0, 0), cv2.FILLED)
+            cv2.putText(display, lbl, (tx, ty), font, 0.5, (0, 200, 200), 1)
             return results
 
         # ── Normal font inspection ────────────────────────────────
@@ -4438,18 +4438,16 @@ class MainWindow(QtWidgets.QWidget):
         aw, ah  = rect_a.width(), rect_a.height()
         ax, ay  = rect_a.x(),    rect_a.y()
         by      = rect_b.y()
-        mcx_a   = ax + aw // 2
         a_cy    = ay + ah // 2
         b_cy    = by + ah // 2
 
-        # anchor — diagonal midpoint between A and B
-        anc_cx = mcx_a - int(aw * 0.85)
+        # anchor — mold width, right edge flush with mold A left edge
         anc_cy = (a_cy + b_cy) // 2
-        anc_w  = int(aw * 0.7)
+        anc_w  = aw
         anchor_rect = QtCore.QRect(
-            max(0, anc_cx - anc_w // 2), max(0, anc_cy - ah // 2), anc_w, ah)
+            max(0, ax - aw), max(0, anc_cy - ah // 2), anc_w, ah)
 
-        # per-mold pin strips (left of each mold)
+        # per-mold pin strips (left of each mold, narrow strip)
         pin_w  = max(4, int(aw * 0.20))
         pin_cx = ax - int(aw * 0.05) - pin_w // 2
         pin_lx = max(0, pin_cx - pin_w // 2)
