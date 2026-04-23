@@ -2064,14 +2064,12 @@ class InspectionEngine:
         missing_ratio = round(int(np.count_nonzero(missing)) / union_area, 4)
 
         # ── Secondary-contour check (blobs outside aligned bbox) ─────
-        roi_area         = max(roi_h * roi_w, 1)
-        others_max_ratio = 0.0
-        sig_others       = []   # contours in ROI space for overlay drawing
+        roi_area          = max(roi_h * roi_w, 1)
+        others_max_ratio  = 0.0
         for c in others:
             r = cv2.contourArea(c) / roi_area
             if r >= ANOMALY_MIN_AREA_RATIO:
                 others_max_ratio = max(others_max_ratio, r)
-                sig_others.append(c)
 
         # ── Decision ─────────────────────────────────────────────────
         dirty_type = "none"
@@ -2081,17 +2079,13 @@ class InspectionEngine:
             dirty_type = "missing_stroke"
 
         area_ratio = round(max(extra_ratio, missing_ratio, others_max_ratio), 4)
-        detected   = dirty_type != "none"
 
         return {
-            "detected":        detected,
-            "type":            dirty_type,
-            "extra_ratio":     extra_ratio,
-            "missing_ratio":   missing_ratio,
-            "area_ratio":      area_ratio,
-            "extra_mask":      extra   if detected else None,
-            "missing_mask":    missing if detected else None,
-            "others_contours": sig_others,
+            "detected":      dirty_type != "none",
+            "type":          dirty_type,
+            "extra_ratio":   extra_ratio,
+            "missing_ratio": missing_ratio,
+            "area_ratio":    area_ratio,
         }
 
     # =========================================================
@@ -2343,40 +2337,36 @@ class ResultAnnotator:
         cell_w   = lx2 - lx1
         cell_h   = ly2 - ly1
 
-        # ── Dirty overlay — semi-transparent red / orange fill ────
-        # Comparison is done in display-cell space (cell_w × cell_h) so that
-        # pixel positions match the actual ROI region on screen.
-        # roi_canvas  — contour mask in ROI-local coords (≈ cell_w × cell_h)
-        # tmpl_canvas — template mask at save-time ROI size (any size)
-        # Both are resized to (cell_w, cell_h) before subtraction so they are
-        # spatially registered to the same display window.
-        dirty_info = result.get("dirty", {})
-        if (not passed) and dirty_info.get("detected") and cell_w > 0 and cell_h > 0:
+        # ── Dirty overlay — semi-transparent fill (lowest layer) ─────
+        # Shows for ANY failing slot, not just dirty-detected ones.
+        # roi_canvas vs tmpl_canvas are compared in display-cell space so
+        # pixel positions map correctly onto the screen region.
+        if (not passed) and cell_w > 0 and cell_h > 0:
             roi_view   = display[ly1:ly2, lx1:lx2]
             roi_canvas = result.get("roi_canvas")
 
             if roi_canvas is not None and tmpl_canvas is not None:
-                # Resize both to display-cell dimensions
                 rc_d = cv2.resize(roi_canvas,  (cell_w, cell_h),
                                   interpolation=cv2.INTER_NEAREST)
                 tc_d = cv2.resize(tmpl_canvas, (cell_w, cell_h),
                                   interpolation=cv2.INTER_NEAREST)
 
-                # Missing stroke — template has pixels, ROI does not → orange
+                # Missing stroke — template has, ROI does not → orange
                 missing_d = cv2.subtract(tc_d, rc_d)
                 if np.any(missing_d):
-                    overlay = roi_view.copy()
-                    overlay[missing_d > 0] = (0, 128, 255)
-                    cv2.addWeighted(overlay, 0.45, roi_view, 0.55, 0, roi_view)
+                    ov = roi_view.copy()
+                    ov[missing_d > 0] = (0, 128, 255)
+                    cv2.addWeighted(ov, 0.45, roi_view, 0.55, 0, roi_view)
 
-                # Extra material — ROI has pixels, template does not → red
+                # Extra material — ROI has, template does not → red
                 extra_d = cv2.subtract(rc_d, tc_d)
                 if np.any(extra_d):
-                    overlay = roi_view.copy()
-                    overlay[extra_d > 0] = (0, 0, 220)
-                    cv2.addWeighted(overlay, 0.45, roi_view, 0.55, 0, roi_view)
+                    ov = roi_view.copy()
+                    ov[extra_d > 0] = (0, 0, 220)
+                    cv2.addWeighted(ov, 0.45, roi_view, 0.55, 0, roi_view)
 
-            # Secondary contours are already in ROI-local coords → draw directly
+            # Secondary contours from dirty check — already in ROI-local coords
+            dirty_info = result.get("dirty", {})
             for c in dirty_info.get("others_contours", []):
                 cv2.drawContours(roi_view, [c], -1, (0, 0, 220), 1)
 
