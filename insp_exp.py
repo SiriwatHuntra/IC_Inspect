@@ -99,7 +99,7 @@ MARK_MAX_FILL_RATIO       = 0.65  # non_zero / bbox_area  — blobs fill > 65%
 MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 18%
 
 # ---- Dirty / Anomaly Detection ----
-ANOMALY_MIN_AREA_RATIO    = 0.05  # secondary contour / roi_area — below → noise, ignore
+ANOMALY_MIN_AREA_RATIO    = 0.15  # secondary contour / roi_area — below → noise, ignore
 DIRTY_EXTRA_RATIO_MAX     = 0.15  # extra pixels / union  > 15%  → foreign object / splatter
 DIRTY_MISSING_RATIO_MAX   = 0.40  # missing pixels / union > 40% → severe stroke loss
 
