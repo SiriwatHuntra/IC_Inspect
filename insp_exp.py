@@ -99,8 +99,8 @@ MARK_MAX_FILL_RATIO       = 0.65  # non_zero / bbox_area  — blobs fill > 65%
 MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 18%
 
 # ---- Dirty / Anomaly Detection ----
-ANOMALY_MIN_AREA_RATIO    = 0.15  # secondary contour / roi_area — below → noise, ignore
-DIRTY_EXTRA_RATIO_MAX     = 0.15  # extra pixels / union  > 15%  → foreign object / splatter
+ANOMALY_MIN_AREA_RATIO    = 0.20  # secondary contour / roi_area — below → noise, ignore
+DIRTY_EXTRA_RATIO_MAX     = 0.20  # extra pixels / union  > 15%  → foreign object / splatter
 DIRTY_MISSING_RATIO_MAX   = 0.40  # missing pixels / union > 40% → severe stroke loss
 
 # ---- HOG descriptor (shared: template load + runtime OCR) ----
@@ -654,8 +654,8 @@ class ContourTemplate:
     def _morph_font(binary: np.ndarray, mold_size: int = 150) -> np.ndarray:
         # OPEN first  — kills isolated speck noise before stitching
         # CLOSE after — bridges stroke gaps with a larger kernel
-        k_open  = max(2, mold_size // 60)           # ~2px at mold=150
-        k_close = max(2, mold_size // 50)           # ~3px at mold=150  — bridges small gaps only
+        k_open  = max(2, 3)#mold_size // 60)           # ~2px at mold=150
+        k_close = max(2, 3) #mold_size // 50)           # ~3px at mold=150  — bridges small gaps only
         # CLOSE first — fills 1-2px breaks (serif junctions) without closing letter holes
         # OPEN after  — removes isolated noise blobs
         out = binary
