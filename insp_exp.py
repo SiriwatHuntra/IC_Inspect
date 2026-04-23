@@ -1221,7 +1221,26 @@ class InspectionEngine:
         """
         contours, canvas, clean_binary, others = ContourTemplate.extract_font_template(gray, mold_size=mold_size)
         return contours, canvas, clean_binary, others
-    
+
+    @staticmethod
+    def _suppress_large_blobs(clean_binary: np.ndarray, mold_size: int) -> tuple:
+        """
+        Empty-slot reflection suppressor: binary white top-hat with a large kernel.
+
+        TOPHAT(binary, k) = binary - OPEN(binary, k).
+        Structures narrower than k survive (OPEN erases them → TOPHAT = binary).
+        Large blobs wider than k are suppressed (OPEN ≈ blob → TOPHAT ≈ 0).
+
+        Keeps thin laser strokes while removing wide specular reflection blobs.
+        Returns (main_list, canvas, filtered_binary, others).
+        """
+        h, w = clean_binary.shape[:2]
+        k = max(13, mold_size // 6)   # ~25px at mold=150; adjust up if marks still survive
+        kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        filtered = cv2.morphologyEx(clean_binary, cv2.MORPH_TOPHAT, kernel)
+        main_list, others, canvas = ContourTemplate._find_contours_all(filtered, h, w)
+        return main_list, canvas, filtered, others
+
     @staticmethod
     def _check_shift(contours:  list,
                      tmpl:      dict,
@@ -2086,6 +2105,8 @@ class InspectionEngine:
             "extra_ratio":   extra_ratio,
             "missing_ratio": missing_ratio,
             "area_ratio":    area_ratio,
+            "extra_map":     extra,    # 64×64 uint8 — pixels present in ROI but absent from template
+            "missing_map":   missing,  # 64×64 uint8 — pixels in template absent from ROI
         }
 
     # =========================================================
@@ -2337,44 +2358,32 @@ class ResultAnnotator:
         cell_w   = lx2 - lx1
         cell_h   = ly2 - ly1
 
-        # ── Dirty overlay — semi-transparent fill (lowest layer) ─────
-        # Shows for ANY failing slot, not just dirty-detected ones.
-        # roi_canvas vs tmpl_canvas are compared in display-cell space so
-        # pixel positions map correctly onto the screen region.
-        if (not passed) and cell_w > 0 and cell_h > 0:
-            roi_view   = display[ly1:ly2, lx1:lx2]
-            roi_canvas = result.get("roi_canvas")
-
-            if roi_canvas is not None and tmpl_canvas is not None:
-                rc_d = cv2.resize(roi_canvas,  (cell_w, cell_h),
-                                  interpolation=cv2.INTER_NEAREST)
-                tc_d = cv2.resize(tmpl_canvas, (cell_w, cell_h),
-                                  interpolation=cv2.INTER_NEAREST)
-
-                # Missing stroke — template has, ROI does not → orange
-                missing_d = cv2.subtract(tc_d, rc_d)
-                if np.any(missing_d):
-                    ov = roi_view.copy()
-                    ov[missing_d > 0] = (0, 128, 255)
-                    cv2.addWeighted(ov, 0.45, roi_view, 0.55, 0, roi_view)
-
-                # Extra material — ROI has, template does not → red
-                extra_d = cv2.subtract(rc_d, tc_d)
-                if np.any(extra_d):
-                    ov = roi_view.copy()
-                    ov[extra_d > 0] = (0, 0, 220)
-                    cv2.addWeighted(ov, 0.45, roi_view, 0.55, 0, roi_view)
-
-            # Secondary contours from dirty check — already in ROI-local coords
-            dirty_info = result.get("dirty", {})
-            for c in dirty_info.get("others_contours", []):
-                cv2.drawContours(roi_view, [c], -1, (0, 0, 220), 1)
-
         # ── Template ghost — dim gray edges show expected shape ───
         if tmpl_canvas is not None and tmpl_canvas.size > 0 and cell_w > 0 and cell_h > 0:
             trs = cv2.resize(tmpl_canvas, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
             tcnts, _ = cv2.findContours(trs, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(display[ly1:ly2, lx1:lx2], tcnts, -1, (90, 90, 90), 1)
+
+        # ── Dirty region red overlay ──────────────────────────────
+        if not passed and cell_w > 0 and cell_h > 0:
+            dirty_info = result.get("dirty", {})
+            d_type     = dirty_info.get("type", "none")
+            if d_type == "foreign_object":
+                dmap = dirty_info.get("extra_map")
+            elif d_type == "missing_stroke":
+                dmap = dirty_info.get("missing_map")
+            else:
+                dmap = None
+
+            if d_type in ("foreign_object", "missing_stroke"):
+                cell_roi  = display[ly1:ly2, lx1:lx2]
+                red_layer = np.zeros_like(cell_roi)
+                if dmap is not None and dmap.size > 0:
+                    dmap_rs = cv2.resize(dmap, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
+                    red_layer[dmap_rs > 0] = (0, 0, 220)
+                else:
+                    red_layer[:] = (0, 0, 100)   # fallback: dim-red tint on whole cell
+                cell_roi[:] = cv2.addWeighted(cell_roi, 0.55, red_layer, 0.45, 0)
 
         # ── Extracted edges — threshold contours in pass/fail color ──
         if roi_thresh is not None and roi_thresh.size > 0 and cell_w > 0 and cell_h > 0:
@@ -2907,6 +2916,9 @@ class InspectionController:
 
             # ── Empty slot: foreign-object check first, then unexpected-mark ──
             if not letter:
+                # Re-filter: tophat removes large reflection blobs, keeps thin strokes
+                slot_contours, slot_canvas, slot_clean_binary, slot_others = \
+                    InspectionEngine._suppress_large_blobs(slot_clean_binary, mold_size)
                 slot_roi_area = (ly2 - ly1) * (lx2 - lx1)
                 if slot_contours:
                     main_area  = cv2.contourArea(slot_contours[0])
