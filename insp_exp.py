@@ -55,11 +55,13 @@ class InspectionResult:
     total      : total letters inspected.
     elapsed_ms : total wall-clock time for run() call.
     """
-    display:    np.ndarray
-    results:    list  = field(default_factory=list)
-    passed:     int   = 0
-    total:      int   = 0
-    elapsed_ms: float = 0.0
+    display:       np.ndarray
+    results:       list  = field(default_factory=list)
+    passed:        int   = 0
+    total:         int   = 0
+    elapsed_ms:    float = 0.0
+    last_lot:      bool  = False   # True when partial tray detected (not all columns filled)
+    last_lot_cols: int   = 0       # number of leading columns that have chip recipe
 
 
 # =========================================================
@@ -99,7 +101,7 @@ MARK_MAX_FILL_RATIO       = 0.65  # non_zero / bbox_area  — blobs fill > 65%
 MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 18%
 
 # ---- Dirty / Anomaly Detection ----
-ANOMALY_MIN_AREA_RATIO    = 0.20  # secondary contour / roi_area — below → noise, ignore
+ANOMALY_MIN_AREA_RATIO    = 0.30  # secondary contour / roi_area — below → noise, ignore
 DIRTY_EXTRA_RATIO_MAX     = 0.20  # extra pixels / union  > 15%  → foreign object / splatter
 DIRTY_MISSING_RATIO_MAX   = 0.40  # missing pixels / union > 40% → severe stroke loss
 
@@ -471,6 +473,17 @@ class MachineIO:
         self._out(self.PORT_BUSY, True)   # release busy
         if not self._gpio_ok:
             print(f"[IO-mock] run complete {passed}/{total}")
+
+    def on_last_lot(self, chip_cols: int):
+        """Signal last-lot (partial tray) condition.
+        Pulses CAT LOW→HIGH briefly so PLC can distinguish from normal FAIL.
+        """
+        if not self._gpio_ok:
+            print(f"[IO-mock] *** LAST LOT signal — {chip_cols} col(s) filled ***")
+            return
+        self._GPIO.output(self.PORT_CAT, self._GPIO.LOW)
+        time.sleep(0.2)
+        self._GPIO.output(self.PORT_CAT, self._GPIO.HIGH)
 
     def wait_for_start(self, stop_flag_fn) -> bool:
         if not self._gpio_ok:
@@ -2338,6 +2351,47 @@ class ResultAnnotator:
                     ResultAnnotator.COLOR_MOLD, 1)
         
 
+    # ---- Last-lot flag -----------------------------------------------
+    @staticmethod
+    def draw_last_lot_flag(display:   np.ndarray,
+                           chip_cols: int,
+                           acx:       int,
+                           acy:       int,
+                           aw:        int,
+                           ah:        int):
+        """
+        Draw a prominent amber "LAST LOT" banner on the mold area.
+
+        Input : display (BGR ndarray, modified in-place),
+                chip_cols — number of leading columns that have chips (1 or 2),
+                acx/acy — mold centre, aw/ah — mold size.
+        """
+        ih, iw = display.shape[:2]
+        ax1 = max(0,    acx - aw // 2)
+        ay1 = max(0,    acy - ah // 2)
+        ax2 = min(iw-1, ax1 + aw)
+        ay2 = min(ih-1, ay1 + ah)
+
+        # Amber semi-transparent fill over mold area
+        overlay = display.copy()
+        cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (0, 140, 255), cv2.FILLED)
+        cv2.addWeighted(overlay, 0.22, display, 0.78, 0, display)
+
+        # Solid amber border
+        cv2.rectangle(display, (ax1, ay1), (ax2, ay2), (0, 165, 255), 2)
+
+        # Label centred on mold
+        lbl   = f"LAST LOT ({chip_cols}/3 col)"
+        font  = cv2.FONT_HERSHEY_SIMPLEX
+        fscl  = 0.45
+        thick = 1
+        (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
+        tx = acx - tw // 2
+        ty = acy + th // 2
+        cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
+                      (0, 0, 0), cv2.FILLED)
+        cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 165, 255), thick)
+
     # ---- Letter ------------------------------------------------------
     @staticmethod
     def draw_letter(display: np.ndarray,
@@ -2675,6 +2729,47 @@ class InspectionController:
         global FONT_CONFIDENCE_MIN
         FONT_CONFIDENCE_MIN = font_confidence_min
         
+    # ---- last-lot detection ----
+    @staticmethod
+    def _check_last_lot(mold_results: list) -> tuple:
+        """
+        Detect partial-tray (end-of-lot) condition for one mold.
+
+        A mold is "last lot" when the first X consecutive columns (from col 0)
+        have chip recipe (letter != "") and all remaining columns have NO recipe
+        (all empty slots).  X must be 1 or 2; X=0 (no chip) and X=3 (full tray)
+        are not flagged.
+
+        Returns (is_last_lot: bool, chip_cols: int).
+        chip_cols = number of leading columns that hold chips.
+        """
+        col_has_recipe = [False, False, False]
+        for r in mold_results:
+            c = r.get("slot", 0) % 3
+            if r.get("letter", "") != "":
+                col_has_recipe[c] = True
+
+        # Count leading consecutive columns with recipe
+        chip_cols = 0
+        for c in range(3):
+            if col_has_recipe[c]:
+                chip_cols += 1
+            else:
+                break
+
+        if chip_cols == 0 or chip_cols >= 3:
+            return False, chip_cols
+
+        # All trailing columns must be recipe-free (drop / None)
+        # — also accept if they have recipe but every slot in that column failed / dropped
+        for c in range(chip_cols, 3):
+            if col_has_recipe[c]:
+                col_slots = [r for r in mold_results if r.get("slot", 0) % 3 == c]
+                if any(r.get("pass") for r in col_slots):
+                    return False, chip_cols  # passing chip in trailing col → normal lot
+
+        return True, chip_cols
+
     # ---- inspection pipeline ----
     def run(self,
         image_bgr: np.ndarray,
@@ -2751,6 +2846,16 @@ class InspectionController:
                 ResultAnnotator.draw_mold(display, acx, acy, aw, ah,
                                         f_idx, area["label"],
                                         elapsed_ms=mold_ms)
+
+                # ── Last-lot detection ───────────────────────────────
+                is_ll, ll_cols = self._check_last_lot(letter_results)
+                if is_ll:
+                    for r in letter_results:
+                        r["last_lot"]      = True
+                        r["last_lot_cols"] = ll_cols
+                    ResultAnnotator.draw_last_lot_flag(
+                        display, ll_cols, acx, acy, aw, ah)
+
                 self.results.extend(letter_results)
 
             frame_ms = (time.perf_counter() - t0_frame) * 1000
@@ -2760,15 +2865,18 @@ class InspectionController:
                 if r.get("frame_idx") == f_idx + 1 and "frame_ms" not in r:
                     r["frame_ms"] = round(frame_ms, 1)
 
-        total_ms = round((time.perf_counter() - t0_total) * 1000, 1)
-
-        passed = sum(1 for r in self.results if r["pass"])
+        total_ms    = round((time.perf_counter() - t0_total) * 1000, 1)
+        passed      = sum(1 for r in self.results if r["pass"])
+        any_ll      = any(r.get("last_lot") for r in self.results)
+        max_ll_cols = max((r.get("last_lot_cols", 0) for r in self.results), default=0)
         result = InspectionResult(
-            display    = display,
-            results    = self.results,
-            passed     = passed,
-            total      = len(self.results),
-            elapsed_ms = total_ms,
+            display        = display,
+            results        = self.results,
+            passed         = passed,
+            total          = len(self.results),
+            elapsed_ms     = total_ms,
+            last_lot       = any_ll,
+            last_lot_cols  = max_ll_cols,
         )
         result.total_ms = total_ms
         return result
@@ -3153,7 +3261,25 @@ class RunWorker(QtCore.QThread):
         cv2.imwrite(ann_path, display_bgr)
         self._log(f"  NG saved: {ts}_R.png + {ts}.png", "#ffaa44")
 
-    def _append_csv(self, ic_groups: dict, image_name: str):
+    def _save_last_lot(self, img_gray: np.ndarray, display_bgr: np.ndarray,
+                       chip_cols: int):
+        """
+        Save raw gray + annotated BGR for a last-lot image.
+        Files: Inspection_result/lastlot_<ts>_R.png  and  lastlot_<ts>.png
+        """
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        raw_path = os.path.join(OUTPUT_DIR, f"lastlot_{ts}_R.png")
+        ann_path = os.path.join(OUTPUT_DIR, f"lastlot_{ts}.png")
+        cv2.imwrite(raw_path, img_gray)
+        cv2.imwrite(ann_path, display_bgr)
+        self._log(
+            f"  LAST LOT saved: lastlot_{ts}_R.png + lastlot_{ts}.png"
+            f"  ({chip_cols}/3 col)",
+            "#ffaa00")
+
+    def _append_csv(self, ic_groups: dict, image_name: str,
+                    last_lot: bool = False):
         """
         Auto-append one row per IC result to run_log/result_YYYYMMDD.csv.
         Skips no-lead molds. Writes header on first entry of the day.
@@ -3168,23 +3294,25 @@ class RunWorker(QtCore.QThread):
                 if write_header:
                     w.writerow(["timestamp", "image", "ic_num", "frame",
                                 "mold", "verdict", "ocr_string",
-                                "fail_causes", "elapsed_ms"])
+                                "fail_causes", "elapsed_ms", "last_lot"])
                 for ic_num in sorted(ic_groups.keys()):
                     group = ic_groups[ic_num]
                     if all(r.get("reason") == "dropped" for r in group):
                         continue
-                    r0      = group[0]
-                    passed  = all(r["pass"] for r in group)
-                    ocr_map = {r["slot"]: r.get("ocr_char", " ") for r in group}
-                    ocr_str = "".join(ocr_map.get(i, " ") for i in range(9))
-                    causes  = ";".join(
+                    r0       = group[0]
+                    passed   = all(r["pass"] for r in group)
+                    ocr_map  = {r["slot"]: r.get("ocr_char", " ") for r in group}
+                    ocr_str  = "".join(ocr_map.get(i, " ") for i in range(9))
+                    causes   = ";".join(
                         f"slot{r['slot']}({r['letter']}):{r['reason']}"
                         for r in group if not r["pass"])
-                    mold_ms = sum(r.get("elapsed_ms", 0.0) for r in group)
+                    mold_ms  = sum(r.get("elapsed_ms", 0.0) for r in group)
+                    mold_ll  = any(r.get("last_lot") for r in group)
                     w.writerow([ts, image_name, ic_num,
                                 r0.get("frame_idx", ""), r0.get("mold", ""),
                                 "PASS" if passed else "NG",
-                                ocr_str, causes, f"{mold_ms:.1f}"])
+                                ocr_str, causes, f"{mold_ms:.1f}",
+                                "1" if mold_ll else "0"])
         except Exception as e:
             self._log(f"  CSV write error: {e}", "#ff4444")
 
@@ -3280,7 +3408,14 @@ class RunWorker(QtCore.QThread):
             if not all_pass:
                 self._save_fail(img, result.display)
 
-            self._append_csv(ic_groups, fname)
+            if result.last_lot:
+                self._log(
+                    f"  *** LAST LOT — {result.last_lot_cols}/3 col(s) filled ***",
+                    "#ffaa00")
+                self._save_last_lot(img, result.display, result.last_lot_cols)
+                self._io.on_last_lot(result.last_lot_cols)
+
+            self._append_csv(ic_groups, fname, last_lot=result.last_lot)
             self._io.on_frame_result(result.passed, result.total)
             total_passed  += result.passed
             total_letters += result.total
@@ -3379,8 +3514,15 @@ class RunWorker(QtCore.QThread):
             if not all_pass:
                 self._save_fail(img, result.display)
 
+            if result.last_lot:
+                self._log(
+                    f"  *** LAST LOT — {result.last_lot_cols}/3 col(s) filled ***",
+                    "#ffaa00")
+                self._save_last_lot(img, result.display, result.last_lot_cols)
+                self._io.on_last_lot(result.last_lot_cols)
+
             ts_label = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._append_csv(ic_groups, f"cam_{ts_label}")
+            self._append_csv(ic_groups, f"cam_{ts_label}", last_lot=result.last_lot)
             self._io.on_frame_result(result.passed, result.total)
             total_passed  += result.passed
             total_letters += result.total
