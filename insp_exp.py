@@ -79,7 +79,7 @@ MIN_CONTOUR_AREA     = 1
 MIN_CONTOUR_SOLIDITY = 0.35   # convex-hull fill ratio; rough surface noise < 0.35; serif I ≈ 0.40
 MIN_CONTOUR_EXTENT   = 0.20   # area / bounding-rect; sparse blobs fail this
 MIN_CONTOUR_REL_AREA = 0.003  # fraction of ROI area; rejects sub-0.3% specks
-IMAGE_SOURCE_DIR  = "Aug/"
+IMAGE_SOURCE_DIR  = "image_source/"
 OUTPUT_DIR        = "Inspection_result"
 
 # Camera
@@ -93,6 +93,19 @@ FONT_SHIFT_RATIO_MAX       = 0.50
 FONT_ASPECT_TOLERANCE      = 0.25
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
+
+# ---- Last-lot detection ----
+# Number of leading frame-columns (by X position) that must contain chips.
+# Trailing columns must have frames detected but no chip contours.
+LAST_LOT_CHIP_FRAME_COLS   = 1
+
+# ---- Empty-slot guard (Otsu false-contour suppression) ----
+# Minimum peak value in the white top-hat image required before Otsu runs.
+# An empty (black) slot produces a near-zero top-hat; Otsu on that signal
+# picks threshold ~2–5 and turns camera noise into false contours.
+# Real laser marks produce top-hat peak >> 30.  Tune down if faint marks are
+# missed; tune up if empty slots still produce false contours.
+MIN_TOPHAT_SIGNAL          = 20
 
 # ---- Reflection / False-mark Filter (empty slots only) ----
 # Laser marks are thin strokes; IC surface reflections are blobs.
@@ -626,6 +639,8 @@ class ContourTemplate:
 
     @staticmethod
     def _thresh_font(gray: np.ndarray, mold_size: int = 150) -> np.ndarray:
+        h, w = gray.shape[:2]
+
         # Step 1: bilateral filter — edge-preserving noise reduction
         filtered = cv2.bilateralFilter(gray, 9, 50, 50)
 
@@ -634,11 +649,16 @@ class ContourTemplate:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
         tophat = cv2.morphologyEx(filtered, cv2.MORPH_TOPHAT, kernel)
 
+        # Guard: Otsu on a uniform-dark (empty) slot degrades to thresholding
+        # camera noise, producing false contours.  If the top-hat has no
+        # meaningful signal, the slot is empty — skip Otsu entirely.
+        if int(tophat.max()) < MIN_TOPHAT_SIGNAL:
+            return np.zeros((h, w), dtype=np.uint8)
+
         # Step 3: Otsu threshold
         _, binary = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         # Step 4: border mask — suppress edge artifacts
-        h, w   = binary.shape[:2]
         margin = max(3, mold_size // 50)
         mask   = np.zeros((h, w), dtype=np.uint8)
         mask[margin:h - margin, margin:w - margin] = 255
@@ -2392,6 +2412,35 @@ class ResultAnnotator:
                       (0, 0, 0), cv2.FILLED)
         cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 165, 255), thick)
 
+    # ---- Last-lot image-level banner --------------------------------
+    @staticmethod
+    def draw_last_lot_image_flag(display: np.ndarray,
+                                 chip_cols: int,
+                                 total_cols: int):
+        """
+        Amber banner at the top of the full display image for
+        the image-level last-lot condition.
+
+        chip_cols  — frame-columns that have physical chips (leading)
+        total_cols — total frame-columns detected in this image
+        """
+        ih, iw = display.shape[:2]
+        bar_h = 30
+        overlay = display.copy()
+        cv2.rectangle(overlay, (0, 0), (iw, bar_h), (0, 140, 255), cv2.FILLED)
+        cv2.addWeighted(overlay, 0.60, display, 0.40, 0, display)
+        # solid border at bottom of bar
+        cv2.line(display, (0, bar_h), (iw, bar_h), (0, 165, 255), 2)
+
+        lbl  = f"*** LAST LOT IMAGE — {chip_cols}/{total_cols} frame-col(s) filled ***"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fscl = 0.55
+        thick = 1
+        (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
+        tx = iw // 2 - tw // 2
+        ty = bar_h // 2 + th // 2
+        cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 255, 255), thick, cv2.LINE_AA)
+
     # ---- Letter ------------------------------------------------------
     @staticmethod
     def draw_letter(display: np.ndarray,
@@ -2729,46 +2778,69 @@ class InspectionController:
         global FONT_CONFIDENCE_MIN
         FONT_CONFIDENCE_MIN = font_confidence_min
         
-    # ---- last-lot detection ----
+    # ---- last-lot detection (image-level, called after all frames processed) ----
     @staticmethod
-    def _check_last_lot(mold_results: list) -> tuple:
+    def _check_last_lot_image(matches: list,
+                              all_results: list,
+                              col_snap: int) -> tuple:
         """
-        Detect partial-tray (end-of-lot) condition for one mold.
+        Post-inspection last-lot check across all detected frame-columns.
 
-        A mold is "last lot" when the first X consecutive columns (from col 0)
-        have chip recipe (letter != "") and all remaining columns have NO recipe
-        (all empty slots).  X must be 1 or 2; X=0 (no chip) and X=3 (full tray)
-        are not flagged.
+        Condition (using LAST_LOT_CHIP_FRAME_COLS = N):
+          • Frame-columns 0 … N-1 must have physical chips (any pass/fail).
+          • Frame-columns N … end must have frames detected but NO chip
+            contours (defect_step == 1 on every letter-slot, or no letter-slots).
+          • Total detected frame-columns must be > N.
 
-        Returns (is_last_lot: bool, chip_cols: int).
-        chip_cols = number of leading columns that hold chips.
+        Physical chip = letter assigned AND defect_step != 1
+                        AND reason != "dropped".
+
+        Returns (is_last_lot: bool, chip_cols: int, total_cols: int).
         """
-        col_has_recipe = [False, False, False]
-        for r in mold_results:
-            c = r.get("slot", 0) % 3
-            if r.get("letter", "") != "":
-                col_has_recipe[c] = True
+        if not matches:
+            return False, 0, 0
 
-        # Count leading consecutive columns with recipe
-        chip_cols = 0
-        for c in range(3):
-            if col_has_recipe[c]:
-                chip_cols += 1
-            else:
-                break
+        from collections import defaultdict
+        cg_to_fidx: dict = defaultdict(list)
+        for f_idx, (anc_cx, *_) in enumerate(matches):
+            cg = round(anc_cx / max(col_snap, 1))
+            cg_to_fidx[cg].append(f_idx)
 
-        if chip_cols == 0 or chip_cols >= 3:
-            return False, chip_cols
+        sorted_cg = sorted(cg_to_fidx.keys())
+        n_cols    = len(sorted_cg)
+        n_chip    = LAST_LOT_CHIP_FRAME_COLS
 
-        # All trailing columns must be recipe-free (drop / None)
-        # — also accept if they have recipe but every slot in that column failed / dropped
-        for c in range(chip_cols, 3):
-            if col_has_recipe[c]:
-                col_slots = [r for r in mold_results if r.get("slot", 0) % 3 == c]
-                if any(r.get("pass") for r in col_slots):
-                    return False, chip_cols  # passing chip in trailing col → normal lot
+        if n_cols <= n_chip:
+            return False, 0, n_cols
 
-        return True, chip_cols
+        # Build reverse map: f_idx → 0-based column index
+        fidx_to_col: dict = {}
+        for col_i, cg in enumerate(sorted_cg):
+            for fi in cg_to_fidx[cg]:
+                fidx_to_col[fi] = col_i
+
+        # Mark columns that have at least one physically-present chip
+        col_has_chip = [False] * n_cols
+        for r in all_results:
+            fi = r.get("frame_idx", 0) - 1          # frame_idx is 1-based
+            if fi not in fidx_to_col:
+                continue
+            if (r.get("letter", "") != ""
+                    and r.get("reason") != "dropped"
+                    and r.get("defect_step", 0) != 1):
+                col_has_chip[fidx_to_col[fi]] = True
+
+        # First n_chip columns must ALL have chips
+        for c in range(n_chip):
+            if not col_has_chip[c]:
+                return False, 0, n_cols
+
+        # Remaining columns must ALL be empty (no chip contours)
+        for c in range(n_chip, n_cols):
+            if col_has_chip[c]:
+                return False, 0, n_cols
+
+        return True, n_chip, n_cols
 
     # ---- inspection pipeline ----
     def run(self,
@@ -2847,15 +2919,6 @@ class InspectionController:
                                         f_idx, area["label"],
                                         elapsed_ms=mold_ms)
 
-                # ── Last-lot detection ───────────────────────────────
-                is_ll, ll_cols = self._check_last_lot(letter_results)
-                if is_ll:
-                    for r in letter_results:
-                        r["last_lot"]      = True
-                        r["last_lot_cols"] = ll_cols
-                    ResultAnnotator.draw_last_lot_flag(
-                        display, ll_cols, acx, acy, aw, ah)
-
                 self.results.extend(letter_results)
 
             frame_ms = (time.perf_counter() - t0_frame) * 1000
@@ -2864,6 +2927,20 @@ class InspectionController:
             for r in self.results:
                 if r.get("frame_idx") == f_idx + 1 and "frame_ms" not in r:
                     r["frame_ms"] = round(frame_ms, 1)
+
+        # ── Image-level last-lot check (runs after all chips inspected) ──
+        col_snap = max(1, anchor_tmpl.get("canvas_w", 60) // 2)
+        img_ll, img_chip_cols, img_total_cols = \
+            self._check_last_lot_image(matches, self.results, col_snap)
+
+        if img_ll:
+            for r in self.results:
+                r["last_lot"]      = True
+                r["last_lot_cols"] = img_chip_cols
+            ResultAnnotator.draw_last_lot_image_flag(
+                display, img_chip_cols, img_total_cols)
+            print(f"[Pipeline] LAST LOT — {img_chip_cols}/{img_total_cols} "
+                  f"frame-col(s) filled")
 
         total_ms    = round((time.perf_counter() - t0_total) * 1000, 1)
         passed      = sum(1 for r in self.results if r["pass"])
