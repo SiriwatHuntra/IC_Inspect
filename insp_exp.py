@@ -160,19 +160,32 @@ OCR_CONF_GAP_MIN   = 0.10   # best must exceed 2nd-best by this — filters circ
 # =========================================================
 # SETTINGS MANAGER
 # =========================================================
-SETTINGS_FILE = "inspection_settings.txt"
+SETUP_FILE    = "Setup.json"
+SETTINGS_FILE = "inspection_settings.txt"   # legacy — migrated to Setup.json on first run
 MASK_FILE     = "search_mask.jpg"
 
-# (header, default, min, max, is_float)
+# Static constants loaded from Setup.json ["static"] section.
+# Values here are only the in-code fallback; Setup.json overrides them at runtime.
+_SETUP_STATIC_DEFAULTS = {
+    "font_confidence_min":        0.60,
+    "font_shift_ratio_max":       0.50,
+    "font_aspect_tolerance":      0.25,
+    "font_hole_count_tolerance":  1,
+    "font_hole_area_tolerance":   0.30,
+    "last_lot_chip_frame_cols":   1,
+    "min_tophat_signal":          20,
+    "pin_edge_ratio":             0.150,
+}
+
+# User-tunable setup values — stored in Setup.json ["setup"] section.
 # (header, default, min, max, is_float)
 _SETTINGS_DEFAULTS = [
     ("pin_score_threshold",  0.75,  0.50,  1.00,  True ),
-    ("font_confidence_min",  0.60,  0.30,  1.00,  True ),
     ("max_matches",             6,     1,    12,  False),
-    ("camera_exposure_us",  8000,   100, 100000,  False),
-    ("grid_scale",           0.85,  0.50,  1.20,  True ),
-    ("grid_x_frac",          0.00, -0.30,  0.30,  True ),
-    ("grid_y_frac",          0.00, -0.30,  0.30,  True ),
+    ("camera_exposure_us",   8000,   100, 100000,  False),
+    ("grid_scale",            0.85,  0.50,  1.20,  True ),
+    ("grid_x_frac",           0.00, -0.30,  0.30,  True ),
+    ("grid_y_frac",           0.00, -0.30,  0.30,  True ),
 ]
 
 _STRING_DEFAULTS = {
@@ -181,13 +194,21 @@ _STRING_DEFAULTS = {
 
 class SettingsManager:
     """
-    Persists numeric and string settings to a plain-text file.
-    Numeric entries  ->  header  value  min  max
-    String  entries  ->  header  "value"
+    Persists all settings to Setup.json with two sections:
+      "static"  — inspection constants (loaded once at startup, apply to globals)
+      "setup"   — user-tunable runtime values (bound to RightPanel spinboxes)
+
+    Migration: if Setup.json is absent but inspection_settings.txt exists,
+    the legacy txt file is read for setup values and Setup.json is written.
     """
 
-    def __init__(self, path: str = SETTINGS_FILE):
+    def __init__(self, path: str = SETUP_FILE):
         self.path = path
+
+        # --- static section (overrides CONFIG-block constants) ---
+        self._static: dict = dict(_SETUP_STATIC_DEFAULTS)
+
+        # --- setup section (numeric) ---
         self._data: dict = {}
         for hdr, val, mn, mx, is_float in _SETTINGS_DEFAULTS:
             self._data[hdr] = {
@@ -196,9 +217,42 @@ class SettingsManager:
                 "max":      float(mx)  if is_float else int(mx),
                 "is_float": is_float,
             }
+
+        # --- setup section (string) ---
         self._str_data: dict = dict(_STRING_DEFAULTS)
+
+        # Load from file or migrate from legacy txt
         if os.path.exists(path):
-            self._load()
+            self._load_json(path)
+        elif os.path.exists(SETTINGS_FILE):
+            self._migrate_txt(SETTINGS_FILE)
+            self.save()                         # write Setup.json immediately
+        else:
+            self.save()                         # create Setup.json with defaults
+
+        self._apply_statics()
+
+    # ---- static access ---------------------------------------------------
+
+    def get_static(self, key: str, default=None):
+        return self._static.get(key, default)
+
+    def _apply_statics(self):
+        """Push static section values into module-level globals."""
+        global FONT_CONFIDENCE_MIN, FONT_SHIFT_RATIO_MAX, FONT_ASPECT_TOLERANCE
+        global FONT_HOLE_COUNT_TOLERANCE, FONT_HOLE_AREA_TOLERANCE
+        global LAST_LOT_CHIP_FRAME_COLS, MIN_TOPHAT_SIGNAL, PIN_EDGE_RATIO
+        s = self._static
+        FONT_CONFIDENCE_MIN        = float(s.get("font_confidence_min",        FONT_CONFIDENCE_MIN))
+        FONT_SHIFT_RATIO_MAX       = float(s.get("font_shift_ratio_max",       FONT_SHIFT_RATIO_MAX))
+        FONT_ASPECT_TOLERANCE      = float(s.get("font_aspect_tolerance",      FONT_ASPECT_TOLERANCE))
+        FONT_HOLE_COUNT_TOLERANCE  = int(  s.get("font_hole_count_tolerance",  FONT_HOLE_COUNT_TOLERANCE))
+        FONT_HOLE_AREA_TOLERANCE   = float(s.get("font_hole_area_tolerance",   FONT_HOLE_AREA_TOLERANCE))
+        LAST_LOT_CHIP_FRAME_COLS   = int(  s.get("last_lot_chip_frame_cols",   LAST_LOT_CHIP_FRAME_COLS))
+        MIN_TOPHAT_SIGNAL          = int(  s.get("min_tophat_signal",          MIN_TOPHAT_SIGNAL))
+        PIN_EDGE_RATIO             = float(s.get("pin_edge_ratio",             PIN_EDGE_RATIO))
+
+    # ---- setup (numeric) access ------------------------------------------
 
     def get(self, header: str):
         return self._data[header]["value"]
@@ -217,6 +271,8 @@ class SettingsManager:
         d["value"] = float(clamped) if d["is_float"] else int(round(clamped))
         return True
 
+    # ---- setup (string) access -------------------------------------------
+
     def get_str(self, header: str) -> str:
         return self._str_data.get(header, "")
 
@@ -224,24 +280,67 @@ class SettingsManager:
         if header in self._str_data:
             self._str_data[header] = value.strip()
 
+    # ---- persistence -----------------------------------------------------
+
     def save(self, path: str = None) -> str:
         target = path or self.path
-        with open(target, "w") as f:
-            for hdr, _, _, _, is_float in _SETTINGS_DEFAULTS:
-                d = self._data[hdr]
-                f.write(f"{hdr:<28} {d['value']}  {d['min']}  {d['max']}\n")
-            for hdr, _ in _STRING_DEFAULTS.items():
-                val = self._str_data[hdr].replace("\n", "\\n")
-                f.write(f"{hdr:<28} \"{val}\"\n")
-        return target
-    
-    def load(self, path: str = None):
-        self._load(path or self.path)
+        setup_section = {}
+        for hdr, *_ in _SETTINGS_DEFAULTS:
+            d = self._data[hdr]
+            setup_section[hdr] = {
+                "value": d["value"],
+                "min":   d["min"],
+                "max":   d["max"],
+            }
+        for hdr in _STRING_DEFAULTS:
+            setup_section[hdr] = self._str_data[hdr]
 
-    def _load(self, path: str = None):
-        target = path or self.path
+        payload = {
+            "static": dict(self._static),
+            "setup":  setup_section,
+        }
+        with open(target, "w") as f:
+            json.dump(payload, f, indent=2)
+        return target
+
+    def load(self, path: str = None):
+        self._load_json(path or self.path)
+        self._apply_statics()
+
+    def _load_json(self, path: str):
         try:
-            with open(target, "r") as f:
+            with open(path, "r") as f:
+                payload = json.load(f)
+
+            # static section
+            for key in _SETUP_STATIC_DEFAULTS:
+                if key in payload.get("static", {}):
+                    self._static[key] = payload["static"][key]
+
+            # setup section (numeric)
+            for hdr, _, _, _, is_float in _SETTINGS_DEFAULTS:
+                entry = payload.get("setup", {}).get(hdr)
+                if isinstance(entry, dict):
+                    d = self._data[hdr]
+                    d["min"]   = float(entry["min"]) if is_float else int(entry["min"])
+                    d["max"]   = float(entry["max"]) if is_float else int(entry["max"])
+                    val        = float(entry["value"])
+                    clamped    = max(d["min"], min(d["max"], val))
+                    d["value"] = float(clamped) if is_float else int(round(clamped))
+
+            # setup section (string)
+            for hdr in _STRING_DEFAULTS:
+                entry = payload.get("setup", {}).get(hdr)
+                if isinstance(entry, str):
+                    self._str_data[hdr] = entry
+
+        except Exception as e:
+            print(f"[Settings] Load error ({path}): {e}")
+
+    def _migrate_txt(self, path: str):
+        """Read legacy inspection_settings.txt into the setup section."""
+        try:
+            with open(path, "r") as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith("#"):
@@ -269,8 +368,9 @@ class SettingsManager:
                     d["max"]   = float(mx)  if d["is_float"] else int(mx)
                     clamped    = max(d["min"], min(d["max"], val))
                     d["value"] = float(clamped) if d["is_float"] else int(round(clamped))
+            print(f"[Settings] Migrated {path} → {self.path}")
         except Exception as e:
-            print(f"[Settings] Load error: {e}")
+            print(f"[Settings] Migration error: {e}")
 
 
 # =========================================================
@@ -2772,11 +2872,9 @@ class InspectionController:
         self._active_grid      = grid_letters
         return []
 
-    def set_run_params(self, pin_params: dict, font_confidence_min: float):
+    def set_run_params(self, pin_params: dict):
         """Store search params once before the loop. Used by run() per frame."""
         self._active_pin_params = pin_params
-        global FONT_CONFIDENCE_MIN
-        FONT_CONFIDENCE_MIN = font_confidence_min
         
     # ---- last-lot detection (image-level, called after all frames processed) ----
     @staticmethod
@@ -4465,18 +4563,6 @@ class RightPanel(QtWidgets.QWidget):
         fl_pin.addRow("", note_pin)
         lay.addWidget(gb_pin)
 
-        # ── Font Inspection ───────────────────────────────────
-        gb_font = QtWidgets.QGroupBox("Font Inspection")
-        fl_font = QtWidgets.QFormLayout(gb_font)
-        self.spin_font_confidence = self._bind_fspin("font_confidence_min", fl_font,
-                                                     "Min confidence")
-        note_font = QtWidgets.QLabel(
-            "Min confidence: lower = more permissive font matching.")
-        note_font.setStyleSheet("color:#888;font-size:9px")
-        note_font.setWordWrap(True)
-        fl_font.addRow("", note_font)
-        lay.addWidget(gb_font)
-
         # ── Grid Position ─────────────────────────────────────
         gb_grid = QtWidgets.QGroupBox("Grid Position")
         fl_grid = QtWidgets.QFormLayout(gb_grid)
@@ -4637,10 +4723,9 @@ class RightPanel(QtWidgets.QWidget):
     def apply_settings(self):
         sm    = self._sm
         pairs = [
-            (self.spin_pin_score,      "pin_score_threshold"),
-            (self.spin_font_confidence,"font_confidence_min"),
-            (self.spin_max_matches,    "max_matches"),
-            (self.spin_exposure,       "camera_exposure_us"),
+            (self.spin_pin_score,   "pin_score_threshold"),
+            (self.spin_max_matches, "max_matches"),
+            (self.spin_exposure,    "camera_exposure_us"),
         ]
         for spin, key in pairs:
             spin.blockSignals(True)
@@ -5217,8 +5302,7 @@ class MainWindow(QtWidgets.QWidget):
             "score_thr":   sm.get("pin_score_threshold"),
             "max_matches": int(sm.get("max_matches")),
         }
-        font_confidence_min = sm.get("font_confidence_min")
-        self._ctrl.set_run_params(pin_params, font_confidence_min)
+        self._ctrl.set_run_params(pin_params)
 
         if not DEBUG_MODE and self._camera:
             self._camera.set_exposure(sm.get("camera_exposure_us"))
