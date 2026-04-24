@@ -7,7 +7,7 @@ Structure
   storage      : ImageIO, ContourTemplate, cv2_draw_dashed_rect
   engine       : InspectionEngine  (PIN search + font inspect)
   controller   : InspectionController  (owns engine + template store + cache)
-  ui-widgets   : ImageView, MaskingToolbar, MaskConfirmDialog,
+  ui-widgets   : ImageView, FrameTemplatePanel, FrameLayoutPanel,
                  TemplatePreviewDialog, RightPanel, MainWindow
   main         : QApplication entry point
 
@@ -162,7 +162,6 @@ OCR_CONF_GAP_MIN   = 0.10   # best must exceed 2nd-best by this — filters circ
 # =========================================================
 SETUP_FILE    = "Setup.json"
 SETTINGS_FILE = "inspection_settings.txt"   # legacy — migrated to Setup.json on first run
-MASK_FILE     = "search_mask.jpg"
 
 # Static constants loaded from Setup.json ["static"] section.
 # Values here are only the in-code fallback; Setup.json overrides them at runtime.
@@ -3568,7 +3567,6 @@ class RunWorker(QtCore.QThread):
     def __init__(self,
                  ctrl:        "InspectionController",
                  io:          "MachineIO",
-                 mask:        np.ndarray,
                  image_io:    "ImageIO",
                  run_from_io: bool = False,
                  io_recipe:   list = None,
@@ -3578,7 +3576,6 @@ class RunWorker(QtCore.QThread):
         super().__init__()
         self._ctrl        = ctrl
         self._io          = io
-        self._mask        = mask
         self._image_io    = image_io
         self._run_from_io = run_from_io
         self._io_recipe   = io_recipe or []
@@ -3911,19 +3908,16 @@ class RunWorker(QtCore.QThread):
             self.sig_error.emit(f"Worker exception: {e}")
             
 # =========================================================
-# IMAGE VIEW  — zoomable label with rubber-band / place-mode ROI
+# IMAGE VIEW  — zoomable label with rubber-band / stamp-mode ROI
 # =========================================================
 class ImageView(QtWidgets.QLabel):
     roi_selected = QtCore.pyqtSignal(QtCore.QRect)
 
-    PLACE_W = PIN_ROI_W
-    PLACE_H = PIN_ROI_H
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(QtCore.Qt.AlignCenter)
         self._draw_mode  = False
-        self._place_mode = False
         self._mask_mode  = False
         self._mask_add   = True
         self._cursor_img = None
@@ -3934,7 +3928,8 @@ class ImageView(QtWidgets.QLabel):
         self._offset      = QtCore.QPoint(0, 0)
         self._orig        = None
         self._stamp_mode  = False
-        self._stamp_box   = 45
+        self._stamp_box   = 45   # preview width
+        self._stamp_h     = 45   # preview height (may differ from width)
         self._stamp_label = ""
         self.setMouseTracking(True)
         self._constraint_rect: QtCore.QRect | None = None
@@ -3966,17 +3961,8 @@ class ImageView(QtWidgets.QLabel):
     # ---- modes ----
     def set_draw_mode(self, on: bool):
         self._draw_mode  = on
-        self._place_mode = False
         self._mask_mode  = False
         self._rect = None
-        self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
-        self.update()
-
-    def set_place_mode(self, on: bool):
-        self._place_mode = on
-        self._draw_mode  = False
-        self._mask_mode  = False
-        self._cursor_img = None
         self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
         self.update()
 
@@ -3984,25 +3970,31 @@ class ImageView(QtWidgets.QLabel):
         self._mask_mode  = on
         self._mask_add   = add
         self._draw_mode  = False
-        self._place_mode = False
         self._start      = None
         self._rect       = None
         self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
         self.update()
 
-    def set_stamp_mode(self, on: bool, box_size: int = 45, label: str = ""):
+    def set_stamp_mode(self, on: bool,
+                       box_size: int = 45, box_h: int = 0,
+                       label: str = ""):
         """
         Stamp mode: a fixed-size rectangle follows the cursor.
         Click emits roi_selected with a QRect centred on the click point.
+        box_h = 0 means square (box_h = box_size).
         """
         self._stamp_mode  = on
         self._stamp_box   = box_size
+        self._stamp_h     = box_h if box_h > 0 else box_size
         self._stamp_label = label
         self._draw_mode   = False
-        self._place_mode  = False
         self._mask_mode   = False
         self._cursor_img  = None
         self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
+        self.update()
+
+    def set_stamp_label(self, label: str):
+        self._stamp_label = label
         self.update()
         
     # ---- overlays ----
@@ -4038,28 +4030,19 @@ class ImageView(QtWidgets.QLabel):
     def mousePressEvent(self, e):
         if e.button() != QtCore.Qt.LeftButton:
             return
-        if self._place_mode:
+        if self._stamp_mode:
             img_pt = self._to_img(e.pos())
-            ix = img_pt.x() - self.PLACE_W // 2
-            iy = img_pt.y() - self.PLACE_H // 2
+            hw = self._stamp_box // 2
+            hh = self._stamp_h   // 2
             self.roi_selected.emit(
-                QtCore.QRect(ix, iy, self.PLACE_W, self.PLACE_H))
-            self._place_mode = False
-            self._cursor_img = None
-            self.setCursor(QtCore.Qt.ArrowCursor)
-            self.update()
-        elif self._stamp_mode:
-            img_pt = self._to_img(e.pos())
-            half   = self._stamp_box // 2
-            self.roi_selected.emit(
-                QtCore.QRect(img_pt.x() - half, img_pt.y() - half,
-                            self._stamp_box, self._stamp_box))
+                QtCore.QRect(img_pt.x() - hw, img_pt.y() - hh,
+                             self._stamp_box, self._stamp_h))
         elif self._draw_mode or self._mask_mode:
             self._start = e.pos()
             self._rect  = None
 
     def mouseMoveEvent(self, e):
-        if self._place_mode or self._stamp_mode:
+        if self._stamp_mode:
             self._cursor_img = self._to_img(e.pos())
             self.update()
         elif (self._draw_mode or self._mask_mode) and self._start:
@@ -4123,36 +4106,25 @@ class ImageView(QtWidgets.QLabel):
             p.setPen(border)
             p.drawText(self._rect.topLeft() + QtCore.QPoint(4, 14), tag)
 
-        # Stamp mode cursor
+        # Stamp mode cursor — rectangular preview attached to cursor
         if self._stamp_mode and self._cursor_img is not None:
             wcx = int(self._cursor_img.x() * self._scale) + self._offset.x()
             wcy = int(self._cursor_img.y() * self._scale) + self._offset.y()
-            wb  = int(self._stamp_box * self._scale)
-            wx  = wcx - wb // 2
-            wy  = wcy - wb // 2
-            p.setPen(QtGui.QPen(QtGui.QColor(255, 200, 0), 2,
+            ww  = int(self._stamp_box * self._scale)
+            wh  = int(self._stamp_h   * self._scale)
+            wx  = wcx - ww // 2
+            wy  = wcy - wh // 2
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 224, 255), 2,
+                                QtCore.Qt.DashLine))
+            p.drawRect(wx, wy, ww, wh)
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 255, 120), 1,
                                 QtCore.Qt.SolidLine))
-            p.drawRect(wx, wy, wb, wb)
             p.drawLine(wcx - 8, wcy, wcx + 8, wcy)
             p.drawLine(wcx, wcy - 8, wcx, wcy + 8)
             if self._stamp_label:
                 p.setFont(QtGui.QFont("Arial", 9, QtGui.QFont.Bold))
-                p.setPen(QtGui.QColor(255, 200, 0))
+                p.setPen(QtGui.QColor(0, 224, 255))
                 p.drawText(wx + 3, wy + 13, self._stamp_label)
-
-        # Place mode cursor (keep existing)
-        if self._place_mode and self._cursor_img is not None:
-            wcx = int(self._cursor_img.x() * self._scale) + self._offset.x()
-            wcy = int(self._cursor_img.y() * self._scale) + self._offset.y()
-            ww  = int(self.PLACE_W * self._scale)
-            wh  = int(self.PLACE_H * self._scale)
-            wx  = wcx - ww // 2
-            wy  = wcy - wh // 2
-            p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255), 2,
-                                QtCore.Qt.SolidLine))
-            p.drawRect(wx, wy, ww, wh)
-            p.drawLine(wcx - 8, wcy, wcx + 8, wcy)
-            p.drawLine(wcx, wcy - 8, wcx, wcy + 8)
 
         p.end()
     
@@ -4177,610 +4149,7 @@ class ImageView(QtWidgets.QLabel):
         self._refresh()
 
 # =========================================================
-# MASKING TOOLBAR
-# =========================================================
-class MaskingToolbar(QtWidgets.QWidget):
-    """Secondary toolbar shown only while drawing mask regions."""
-
-    sig_add      = QtCore.pyqtSignal()
-    sig_subtract = QtCore.pyqtSignal()
-    sig_complete = QtCore.pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(4, 2, 4, 2)
-        lay.setSpacing(6)
-
-        lbl = QtWidgets.QLabel("  MASK EDIT MODE:")
-        lbl.setStyleSheet("color:#ffcc00;font-weight:bold")
-        lay.addWidget(lbl)
-
-        self._btn_add = QtWidgets.QPushButton("Add Mask")
-        self._btn_sub = QtWidgets.QPushButton("Subtract Mask")
-        self._btn_ok  = QtWidgets.QPushButton("Complete")
-
-        self._btn_add.setStyleSheet(
-            "background:#1a6b2a;color:#fff;font-weight:bold;padding:4px 10px")
-        self._btn_sub.setStyleSheet(
-            "background:#6b1a1a;color:#fff;font-weight:bold;padding:4px 10px")
-        self._btn_ok.setStyleSheet(
-            "background:#4a4a00;color:#fff;font-weight:bold;padding:4px 10px")
-
-        self._btn_add.setCheckable(True)
-        self._btn_sub.setCheckable(True)
-        self._btn_add.setChecked(True)
-
-        self._btn_add.clicked.connect(self._on_add)
-        self._btn_sub.clicked.connect(self._on_sub)
-        self._btn_ok.clicked.connect(self.sig_complete)
-
-        for b in (self._btn_add, self._btn_sub, self._btn_ok):
-            lay.addWidget(b)
-
-        lay.addStretch()
-        hint = QtWidgets.QLabel(
-            "  Draw rectangles.  Add = allow search    Subtract = block search")
-        hint.setStyleSheet("color:#999")
-        lay.addWidget(hint)
-
-    def _on_add(self):
-        self._btn_add.setChecked(True)
-        self._btn_sub.setChecked(False)
-        self.sig_add.emit()
-
-    def _on_sub(self):
-        self._btn_sub.setChecked(True)
-        self._btn_add.setChecked(False)
-        self.sig_subtract.emit()
-
-    def set_add_mode(self):
-        self._btn_add.setChecked(True)
-        self._btn_sub.setChecked(False)
-
-    def set_sub_mode(self):
-        self._btn_sub.setChecked(True)
-        self._btn_add.setChecked(False)
-
-
-# =========================================================
-# MASK CONFIRM DIALOG
-# =========================================================
-class MaskConfirmDialog(QtWidgets.QDialog):
-    """Colour-coded mask preview — confirm save or cancel."""
-
-    def __init__(self, mask: np.ndarray, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Confirm Search Mask")
-        self.setModal(True)
-        lay = QtWidgets.QVBoxLayout(self)
-
-        h, w  = mask.shape[:2]
-        scale = min(1.0, 600 / max(w, 1))
-        dw    = max(int(w * scale), 1)
-        dh    = max(int(h * scale), 1)
-        prev  = cv2.resize(mask, (dw, dh), interpolation=cv2.INTER_NEAREST)
-
-        colour = cv2.cvtColor(prev, cv2.COLOR_GRAY2BGR)
-        colour[prev == 255] = [40, 160,  40]
-        colour[prev == 0]   = [60,  40, 140]
-
-        rgb = cv2.cvtColor(colour, cv2.COLOR_BGR2RGB)
-        qi  = QtGui.QImage(rgb.data, dw, dh, 3 * dw,
-                           QtGui.QImage.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qi)
-
-        img_lbl = QtWidgets.QLabel()
-        img_lbl.setPixmap(pix)
-        img_lbl.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(img_lbl)
-
-        white_pct = 100.0 * np.count_nonzero(mask) / max(mask.size, 1)
-        info = QtWidgets.QLabel(
-            f"<b>Mask preview</b>  |  "
-            f"Image size: <b>{w}x{h}</b> px  |  "
-            f"<span style='color:#80ff80'>"
-            f"Searchable: {white_pct:.1f}%</span>  "
-            f"<span style='color:#ff8080'>"
-            f"Blocked: {100 - white_pct:.1f}%</span>"
-        )
-        info.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(info)
-
-        note = QtWidgets.QLabel(
-            "<i>Green = search allowed    Purple = search blocked</i>")
-        note.setAlignment(QtCore.Qt.AlignCenter)
-        note.setStyleSheet("color:#888")
-        lay.addWidget(note)
-
-        btn_row    = QtWidgets.QHBoxLayout()
-        btn_save   = QtWidgets.QPushButton("Save Mask")
-        btn_cancel = QtWidgets.QPushButton("Cancel")
-        btn_save.setStyleSheet(
-            "background:#1a6b2a;color:#fff;font-weight:bold;padding:4px 14px")
-        btn_cancel.setStyleSheet(
-            "background:#6b1a1a;color:#fff;font-weight:bold;padding:4px 14px")
-        btn_save.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
-        btn_row.addStretch()
-        btn_row.addWidget(btn_save)
-        btn_row.addWidget(btn_cancel)
-        btn_row.addStretch()
-        lay.addLayout(btn_row)
-        self.adjustSize()
-
-
-# =========================================================
-# TEMPLATE PREVIEW DIALOG  — 3-panel: original | canvas | overlay
-# =========================================================
-class TemplatePreviewDialog(QtWidgets.QDialog):
-    """
-    Shows 3 panels after a template is saved:
-      Left   : original BGR crop
-      Centre : pre-rendered contour canvas (filled, grayscale)
-      Right  : original crop with contour outlines overlaid in cyan
-    """
-
-    MAX_W = 320
-    MAX_H = 320
-
-    def __init__(self, roi_bgr: np.ndarray, name: str,
-                 mold_size: int = 150, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Template Preview — {name}")
-        self.setModal(True)
-        lay = QtWidgets.QVBoxLayout(self)
-
-        h, w  = roi_bgr.shape[:2]
-        scale = max(1.0, min(4.0,
-                            self.MAX_W / max(w, 1),
-                            self.MAX_H / max(h, 1)))
-        dw = max(int(w * scale), 1)
-        dh = max(int(h * scale), 1)
-
-        contours, canvas, *_ = ContourTemplate.extract_font_template(
-            roi_bgr, mold_size=mold_size)   # was hardcoded 150
-
-        orig_bgr  = roi_bgr if roi_bgr.ndim == 3 \
-                    else cv2.cvtColor(roi_bgr, cv2.COLOR_GRAY2BGR)
-        canvas_3c = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
-        overlay   = orig_bgr.copy()
-        cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)
-
-        orig_rs    = cv2.resize(orig_bgr,  (dw, dh),
-                                interpolation=cv2.INTER_LINEAR)
-        canvas_rs  = cv2.resize(canvas_3c, (dw, dh),
-                                interpolation=cv2.INTER_LINEAR)
-        overlay_rs = cv2.resize(overlay,   (dw, dh),
-                                interpolation=cv2.INTER_LINEAR)
-
-        gap      = np.zeros((dh, 4, 3), dtype=np.uint8)
-        combined = np.hstack([orig_rs, gap, canvas_rs, gap, overlay_rs])
-
-        ch, cw = combined.shape[:2]
-        rgb    = cv2.cvtColor(combined, cv2.COLOR_BGR2RGB)
-        qi     = QtGui.QImage(rgb.data, cw, ch, 3 * cw,
-                              QtGui.QImage.Format_RGB888)
-        pix    = QtGui.QPixmap.fromImage(qi.copy())
-
-        img_lbl = QtWidgets.QLabel()
-        img_lbl.setPixmap(pix)
-        img_lbl.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(img_lbl)
-
-        info = QtWidgets.QLabel(
-            f"<b>{name}</b>  |  "
-            f"ROI: <b>{w}x{h} px</b>  |  "
-            f"Contours kept: <b>{len(contours)}</b>  "
-            f"(area >= {MIN_CONTOUR_AREA} px^2)<br>"
-            f"<i style='color:#888'>Left: original  "
-            f"Centre: canvas  Right: overlay</i>"
-        )
-        info.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(info)
-
-        btn = QtWidgets.QPushButton("OK")
-        btn.setFixedWidth(100)
-        btn.clicked.connect(self.accept)
-        row = QtWidgets.QHBoxLayout()
-        row.addStretch(); row.addWidget(btn); row.addStretch()
-        lay.addLayout(row)
-        self.adjustSize()
-
-
-# =========================================================
-# FRAME LAYOUT DIALOG
-# =========================================================
-class FrameLayoutDialog(QtWidgets.QDialog):
-    """
-    Step 4 of the frame template wizard.
-
-    Displays the full image; user left-clicks to stamp expected anchor
-    positions in order F1…FN.  Each stamp creates an ROI box whose size
-    matches the anchor template canvas exactly — the click point is the
-    ROI centre.  TM runs inside this ROI to confirm presence.
-
-    Undo removes the last stamp.  Confirm saves frame_layout.json.
-    """
-
-    LAYOUT_FILE = "frame_layout.json"
-    MAX_DISP_W  = 920
-    MAX_DISP_H  = 660
-
-    def __init__(self, image_bgr: np.ndarray, recipe: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Frame Layout — Stamp Expected Frame Positions")
-        self.setModal(True)
-
-        self._image_bgr = image_bgr
-        self._stamps    = []   # list of (cx, cy) in image coords — ROI centre
-
-        # ROI size = anchor canvas dimensions
-        anc_canvas      = recipe["anchor"].get("canvas")
-        if anc_canvas is not None and anc_canvas.ndim >= 2:
-            self._roi_h, self._roi_w = anc_canvas.shape[:2]
-        else:
-            # fallback: use mold_size if canvas unavailable
-            self._roi_w, self._roi_h = recipe["mold_size"]
-
-        # Scale image to fit dialog display area
-        ih, iw         = image_bgr.shape[:2]
-        scale          = min(self.MAX_DISP_W / max(iw, 1),
-                             self.MAX_DISP_H / max(ih, 1), 1.0)
-        self._scale    = scale
-        dw             = max(int(iw * scale), 1)
-        dh             = max(int(ih * scale), 1)
-
-        self.setFixedSize(dw + 24, dh + 90)
-
-        root = QtWidgets.QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
-
-        # Hint label
-        hint = QtWidgets.QLabel(
-            f"Left-click the centre of each expected anchor position (F1, F2, …).  "
-            f"ROI size = anchor canvas ({self._roi_w}×{self._roi_h} px).  "
-            "Undo removes the last stamp.  Confirm saves the layout.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#aaa; font-size:9px")
-        root.addWidget(hint)
-
-        # Image label — receives mouse clicks
-        self._lbl = QtWidgets.QLabel()
-        self._lbl.setFixedSize(dw, dh)
-        self._lbl.setCursor(QtCore.Qt.CrossCursor)
-        self._lbl.mousePressEvent = self._on_click
-        root.addWidget(self._lbl)
-
-        # Button row
-        btn_row = QtWidgets.QHBoxLayout()
-        self._btn_undo    = QtWidgets.QPushButton("Undo (last stamp)")
-        self._btn_confirm = QtWidgets.QPushButton("Confirm & Save")
-        self._btn_cancel  = QtWidgets.QPushButton("Cancel")
-        self._btn_confirm.setDefault(True)
-        btn_row.addWidget(self._btn_undo)
-        btn_row.addStretch()
-        btn_row.addWidget(self._btn_confirm)
-        btn_row.addWidget(self._btn_cancel)
-        root.addLayout(btn_row)
-
-        self._btn_undo.clicked.connect(self._undo)
-        self._btn_confirm.clicked.connect(self._confirm)
-        self._btn_cancel.clicked.connect(self.reject)
-
-        self._refresh()
-
-    # ---- mouse input ----
-
-    def _on_click(self, ev):
-        if ev.button() != QtCore.Qt.LeftButton:
-            return
-        s   = self._scale
-        px  = int(ev.x() / s)
-        py  = int(ev.y() / s)
-        self._stamps.append((px, py))
-        self._refresh()
-
-    def _undo(self):
-        if self._stamps:
-            self._stamps.pop()
-            self._refresh()
-
-    # ---- save ----
-
-    def _confirm(self):
-        if not self._stamps:
-            QtWidgets.QMessageBox.warning(
-                self, "No Stamps",
-                "Place at least one frame stamp before confirming.")
-            return
-
-        rw = self._roi_w
-        rh = self._roi_h
-
-        frames = []
-        for i, (cx, cy) in enumerate(self._stamps):
-            # ROI centred on click point (= expected anchor centre)
-            rx = cx - rw // 2
-            ry = cy - rh // 2
-            frames.append({
-                "id":  f"F{i + 1}",
-                "roi": [rx, ry, rw, rh],
-            })
-
-        layout = {"version": 1, "frames": frames}
-        try:
-            with open(self.LAYOUT_FILE, "w") as f:
-                json.dump(layout, f, indent=2)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Save Error", f"Could not save frame_layout.json:\n{e}")
-            return
-
-        self.accept()
-
-    # ---- display refresh ----
-
-    def _refresh(self):
-        s  = self._scale
-        rw = self._roi_w
-        rh = self._roi_h
-
-        disp = cv2.resize(self._image_bgr,
-                          (int(self._image_bgr.shape[1] * s),
-                           int(self._image_bgr.shape[0] * s)),
-                          interpolation=cv2.INTER_LINEAR)
-        dh, dw = disp.shape[:2]
-
-        for i, (cx, cy) in enumerate(self._stamps):
-            # ROI centred on click point in image coords
-            rx = cx - rw // 2
-            ry = cy - rh // 2
-
-            # Convert to display coords
-            drx  = max(0,    int(rx * s))
-            dry  = max(0,    int(ry * s))
-            drx2 = min(dw-1, int((rx + rw) * s))
-            dry2 = min(dh-1, int((ry + rh) * s))
-
-            cv2.rectangle(disp, (drx, dry), (drx2, dry2), (0, 224, 255), 2)
-
-            # F-label top-left of box
-            lbl = f"F{i + 1}"
-            cv2.putText(disp, lbl,
-                        (drx + 4, dry + 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        (0, 224, 255), 2, cv2.LINE_AA)
-
-        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        qi   = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
-        self._lbl.setPixmap(QtGui.QPixmap.fromImage(qi.copy()))
-
-
-# =========================================================
-# FRAME RECIPE PREVIEW DIALOG
-# =========================================================
-class FrameRecipePreviewDialog(QtWidgets.QDialog):
-    """
-    Shows FRAME, MOLD A, and MOLD B each as a 3-panel strip:
-      Left: original BGR crop | Centre: contour canvas | Right: contour overlay
-
-    Stacked vertically — one strip per section.
-    """
-
-    PANEL_W = 240   # display width per individual panel image
-    PANEL_H = 200   # display height per individual panel image
-
-    def __init__(self, recipe: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Frame Recipe Preview")
-        self.setModal(True)
-        root = QtWidgets.QVBoxLayout(self)
-        root.setSpacing(10)
-        root.setContentsMargins(10, 10, 10, 10)
-
-        for key, label, color_bgr in [
-            ("frame",  "FRAME",  (255, 200,   0)),
-            ("mold_a", "MOLD A", (  0, 224, 255)),
-            ("mold_b", "MOLD B", (  0, 180, 200)),
-        ]:
-            sec = recipe.get(key)
-            if sec is None:
-                continue
-
-            # Decode section data
-            contours = sec.get("contours", [])
-            canvas   = sec.get("canvas")
-            if canvas is None:
-                continue
-
-            # Reconstruct original BGR from canvas (grayscale → colour)
-            # We use the canvas as "original" since the raw crop is not stored
-            orig_gray = canvas
-            h, w = orig_gray.shape[:2]
-
-            orig_bgr  = cv2.cvtColor(orig_gray, cv2.COLOR_GRAY2BGR)
-            canvas_3c = cv2.cvtColor(canvas,    cv2.COLOR_GRAY2BGR)
-            overlay   = orig_bgr.copy()
-            cv2.drawContours(overlay, contours, -1, color_bgr, 1)
-
-            # Scale to display size keeping aspect ratio
-            scale = min(self.PANEL_W / max(w, 1), self.PANEL_H / max(h, 1))
-            scale = max(1.0, scale)
-            dw    = max(int(w * scale), 1)
-            dh    = max(int(h * scale), 1)
-
-            orig_rs    = cv2.resize(orig_bgr,  (dw, dh), interpolation=cv2.INTER_LINEAR)
-            canvas_rs  = cv2.resize(canvas_3c, (dw, dh), interpolation=cv2.INTER_LINEAR)
-            overlay_rs = cv2.resize(overlay,   (dw, dh), interpolation=cv2.INTER_LINEAR)
-
-            gap      = np.zeros((dh, 4, 3), dtype=np.uint8)
-            combined = np.hstack([orig_rs, gap, canvas_rs, gap, overlay_rs])
-
-            ch, cw = combined.shape[:2]
-            rgb    = cv2.cvtColor(combined, cv2.COLOR_BGR2RGB)
-            qi     = QtGui.QImage(rgb.data, cw, ch, 3 * cw,
-                                  QtGui.QImage.Format_RGB888)
-            pix    = QtGui.QPixmap.fromImage(qi.copy())
-
-            # Section title
-            title = QtWidgets.QLabel(f"<b style='color:#00e5ff'>{label}</b>"
-                                     f"  {w}x{h} px  "
-                                     f"contours: {len(contours)}")
-            title.setStyleSheet("font-size:10px")
-            root.addWidget(title)
-
-            img_lbl = QtWidgets.QLabel()
-            img_lbl.setPixmap(pix)
-            img_lbl.setAlignment(QtCore.Qt.AlignLeft)
-            root.addWidget(img_lbl)
-
-            note = QtWidgets.QLabel(
-                "<i style='color:#666'>original  |  canvas  |  overlay</i>")
-            note.setStyleSheet("font-size:9px")
-            root.addWidget(note)
-
-            sep = QtWidgets.QFrame()
-            sep.setFrameShape(QtWidgets.QFrame.HLine)
-            sep.setFrameShadow(QtWidgets.QFrame.Sunken)
-            root.addWidget(sep)
-
-        btn = QtWidgets.QPushButton("Close")
-        btn.setFixedWidth(100)
-        btn.clicked.connect(self.accept)
-        row = QtWidgets.QHBoxLayout()
-        row.addStretch(); row.addWidget(btn); row.addStretch()
-        root.addLayout(row)
-        self.adjustSize()
-
-
-# =========================================================
-# SETUP PREVIEW DIALOG
-# =========================================================
-class SetupPreviewDialog(QtWidgets.QDialog):
-    """
-    Renders the full image with mold A, mold B, and all letter cell
-    boxes drawn on a copy — no changes to the live image view.
-
-    Frame anchor taken from recipe["frame"]["contour"] (capture position).
-    Mold centres derived using stored offsets.
-    Letter cells placed using marking_pairs offsets from mold centre.
-    Template canvas size used for each cell if available, else 45x45 px.
-
-    Colour coding:
-      FRAME box  — dashed cyan
-      MOLD boxes — dashed cyan (dimmer)
-      Cell boxes — yellow solid, labelled with template name
-    """
-
-    MAX_DIALOG_W = 1000
-    MAX_DIALOG_H =  800
-
-    def __init__(self, image_bgr: np.ndarray, recipe: dict, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Inspection Setup Preview")
-        self.setModal(True)
-
-        ih, iw = image_bgr.shape[:2]
-        display = image_bgr.copy()
-
-        # ── frame ──────────────────────────────────────────────
-        fx, fy, fw, fh = recipe["frame"]["contour"]
-        fcx = fx + fw // 2
-        fcy = fy + fh // 2
-        cv2_draw_dashed_rect(display, (fx, fy), (fx + fw, fy + fh),
-                             (0, 224, 255), 1)
-        cv2.putText(display, "FRAME", (fx + 2, fy - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 224, 255), 1)
-
-        # ── molds + cells ──────────────────────────────────────
-        grid_letters = recipe.get("grid_letters", [])
-        for key, mold_label in [("mold_a", "MOLD A"), ("mold_b", "MOLD B")]:
-            mold     = recipe[key]
-            odx, ody = mold["offset"]
-            mw, mh   = mold["canvas_w"], mold["canvas_h"]
-            acx = max(mw // 2, min(iw - mw // 2, fcx + odx))
-            acy = max(mh // 2, min(ih - mh // 2, fcy + ody))
-            ax1, ay1 = acx - mw // 2, acy - mh // 2
-            ax2, ay2 = ax1 + mw, ay1 + mh
-            cv2_draw_dashed_rect(display, (ax1, ay1), (ax2, ay2),
-                                 (0, 180, 200), 1)
-            cv2.putText(display, mold_label, (ax1 + 2, ay1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 180, 200), 1)
-
-            cell_w = int(mw * 0.90 / 3)
-            cell_h = int(mh * 0.85 / 3)
-            for slot_idx, letter in enumerate(grid_letters):
-                if not letter:
-                    continue
-                row = slot_idx // 3
-                col = slot_idx  % 3
-                dx  = (col - 1) * cell_w
-                dy  = (row - 1) * cell_h
-                ccx = acx + dx
-                ccy = acy + dy
-                roi_w = int(cell_w * 1.1)
-                roi_h = int(cell_h * 1.1)
-                lx1 = max(0,  ccx - roi_w // 2)
-                ly1 = max(0,  ccy - roi_h // 2)
-                lx2 = min(iw, lx1 + roi_w)
-                ly2 = min(ih, ly1 + roi_h)
-                cv2.rectangle(display, (lx1, ly1), (lx2, ly2), (255, 220, 0), 1)
-                cv2.putText(display, letter, (lx1 + 2, ly2 - 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 220, 0), 1)
-                
-        # ── scale to dialog ────────────────────────────────────
-        scale = min(self.MAX_DIALOG_W / max(iw, 1),
-                    self.MAX_DIALOG_H / max(ih, 1), 1.0)
-        dw = max(int(iw * scale), 1)
-        dh = max(int(ih * scale), 1)
-        disp_rs = cv2.resize(display, (dw, dh), interpolation=cv2.INTER_AREA)
-
-        rgb = cv2.cvtColor(disp_rs, cv2.COLOR_BGR2RGB)
-        qi  = QtGui.QImage(rgb.data, dw, dh, 3 * dw,
-                           QtGui.QImage.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qi.copy())
-
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
-
-        img_lbl = QtWidgets.QLabel()
-        img_lbl.setPixmap(pix)
-        img_lbl.setAlignment(QtCore.Qt.AlignCenter)
-        lay.addWidget(img_lbl)
-
-        active = sum(1 for l in recipe.get("grid_letters", []) if l)
-        self._panel.log(f"Setup preview — {active} active slots.", "#88ff88")
-        
-        info = QtWidgets.QLabel(
-            f"Frame anchor: ({fcx},{fcy})  |  "
-            f"Active slots: <b>{active}</b>"
-        )
-        info.setAlignment(QtCore.Qt.AlignCenter)
-        info.setStyleSheet("font-size:10px")
-        lay.addWidget(info)
-
-        note = QtWidgets.QLabel(
-            "<i style='color:#666'>Cyan dashed = frame/mold  "
-            "Yellow solid = letter cells</i>")
-        note.setAlignment(QtCore.Qt.AlignCenter)
-        note.setStyleSheet("font-size:9px")
-        lay.addWidget(note)
-
-        btn = QtWidgets.QPushButton("Close")
-        btn.setFixedWidth(100)
-        btn.clicked.connect(self.accept)
-        row = QtWidgets.QHBoxLayout()
-        row.addStretch(); row.addWidget(btn); row.addStretch()
-        lay.addLayout(row)
-        self.adjustSize()
-
-
-# =========================================================
-# FRAME TEMPLATE PANEL  — floating non-blocking step panel
+# FRAME TEMPLATE PANEL
 # =========================================================
 class FrameTemplatePanel(QtWidgets.QWidget):
     """
@@ -4852,21 +4221,18 @@ class FrameTemplatePanel(QtWidgets.QWidget):
         self.adjustSize()
 
     def set_detected(self, rect_str: str):
-        """Call after successful detection with a bbox description string."""
         self._lbl_status.setText(
             f"Mold detected:\n{rect_str}\n\nFrame (lead) box auto-derived.")
         self._lbl_status.setStyleSheet("color:#88ff88;font-size:11px")
         self._btn_confirm.setEnabled(True)
 
     def set_no_detection(self):
-        """Call when YOLO finds nothing."""
         self._lbl_status.setText(
             "No mold detected.\nCheck image or model file,\nthen click Retry.")
         self._lbl_status.setStyleSheet("color:#ffaa44;font-size:11px")
         self._btn_confirm.setEnabled(False)
 
     def set_no_model(self):
-        """Call when YOLO model is not available."""
         self._lbl_status.setText(
             "YOLO model not ready.\n"
             f"Place {YOLO_MODEL_XML} in the project folder.")
@@ -4877,7 +4243,94 @@ class FrameTemplatePanel(QtWidgets.QWidget):
     def closeEvent(self, e):
         self._on_cancel()
         e.accept()
-            
+
+
+# =========================================================
+# FRAME LAYOUT PANEL
+# =========================================================
+class FrameLayoutPanel(QtWidgets.QWidget):
+    """
+    Floating always-on-top panel for step 4 of the frame template wizard:
+    stamping expected frame positions directly on the main ImageView.
+
+    Provides stamp count feedback plus Undo / Confirm / Cancel controls.
+    """
+
+    def __init__(self, roi_w: int, roi_h: int,
+                 on_undo, on_confirm, on_cancel, parent=None):
+        super().__init__(
+            parent,
+            QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint |
+            QtCore.Qt.WindowTitleHint | QtCore.Qt.WindowCloseButtonHint
+        )
+        self.setWindowTitle("Frame Layout — Stamp Positions")
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, False)
+        self.setFixedWidth(340)
+
+        self._on_undo    = on_undo
+        self._on_confirm = on_confirm
+        self._on_cancel  = on_cancel
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(8)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        title = QtWidgets.QLabel("Stamp Expected Frame Positions")
+        title.setStyleSheet("font-size:13px;font-weight:bold;color:#00e5ff")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(title)
+
+        hint = QtWidgets.QLabel(
+            f"Left-click the anchor centre of each expected frame (F1, F2, …).\n"
+            f"ROI box: {roi_w} × {roi_h} px  (1.5 × anchor canvas).")
+        hint.setStyleSheet("color:#aaa;font-size:9px")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self._lbl_count = QtWidgets.QLabel("Stamps placed: 0")
+        self._lbl_count.setStyleSheet("color:#888888;font-size:11px")
+        self._lbl_count.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(self._lbl_count)
+
+        lay.addSpacing(4)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self._btn_undo    = QtWidgets.QPushButton("Undo")
+        self._btn_confirm = QtWidgets.QPushButton("Confirm & Save")
+        self._btn_cancel  = QtWidgets.QPushButton("Cancel")
+
+        self._btn_undo.setStyleSheet(
+            "background:#4a3a00;color:#fff;padding:5px 10px;border-radius:4px")
+        self._btn_confirm.setStyleSheet(
+            "background:#005f6b;color:#fff;font-weight:bold;"
+            "padding:5px 12px;border-radius:4px")
+        self._btn_cancel.setStyleSheet(
+            "background:#4a1a1a;color:#fff;padding:5px 10px;border-radius:4px")
+
+        self._btn_confirm.setEnabled(False)
+        self._btn_undo.clicked.connect(self._on_undo)
+        self._btn_confirm.clicked.connect(self._on_confirm)
+        self._btn_cancel.clicked.connect(self._on_cancel)
+
+        btn_row.addWidget(self._btn_undo)
+        btn_row.addStretch()
+        btn_row.addWidget(self._btn_confirm)
+        btn_row.addWidget(self._btn_cancel)
+        lay.addLayout(btn_row)
+
+        self.adjustSize()
+
+    def update_count(self, n: int):
+        self._lbl_count.setText(f"Stamps placed: {n}")
+        self._lbl_count.setStyleSheet(
+            f"color:{'#88ff88' if n > 0 else '#888888'};font-size:11px")
+        self._btn_confirm.setEnabled(n > 0)
+
+    def closeEvent(self, e):
+        self._on_cancel()
+        e.accept()
+
+
 # =========================================================
 # RIGHT PANEL
 # =========================================================
@@ -5177,7 +4630,7 @@ class MainWindow(QtWidgets.QWidget):
         self._run_from_io:  bool = False     # True = run triggered by MachineIO
         
         # General draw mode
-        self._mode    = None   # "frame" | "font" | "mask" | None
+        self._mode    = None   # "frame" | "font" | "frame_layout" | None
         self._pending = None   # pending font template name
 
         # Frame template creation state
@@ -5186,17 +4639,16 @@ class MainWindow(QtWidgets.QWidget):
         self._FRAME_TAGS  = ["MOLD_A", "MOLD_B", "ANCHOR", "PIN_A", "PIN_B"]
         self._yolo_pair_offset: int         = 0    # retry cycles through pairs
 
-        # Mask work-in-progress
-        self._mask_wip    = None
-        self._mask_is_add = True
-        
+        # Frame layout stamping state (step 4)
+        self._layout_stamps: list                = []   # list of QRect (image coords)
+        self._layout_roi_w:  int                 = 0
+        self._layout_roi_h:  int                 = 0
+        self._layout_panel:  FrameLayoutPanel | None = None
+
         # Run worker state
         self._worker:  RunWorker   | None = None
         self._camera:  BaslerCamera | None = None
         self._machine_io       = MachineIO()
-
-        # Pre-load mask once
-        self._run_mask: np.ndarray | None = None
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -5226,13 +4678,6 @@ class MainWindow(QtWidgets.QWidget):
         left = QtWidgets.QVBoxLayout()
 
         left.addLayout(self._build_toolbar())
-
-        self._mask_bar = MaskingToolbar()
-        self._mask_bar.setVisible(False)
-        self._mask_bar.sig_add.connect(self._mask_set_add)
-        self._mask_bar.sig_subtract.connect(self._mask_set_sub)
-        self._mask_bar.sig_complete.connect(self._mask_complete)
-        left.addWidget(self._mask_bar)
 
         self._view = ImageView()
         self._view.roi_selected.connect(self._on_roi)
@@ -5269,7 +4714,6 @@ class MainWindow(QtWidgets.QWidget):
         sep()
         btn("Create Frame Tmpl", self._start_frame,   "#1155aa")
         btn("Create Font Tmpl",  self._start_font,    "#116611")
-        btn("Masking Template",  self._start_masking, "#333388")
         sep()
         self._btn_run  = btn("▶ Start Run", self._start_run, "#1a6b2a")
         self._btn_stop = btn("■ Stop",      self._stop_run,  "#882200")
@@ -5438,26 +4882,8 @@ class MainWindow(QtWidgets.QWidget):
             grid_letters = letters,
         )
         if ok:
-            self._panel.log("Frame recipe saved (auto-derived from YOLO bbox).", "#88ff88")
-            try:
-                recipe = self._ctrl.load_frame_recipe()
-                FrameRecipePreviewDialog(recipe, parent=self).exec_()
-            except Exception:
-                pass
-            # Step 4: stamp expected frame positions → saves frame_layout.json
-            try:
-                recipe = self._ctrl.load_frame_recipe()
-                dlg = FrameLayoutDialog(self._image, recipe, parent=self)
-                if dlg.exec_() == QtWidgets.QDialog.Accepted:
-                    layout = self._ctrl.load_frame_layout()
-                    n = len(layout.get("frames", []))
-                    self._panel.log(
-                        f"Frame layout saved — {n} frame(s) defined.", "#88ff88")
-                else:
-                    self._panel.log(
-                        "Frame layout not saved (cancelled).", "#ffaa44")
-            except Exception as e:
-                self._panel.log(f"Frame layout step error: {e}", "#ff4444")
+            self._panel.log("Frame recipe saved. Now stamp expected frame positions.", "#88ff88")
+            self._start_layout_stamp()
         else:
             self._panel.log("Frame recipe save failed.", "#ff4444")
             self._clear_frame_overlays()
@@ -5469,6 +4895,115 @@ class MainWindow(QtWidgets.QWidget):
             if ov[2] not in self._FRAME_TAGS
         ]
         self._view.update()
+
+    # ----------------------------------------------------------
+    # Frame layout stamping (step 4 — inline in main window)
+    # ----------------------------------------------------------
+    def _start_layout_stamp(self):
+        """Enter frame-layout stamping mode on the main ImageView."""
+        try:
+            recipe = self._ctrl.load_frame_recipe()
+        except Exception as e:
+            self._panel.log(f"Layout stamp: recipe load error: {e}", "#ff4444")
+            return
+
+        anc_canvas = recipe["anchor"].get("canvas")
+        if anc_canvas is None:
+            self._panel.log("Layout stamp: anchor canvas not found.", "#ff4444")
+            return
+
+        canvas_h, canvas_w = anc_canvas.shape[:2]
+        self._layout_roi_w = int(canvas_w * 1.5)
+        self._layout_roi_h = int(canvas_h * 1.5)
+        self._layout_stamps = []
+        self._mode = "frame_layout"
+
+        self._view.set_stamp_mode(
+            True,
+            box_size = self._layout_roi_w,
+            box_h    = self._layout_roi_h,
+            label    = "F1",
+        )
+
+        self._layout_panel = FrameLayoutPanel(
+            roi_w      = self._layout_roi_w,
+            roi_h      = self._layout_roi_h,
+            on_undo    = self._on_layout_undo,
+            on_confirm = self._on_layout_confirm,
+            on_cancel  = self._on_layout_cancel,
+            parent     = self,
+        )
+        geo = self.geometry()
+        pw  = self._layout_panel.sizeHint().width()
+        self._layout_panel.move(geo.right() - pw - 20, geo.top() + 60)
+        self._layout_panel.show()
+        self._panel.log(
+            f"Step 4 — Click image to stamp frame positions "
+            f"(ROI {self._layout_roi_w}×{self._layout_roi_h} px = 1.5× anchor).",
+            "#aaddff")
+
+    def _on_layout_stamp(self, rect: QtCore.QRect):
+        n = len(self._layout_stamps) + 1
+        self._layout_stamps.append(rect)
+        self._view.add_overlay(
+            rect, QtGui.QColor(0, 224, 255), f"F{n}", "dash")
+        if self._layout_panel:
+            self._layout_panel.update_count(n)
+        self._view.set_stamp_label(f"F{n + 1}")
+        self._panel.log(
+            f"Stamp F{n} placed at ({rect.center().x()}, {rect.center().y()}).",
+            "#88ddff")
+
+    def _on_layout_undo(self):
+        if not self._layout_stamps:
+            return
+        self._layout_stamps.pop()
+        # Remove the last LAYOUT overlay (tag starts with "F")
+        for i in range(len(self._view._overlays) - 1, -1, -1):
+            lbl = self._view._overlays[i][2]
+            if lbl.startswith("F") and lbl[1:].isdigit():
+                del self._view._overlays[i]
+                break
+        self._view.update()
+        n = len(self._layout_stamps)
+        if self._layout_panel:
+            self._layout_panel.update_count(n)
+        self._view.set_stamp_label(f"F{n + 1}")
+        self._panel.log(f"Undo — {n} stamp(s) remaining.", "#ffaa44")
+
+    def _on_layout_confirm(self):
+        frames = []
+        for i, rect in enumerate(self._layout_stamps):
+            frames.append({
+                "id":  f"F{i + 1}",
+                "roi": [rect.x(), rect.y(), rect.width(), rect.height()],
+            })
+        layout = {"version": 1, "frames": frames}
+        ok = self._ctrl.save_frame_layout(layout)
+        self._stop_layout_stamp()
+        if ok:
+            self._panel.log(
+                f"Frame layout saved — {len(frames)} frame(s) defined.", "#88ff88")
+        else:
+            self._panel.log("Frame layout save failed.", "#ff4444")
+
+    def _on_layout_cancel(self):
+        self._stop_layout_stamp()
+        self._panel.log("Frame layout stamping cancelled.", "#888888")
+
+    def _stop_layout_stamp(self):
+        self._mode = None
+        self._view.set_stamp_mode(False)
+        # Remove layout stamp overlays (tagged "F1", "F2", …)
+        self._view._overlays = [
+            ov for ov in self._view._overlays
+            if not (ov[2].startswith("F") and ov[2][1:].isdigit())
+        ]
+        self._view.update()
+        self._layout_stamps = []
+        if self._layout_panel:
+            self._layout_panel.hide()
+            self._layout_panel = None
 
     def _start_font(self):
         if self._image is None:
@@ -5491,15 +5026,14 @@ class MainWindow(QtWidgets.QWidget):
         if self._image is None or self._mode is None:
             return
 
-        if self._mode == "mask":
-            self._on_mask_roi(rect)
-            return
-
         if self._mode == "frame":
             self._on_frame_roi(rect)
             return
 
-        
+        if self._mode == "frame_layout":
+            self._on_layout_stamp(rect)
+            return
+
         # ---- font mode ----
         self._view.set_draw_mode(False)
         x = max(0, rect.x())
@@ -5541,100 +5075,8 @@ class MainWindow(QtWidgets.QWidget):
         pass
 
     # ----------------------------------------------------------
-    # Masking
-    # ----------------------------------------------------------
-    def _start_masking(self):
-        if self._image is None:
-            self._panel.log("No image loaded.", "#ffaa44"); return
-
-        ih, iw = self._image.shape[:2]
-
-        if os.path.exists(MASK_FILE):
-            loaded = cv2.imread(MASK_FILE, cv2.IMREAD_GRAYSCALE)
-            if loaded is not None and loaded.shape == (ih, iw):
-                self._mask_wip = loaded.copy()
-                self._panel.log("Existing mask loaded for editing.", "#aaddff")
-            else:
-                self._mask_wip = np.full((ih, iw), 255, dtype=np.uint8)
-                self._panel.log(
-                    "Mask size mismatch — starting fresh.", "#ffaa44")
-        else:
-            self._mask_wip = np.full((ih, iw), 255, dtype=np.uint8)
-            self._panel.log(
-                "Starting new mask (all white = fully searchable).", "#aaddff")
-
-        self._mask_is_add = True
-        self._mode        = "mask"
-        self._mask_bar.setVisible(True)
-        self._mask_bar.set_add_mode()
-        self._view.set_mask_draw_mode(True, add=True)
-        self._panel.log(
-            "Masking mode: draw rectangles.  Add = allow  Subtract = block.",
-            "#ffcc00")
-
-    def _mask_set_add(self):
-        self._mask_is_add = True
-        self._view.set_mask_draw_mode(True, add=True)
-        self._panel.log("Brush -> ADD (white / searchable)", "#80ff80")
-
-    def _mask_set_sub(self):
-        self._mask_is_add = False
-        self._view.set_mask_draw_mode(True, add=False)
-        self._panel.log("Brush -> SUBTRACT (black / blocked)", "#ff8080")
-
-    def _on_mask_roi(self, rect: QtCore.QRect):
-        if self._mask_wip is None:
-            return
-        ih, iw = self._mask_wip.shape[:2]
-        x  = max(0, rect.x())
-        y  = max(0, rect.y())
-        x2 = min(iw, x + rect.width())
-        y2 = min(ih, y + rect.height())
-        if x2 <= x or y2 <= y:
-            return
-        self._mask_wip[y:y2, x:x2] = 255 if self._mask_is_add else 0
-        op = "ADD" if self._mask_is_add else "SUBTRACT"
-        self._panel.log(f"  Mask {op}: ({x},{y})->({x2},{y2})", "#cccccc")
-        self._view.set_mask_draw_mode(True, add=self._mask_is_add)
-
-    def _mask_complete(self):
-        self._view.set_mask_draw_mode(False)
-        self._mask_bar.setVisible(False)
-        self._mode = None
-        if self._mask_wip is None:
-            return
-        dlg = MaskConfirmDialog(self._mask_wip, parent=self)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            ok = cv2.imwrite(MASK_FILE, self._mask_wip,
-                             [cv2.IMWRITE_JPEG_QUALITY, 95])
-            if ok:
-                self._panel.log(
-                    f"Search mask saved -> {MASK_FILE}", "#88ff88")
-            else:
-                self._panel.log(
-                    f"ERROR: could not save mask to {MASK_FILE}", "#ff4444")
-        else:
-            self._panel.log(
-                "Mask edit cancelled — no file written.", "#888888")
-        self._mask_wip = None
-
-    # ----------------------------------------------------------
     # Inspection run — threaded
     # ----------------------------------------------------------
-    def _load_run_mask(self) -> np.ndarray | None:
-        """Load and cache the binary search mask. Returns None if absent."""
-        if not os.path.exists(MASK_FILE):
-            return None
-        ih  = ImageIO.TARGET_H
-        iw  = ImageIO.TARGET_W
-        m   = cv2.imread(MASK_FILE, cv2.IMREAD_GRAYSCALE)
-        if m is None or m.shape != (ih, iw):
-            self._panel.log("Mask file missing or size mismatch — ignored.",
-                            "#ffaa44")
-            return None
-        _, bm = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
-        return bm
-
     def _start_run(self, from_io: bool = False):
         if self._worker and self._worker.isRunning():
             self._panel.log("Run already in progress.", "#ffaa44"); return
@@ -5686,12 +5128,9 @@ class MainWindow(QtWidgets.QWidget):
         if not DEBUG_MODE and self._camera:
             self._camera.set_exposure(sm.get("camera_exposure_us"))
 
-        mask = self._load_run_mask()
-
         self._worker = RunWorker(
             ctrl        = self._ctrl,
             io          = self._machine_io,
-            mask        = mask,
             image_io    = self._io_obj,
             run_from_io = self._run_from_io,
             io_recipe   = list(self._io_recipe),
