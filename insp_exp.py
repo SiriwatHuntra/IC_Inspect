@@ -221,12 +221,15 @@ class SettingsManager:
         # --- setup section (string) ---
         self._str_data: dict = dict(_STRING_DEFAULTS)
 
-        # Load from file or migrate from legacy txt
+        # Load from file, migrate from legacy, or create fresh
         if os.path.exists(path):
             self._load_json(path)
         elif os.path.exists(SETTINGS_FILE):
-            self._migrate_txt(SETTINGS_FILE)
-            self.save()                         # write Setup.json immediately
+            # Legacy file may be old txt format OR already new JSON format
+            # (written by a previous run before the rename).  Try JSON first.
+            if not self._load_json(SETTINGS_FILE):
+                self._migrate_txt(SETTINGS_FILE)
+            self.save()                         # write Setup.json
         else:
             self.save()                         # create Setup.json with defaults
 
@@ -307,7 +310,8 @@ class SettingsManager:
         self._load_json(path or self.path)
         self._apply_statics()
 
-    def _load_json(self, path: str):
+    def _load_json(self, path: str) -> bool:
+        """Load Setup.json.  Returns True on success, False on any error."""
         try:
             with open(path, "r") as f:
                 payload = json.load(f)
@@ -334,8 +338,11 @@ class SettingsManager:
                 if isinstance(entry, str):
                     self._str_data[hdr] = entry
 
+            return True
+
         except Exception as e:
             print(f"[Settings] Load error ({path}): {e}")
+            return False
 
     def _migrate_txt(self, path: str):
         """Read legacy inspection_settings.txt into the setup section."""
@@ -4809,7 +4816,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self._image = image.copy() if image is not None else None
         self._io_obj    = ImageIO()
-        self._sm    = SettingsManager(SETTINGS_FILE)
+        self._sm    = SettingsManager(SETUP_FILE)
         self._grid_changed_cb = None
         self._ctrl  = InspectionController(self._sm)
         self._current_grid: list = []
@@ -5332,7 +5339,7 @@ class MainWindow(QtWidgets.QWidget):
         self._panel.log(
             f"=== Start [{mode}] grid_src={src}"
             f"  pin_thr={pin_params['score_thr']:.2f}"
-            f"  font_conf={font_confidence_min:.2f}"
+            f"  font_conf={FONT_CONFIDENCE_MIN:.2f}"
             f"  grid={','.join(grid)} ===", "#ffffff")
         self._worker.start()
 
