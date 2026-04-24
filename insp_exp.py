@@ -2417,13 +2417,15 @@ class ResultAnnotator:
                    fw:      int,
                    fh:      int,
                    f_idx:   int,
-                   fscore:  float):
+                   fscore:  float,
+                   frame_id: str = ""):
         """
         Draw dashed frame bounding box + score label.
 
         Input : display (BGR ndarray, modified in-place),
                 fcx/fcy (frame centre), fw/fh (matched size),
-                f_idx (0-based frame index), fscore (TM score 0–1)
+                f_idx (0-based frame index), fscore (TM score 0–1),
+                frame_id (layout id string, e.g. "F1")
         """
         ih, iw = display.shape[:2]
         fx1 = max(0,    fcx - fw // 2)
@@ -2433,8 +2435,9 @@ class ResultAnnotator:
         cv2_draw_dashed_rect(
             display, (fx1, fy1), (fx2, fy2),
             ResultAnnotator.COLOR_FRAME, 1)
+        lbl = f"{frame_id} {fscore:.2f}" if frame_id else f"F{f_idx+1} {fscore:.2f}"
         cv2.putText(display,
-                    f"F{f_idx+1} {fscore:.2f}",
+                    lbl,
                     (fx1 + 2, fy1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40,
                     ResultAnnotator.COLOR_FRAME, 1)
@@ -2543,7 +2546,8 @@ class ResultAnnotator:
     @staticmethod
     def draw_drop_label(display: np.ndarray,
                         acx: int, acy: int,
-                        aw: int, ah: int):
+                        aw: int, ah: int,
+                        ic_id: str = ""):
         """Draw 'DROP' label centred on a mold whose leads are absent."""
         ih, iw = display.shape[:2]
         ax1 = max(0,    acx - aw // 2)
@@ -2556,7 +2560,7 @@ class ResultAnnotator:
         cv2.addWeighted(overlay, 0.18, display, 0.82, 0, display)
         cv2.rectangle(display, (ax1, ay1), (ax2, ay2), (0, 200, 200), 1)
 
-        lbl   = "DROP"
+        lbl   = f"{ic_id} DROP" if ic_id else "DROP"
         font  = cv2.FONT_HERSHEY_SIMPLEX
         fscl  = 0.55
         thick = 1
@@ -2566,6 +2570,27 @@ class ResultAnnotator:
         cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
                       (0, 0, 0), cv2.FILLED)
         cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 200, 200), thick, cv2.LINE_AA)
+
+    # ---- Missing frame (no TM match in layout ROI) ------------------
+    @staticmethod
+    def draw_missing_frame(display: np.ndarray,
+                           rx: int, ry: int,
+                           rw: int, rh: int,
+                           frame_id: str = ""):
+        """Draw MISSING annotation over a pre-defined frame ROI that had no TM hit."""
+        ih, iw = display.shape[:2]
+        x1 = max(0,    rx);      y1 = max(0,    ry)
+        x2 = min(iw-1, rx + rw); y2 = min(ih-1, ry + rh)
+        cv2_draw_dashed_rect(display, (x1, y1), (x2, y2), (0, 0, 180), 2)
+        lbl  = f"{frame_id} MISSING" if frame_id else "MISSING"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fscl = 0.50; thick = 1
+        (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
+        tx = (x1 + x2) // 2 - tw // 2
+        ty = (y1 + y2) // 2 + th // 2
+        cv2.rectangle(display, (tx - 2, ty - th - bl), (tx + tw + 2, ty + bl),
+                      (0, 0, 0), cv2.FILLED)
+        cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 80, 255), thick, cv2.LINE_AA)
 
     # ---- Last-lot image-level banner --------------------------------
     @staticmethod
@@ -2851,6 +2876,25 @@ class InspectionController:
         recipe = self.load_frame_recipe()
         return recipe["mold_a_shift"], recipe["mold_b_shift"]
 
+    # ---- frame layout (frame_layout.json) ----
+    LAYOUT_FILE = "frame_layout.json"
+
+    def has_frame_layout(self) -> bool:
+        return os.path.exists(self.LAYOUT_FILE)
+
+    def load_frame_layout(self) -> dict:
+        with open(self.LAYOUT_FILE, "r") as f:
+            return json.load(f)
+
+    def save_frame_layout(self, layout: dict) -> bool:
+        try:
+            with open(self.LAYOUT_FILE, "w") as f:
+                json.dump(layout, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"[Controller] save_frame_layout error: {e}")
+            return False
+
     # ---- font template save ----
     def save_font(self, name, roi_bgr, roi_rect,
                 parent_widget, mold_size: int = 150) -> bool:
@@ -2880,14 +2924,15 @@ class InspectionController:
     
     def prepare(self, grid_letters: list) -> list:
         """
-        Pre-flight: load recipe + cache all templates for grid_letters.
+        Pre-flight: load recipe + layout + cache all templates for grid_letters.
         Call once before the inspection loop starts.
 
         Returns list of missing template names (empty = all good).
-        Stores loaded recipe in self._active_recipe for use by run().
+        Stores loaded recipe and layout in self._active_recipe / _active_layout.
         """
         self._active_recipe  = None
         self._active_grid    = []
+        self._active_layout  = None
 
         if not self.has_frame_recipe():
             return ["__NO_RECIPE__"]
@@ -2897,6 +2942,15 @@ class InspectionController:
         except Exception as e:
             print(f"[Prepare] Recipe load error: {e}")
             return ["__RECIPE_ERROR__"]
+
+        if not self.has_frame_layout():
+            return ["__NO_LAYOUT__"]
+
+        try:
+            layout = self.load_frame_layout()
+        except Exception as e:
+            print(f"[Prepare] Layout load error: {e}")
+            return ["__LAYOUT_ERROR__"]
 
         active_grid = [l for l in grid_letters if l]
         if not active_grid:
@@ -2919,6 +2973,7 @@ class InspectionController:
         recipe["grid_letters"] = grid_letters
         self._active_recipe    = recipe
         self._active_grid      = grid_letters
+        self._active_layout    = layout
         return []
 
     def set_run_params(self, pin_params: dict):
@@ -3000,8 +3055,9 @@ class InspectionController:
         empty   = InspectionResult(display=display)
 
         recipe = getattr(self, "_active_recipe", None)
-        if recipe is None:
-            print("[Pipeline] prepare() not called — no recipe loaded.")
+        layout = getattr(self, "_active_layout", None)
+        if recipe is None or layout is None:
+            print("[Pipeline] prepare() not called — no recipe/layout loaded.")
             return empty
 
         pin_params = getattr(self, "_active_pin_params", None)
@@ -3017,20 +3073,65 @@ class InspectionController:
             print("[Pipeline] Recipe missing 'anchor' key — re-save template.")
             return empty
 
-        matches = self._step1_find_frames(
-            image_bgr, anchor_tmpl, pin_params, mask)
+        frame_results = self._step1_find_frames(
+            image_bgr, anchor_tmpl, pin_params, layout)
 
-        if not matches:
-            print("[Pipeline] No anchor matches found.")
+        if not frame_results:
+            print("[Pipeline] Frame layout is empty.")
             return empty
 
         ih, iw = image_bgr.shape[:2]
 
-        for f_idx, (anc_cx, anc_cy, fscore, fw, fh, fscale) in enumerate(matches):
-            ResultAnnotator.draw_frame(display, anc_cx, anc_cy, fw, fh, f_idx, fscore)
+        # Build a fake matches list (cx, cy, score, fw, fh, scale) for last-lot
+        # using expected ROI centres for MISSING frames so column grouping still works.
+        fake_matches = []
+
+        for f_idx, fentry in enumerate(frame_results):
+            fid   = fentry["id"]
+            found = fentry["found"]
+            anc_cx, anc_cy = fentry["cx"], fentry["cy"]
+            fscore = fentry["score"]
+            fw, fh = fentry["fw"], fentry["fh"]
+
+            fake_matches.append((anc_cx, anc_cy, fscore, fw, fh, 1.0))
+
+            if not found:
+                # Always draw annotation for missing frames
+                rx, ry, rw, rh = fentry["roi"]
+                ResultAnnotator.draw_missing_frame(display, rx, ry, rw, rh, fid)
+                # Add placeholder results so every frame appears in the result set
+                grid_letters = recipe.get("grid_letters", [""] * 9)
+                for m_idx, mold_label in enumerate(["A", "B"]):
+                    ic_num = f_idx * 2 + m_idx + 1
+                    ic_id  = f"{fid}-{mold_label}"
+                    for slot_idx, letter in enumerate(grid_letters):
+                        if not letter:
+                            continue
+                        self.results.append({
+                            "frame_idx":   f_idx + 1,
+                            "frame_id":    fid,
+                            "mold":        mold_label,
+                            "slot":        slot_idx,
+                            "letter":      letter,
+                            "pass":        False,
+                            "confidence":  0.0,
+                            "shift_px":    0.0,
+                            "shift_ratio": 0.0,
+                            "defect_step": 0,
+                            "reason":      "missing_frame",
+                            "ic_num":      ic_num,
+                            "cell_cx":     anc_cx,
+                            "cell_cy":     anc_cy,
+                            "elapsed_ms":  0.0,
+                            "lx1": 0, "ly1": 0, "lx2": 0, "ly2": 0,
+                            "roi_canvas":  None,
+                        })
+                continue
+
+            ResultAnnotator.draw_frame(display, anc_cx, anc_cy, fw, fh, f_idx, fscore, fid)
 
             mold_areas = self._step2_locate_molds(
-                recipe, anc_cx, anc_cy, fscale, iw, ih)
+                recipe, anc_cx, anc_cy, 1.0, iw, ih)
 
             t0_frame = time.perf_counter()
 
@@ -3038,10 +3139,9 @@ class InspectionController:
                 acx, acy  = area["cx"],  area["cy"]
                 aw,  ah   = area["w"],   area["h"]
                 mold_size = min(aw, ah)
-                ic_num    = f_idx * 2 + m_idx + 1  # A=2i+1, B=2i+2  (1-based)
+                ic_num    = f_idx * 2 + m_idx + 1   # A=2i+1, B=2i+2 (1-based)
+                ic_id     = f"{fid}-{area['label']}"
 
-
-                # Per-mold pin presence check before font inspection
                 pin_key       = "pin_a" if area["label"] == "A" else "pin_b"
                 leads_present = self._eng.check_pin_presence(
                     src, anc_cx, anc_cy,
@@ -3055,43 +3155,43 @@ class InspectionController:
                     mold_size     = mold_size,
                     mold_w        = aw,
                     mold_h        = ah,
-                    leads_present = leads_present)
+                    leads_present = leads_present,
+                    ic_id         = ic_id)
                 mold_ms = (time.perf_counter() - t0_mold) * 1000
 
-                # Tag each result with IC number
                 for r in letter_results:
-                    r["ic_num"] = ic_num
+                    r["ic_num"]   = ic_num
+                    r["frame_id"] = fid
 
                 ResultAnnotator.draw_mold(display, acx, acy, aw, ah,
-                                        f_idx, area["label"],
-                                        elapsed_ms=mold_ms)
+                                          f_idx, area["label"],
+                                          elapsed_ms=mold_ms)
 
                 self.results.extend(letter_results)
 
             frame_ms = (time.perf_counter() - t0_frame) * 1000
 
-            # Tag frame timing on last results batch for this frame
             for r in self.results:
                 if r.get("frame_idx") == f_idx + 1 and "frame_ms" not in r:
                     r["frame_ms"] = round(frame_ms, 1)
 
-        # ── Image-level last-lot check (runs after all chips inspected) ──
+        # ── Image-level last-lot check ──
         col_snap = max(1, anchor_tmpl.get("canvas_w", 60) // 2)
         img_ll, img_chip_cols, img_total_cols, fidx_to_col = \
-            self._check_last_lot_image(matches, self.results, col_snap)
+            self._check_last_lot_image(fake_matches, self.results, col_snap)
 
         if img_ll:
-            # Tag every result; mark empty columns (index >= img_chip_cols) as ignored
             for r in self.results:
                 r["last_lot"]      = True
                 r["last_lot_cols"] = img_chip_cols
-                fi = r.get("frame_idx", 0) - 1      # frame_idx is 1-based
+                fi = r.get("frame_idx", 0) - 1
                 if fidx_to_col.get(fi, -1) >= img_chip_cols:
                     r["ignored"] = True
 
-            # Gray overlay on each ignored (empty-column) frame
-            for f_idx, (anc_cx, anc_cy, _, fw, fh, _) in enumerate(matches):
+            for f_idx, fentry in enumerate(frame_results):
                 if fidx_to_col.get(f_idx, -1) >= img_chip_cols:
+                    anc_cx, anc_cy = fentry["cx"], fentry["cy"]
+                    fw, fh = fentry["fw"], fentry["fh"]
                     ResultAnnotator.draw_ignored_frame(display, anc_cx, anc_cy, fw, fh)
 
             ResultAnnotator.draw_last_lot_image_flag(
@@ -3100,7 +3200,6 @@ class InspectionController:
                   f"frame-col(s) filled")
 
         total_ms = round((time.perf_counter() - t0_total) * 1000, 1)
-        # Only count active (non-ignored) results toward pass/fail
         active      = [r for r in self.results if not r.get("ignored")]
         passed      = sum(1 for r in active if r["pass"])
         any_ll      = any(r.get("last_lot") for r in self.results)
@@ -3117,27 +3216,61 @@ class InspectionController:
         result.total_ms = total_ms
         return result
 
-    def _step1_find_frames(self, image_bgr, anchor_tmpl, pin_params, mask):
+    def _step1_find_frames(self, image_bgr, anchor_tmpl, pin_params, layout):
         """
-        Find all anchor template hits; sort Y-row first then X-col.
-        Returns list of (anchor_cx, anchor_cy, score, w, h, scale) — same
-        tuple shape as before so run() loop is unchanged.
+        For each frame in layout (F1→FN), crop the image at the pre-defined ROI
+        and run a local TM to confirm presence.
+
+        Returns list of dicts:
+          { id, roi, found, cx, cy, score, fw, fh }
+        Order is always the layout order — no sorting, no index reassignment.
         """
-        matches = self._eng.find_all_pin_templates(
-            image_bgr, anchor_tmpl,
-            score_thr   = pin_params["score_thr"],
-            max_matches = pin_params["max_matches"],
-            mask        = mask,
-        )
-        if not matches:
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY) \
+            if image_bgr.ndim == 3 else image_bgr.copy()
+
+        tmpl_canvas = anchor_tmpl.get("canvas")
+        if tmpl_canvas is None or tmpl_canvas.size == 0:
             return []
 
-        COL_SNAP = max(1, anchor_tmpl.get("canvas_w", 60) // 2)
-        ROW_SNAP = max(1, anchor_tmpl.get("canvas_h", 60) // 2)
+        th, tw = tmpl_canvas.shape[:2]
+        ih, iw = gray.shape[:2]
+        score_thr = pin_params.get("score_thr", 0.75)
+        results = []
 
-        return sorted(matches,
-                      key=lambda m: (round(m[0] / COL_SNAP),
-                                     round(m[1] / ROW_SNAP)))
+        for fentry in layout.get("frames", []):
+            fid   = fentry["id"]
+            x, y, w, h = fentry["roi"]
+            x1 = max(0, x);      y1 = max(0, y)
+            x2 = min(iw, x + w); y2 = min(ih, y + h)
+            crop = gray[y1:y2, x1:x2]
+
+            found = False
+            cx    = x1 + (x2 - x1) // 2
+            cy    = y1 + (y2 - y1) // 2
+            score = 0.0
+
+            if crop.shape[0] >= th and crop.shape[1] >= tw:
+                result_map = cv2.matchTemplate(crop, tmpl_canvas, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(result_map)
+                if max_val >= score_thr:
+                    found = True
+                    score = float(max_val)
+                    mx, my = max_loc
+                    cx = x1 + mx + tw // 2
+                    cy = y1 + my + th // 2
+
+            results.append({
+                "id":    fid,
+                "roi":   [x, y, w, h],
+                "found": found,
+                "cx":    cx,
+                "cy":    cy,
+                "score": score,
+                "fw":    tw,
+                "fh":    th,
+            })
+
+        return results
 
     def _step2_locate_molds(self, recipe, anc_cx, anc_cy, fscale, iw, ih):
         """
@@ -3174,7 +3307,8 @@ class InspectionController:
                          mold_size:     int  = 150,
                          mold_w:        int  = 150,
                          mold_h:        int  = 150,
-                         leads_present: bool = True) -> list:
+                         leads_present: bool = True,
+                         ic_id:         str  = "") -> list:
         results = []
 
         # ── Grid geometry (tunable) ───────────────────────────────
@@ -3215,7 +3349,7 @@ class InspectionController:
                     "roi_canvas":  None,
                 })
 
-            ResultAnnotator.draw_drop_label(display, acx, acy, mold_w, mold_h)
+            ResultAnnotator.draw_drop_label(display, acx, acy, mold_w, mold_h, ic_id=ic_id)
             return results
 
         # ── Normal font inspection ────────────────────────────────
@@ -4266,6 +4400,194 @@ class TemplatePreviewDialog(QtWidgets.QDialog):
 
 
 # =========================================================
+# FRAME LAYOUT DIALOG
+# =========================================================
+class FrameLayoutDialog(QtWidgets.QDialog):
+    """
+    Step 4 of the frame template wizard.
+
+    Displays the full image; user left-clicks to stamp expected anchor
+    positions in order F1…FN.  Each stamp creates an ROI box sized to
+    cover the complete frame (anchor + mold A + mold B) computed from
+    the saved recipe.
+
+    Undo removes the last stamp.  Confirm saves frame_layout.json.
+    """
+
+    LAYOUT_FILE = "frame_layout.json"
+    MAX_DISP_W  = 920
+    MAX_DISP_H  = 660
+
+    def __init__(self, image_bgr: np.ndarray, recipe: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Frame Layout — Stamp Expected Frame Positions")
+        self.setModal(True)
+
+        self._image_bgr = image_bgr
+        self._recipe    = recipe
+        self._stamps    = []   # list of (anchor_cx, anchor_cy) in image coords
+
+        # Compute ROI dimensions from recipe
+        aw, ah         = recipe["mold_size"]
+        dx_a, dy_a     = recipe["mold_a_shift"]
+        _dx_b, dy_b    = recipe["mold_b_shift"]
+        self._anc_w    = aw
+        self._anc_h    = ah
+        self._dy_a     = dy_a
+        self._dy_b     = dy_b
+        # Full frame width: anchor half + mold-A x-shift + mold half
+        self._roi_w    = aw // 2 + int(dx_a) + aw // 2
+        # Full frame height: mold B bottom - mold A top
+        self._roi_h    = int(dy_b - dy_a) + ah
+
+        # Scale image to fit dialog display area
+        ih, iw         = image_bgr.shape[:2]
+        scale          = min(self.MAX_DISP_W / max(iw, 1),
+                             self.MAX_DISP_H / max(ih, 1), 1.0)
+        self._scale    = scale
+        dw             = max(int(iw * scale), 1)
+        dh             = max(int(ih * scale), 1)
+
+        self.setFixedSize(dw + 24, dh + 90)
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # Hint label
+        hint = QtWidgets.QLabel(
+            "Left-click the anchor centre of each expected frame (F1, F2, …). "
+            "Undo removes the last stamp.  Confirm saves the layout.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#aaa; font-size:9px")
+        root.addWidget(hint)
+
+        # Image label — receives mouse clicks
+        self._lbl = QtWidgets.QLabel()
+        self._lbl.setFixedSize(dw, dh)
+        self._lbl.setCursor(QtCore.Qt.CrossCursor)
+        self._lbl.mousePressEvent = self._on_click
+        root.addWidget(self._lbl)
+
+        # Button row
+        btn_row = QtWidgets.QHBoxLayout()
+        self._btn_undo    = QtWidgets.QPushButton("Undo (last stamp)")
+        self._btn_confirm = QtWidgets.QPushButton("Confirm & Save")
+        self._btn_cancel  = QtWidgets.QPushButton("Cancel")
+        self._btn_confirm.setDefault(True)
+        btn_row.addWidget(self._btn_undo)
+        btn_row.addStretch()
+        btn_row.addWidget(self._btn_confirm)
+        btn_row.addWidget(self._btn_cancel)
+        root.addLayout(btn_row)
+
+        self._btn_undo.clicked.connect(self._undo)
+        self._btn_confirm.clicked.connect(self._confirm)
+        self._btn_cancel.clicked.connect(self.reject)
+
+        self._refresh()
+
+    # ---- mouse input ----
+
+    def _on_click(self, ev):
+        if ev.button() != QtCore.Qt.LeftButton:
+            return
+        s   = self._scale
+        px  = int(ev.x() / s)
+        py  = int(ev.y() / s)
+        self._stamps.append((px, py))
+        self._refresh()
+
+    def _undo(self):
+        if self._stamps:
+            self._stamps.pop()
+            self._refresh()
+
+    # ---- save ----
+
+    def _confirm(self):
+        if not self._stamps:
+            QtWidgets.QMessageBox.warning(
+                self, "No Stamps",
+                "Place at least one frame stamp before confirming.")
+            return
+
+        aw   = self._anc_w
+        ah   = self._anc_h
+        dy_a = self._dy_a
+        rw   = self._roi_w
+        rh   = self._roi_h
+
+        frames = []
+        for i, (cx, cy) in enumerate(self._stamps):
+            # ROI top-left: anchor left edge, mold-A top edge
+            rx = cx - aw // 2
+            ry = cy + int(dy_a) - ah // 2
+            frames.append({
+                "id":  f"F{i + 1}",
+                "roi": [rx, ry, rw, rh],
+            })
+
+        layout = {"version": 1, "frames": frames}
+        try:
+            with open(self.LAYOUT_FILE, "w") as f:
+                json.dump(layout, f, indent=2)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Save Error", f"Could not save frame_layout.json:\n{e}")
+            return
+
+        self.accept()
+
+    # ---- display refresh ----
+
+    def _refresh(self):
+        s    = self._scale
+        aw   = self._anc_w
+        ah   = self._anc_h
+        dy_a = self._dy_a
+        rw   = self._roi_w
+        rh   = self._roi_h
+
+        disp = cv2.resize(self._image_bgr,
+                          (int(self._image_bgr.shape[1] * s),
+                           int(self._image_bgr.shape[0] * s)),
+                          interpolation=cv2.INTER_LINEAR)
+        dh, dw = disp.shape[:2]
+
+        for i, (cx, cy) in enumerate(self._stamps):
+            # ROI in image coords
+            rx = cx - aw // 2
+            ry = cy + int(dy_a) - ah // 2
+
+            # Convert to display coords
+            drx  = max(0,    int(rx * s))
+            dry  = max(0,    int(ry * s))
+            drx2 = min(dw-1, int((rx + rw) * s))
+            dry2 = min(dh-1, int((ry + rh) * s))
+
+            cv2.rectangle(disp, (drx, dry), (drx2, dry2), (0, 224, 255), 2)
+
+            # F-label top-left of box
+            lbl = f"F{i + 1}"
+            cv2.putText(disp, lbl,
+                        (drx + 4, dry + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        (0, 224, 255), 2, cv2.LINE_AA)
+
+            # Green cross at anchor centre
+            dcx = max(0, min(dw-1, int(cx * s)))
+            dcy = max(0, min(dh-1, int(cy * s)))
+            cv2.drawMarker(disp, (dcx, dcy), (0, 255, 0),
+                           cv2.MARKER_CROSS, 14, 2)
+
+        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        qi   = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        self._lbl.setPixmap(QtGui.QPixmap.fromImage(qi.copy()))
+
+
+# =========================================================
 # FRAME RECIPE PREVIEW DIALOG
 # =========================================================
 class FrameRecipePreviewDialog(QtWidgets.QDialog):
@@ -4624,11 +4946,9 @@ class RightPanel(QtWidgets.QWidget):
         fl_pin = QtWidgets.QFormLayout(gb_pin)
         self.spin_pin_score = self._bind_fspin("pin_score_threshold", fl_pin,
                                                "Min score")
-        self.spin_max_matches = self._bind_ispin("max_matches", fl_pin,
-                                                 "Max frames")
         note_pin = QtWidgets.QLabel(
-            "Min score: lower = more permissive detection.\n"
-            "Max frames: 6 for multi-frame machine, 1 for single.")
+            "Min score: match threshold for anchor TM inside each frame ROI.\n"
+            "Frame count is defined by the layout (step 4 of frame wizard).")
         note_pin.setStyleSheet("color:#888;font-size:9px")
         note_pin.setWordWrap(True)
         fl_pin.addRow("", note_pin)
@@ -4794,9 +5114,8 @@ class RightPanel(QtWidgets.QWidget):
     def apply_settings(self):
         sm    = self._sm
         pairs = [
-            (self.spin_pin_score,   "pin_score_threshold"),
-            (self.spin_max_matches, "max_matches"),
-            (self.spin_exposure,    "camera_exposure_us"),
+            (self.spin_pin_score, "pin_score_threshold"),
+            (self.spin_exposure,  "camera_exposure_us"),
         ]
         for spin, key in pairs:
             spin.blockSignals(True)
@@ -4816,8 +5135,7 @@ class RightPanel(QtWidgets.QWidget):
     def pin_search_params(self) -> dict:
         sm = self._sm
         return {
-            "score_thr":   sm.get("pin_score_threshold"),
-            "max_matches": int(sm.get("max_matches")),
+            "score_thr": sm.get("pin_score_threshold"),
         }
 
     def font_list(self, ct: "ContourTemplate") -> list:
@@ -5155,6 +5473,20 @@ class MainWindow(QtWidgets.QWidget):
                 FrameRecipePreviewDialog(recipe, parent=self).exec_()
             except Exception:
                 pass
+            # Step 4: stamp expected frame positions → saves frame_layout.json
+            try:
+                recipe = self._ctrl.load_frame_recipe()
+                dlg = FrameLayoutDialog(self._image, recipe, parent=self)
+                if dlg.exec_() == QtWidgets.QDialog.Accepted:
+                    layout = self._ctrl.load_frame_layout()
+                    n = len(layout.get("frames", []))
+                    self._panel.log(
+                        f"Frame layout saved — {n} frame(s) defined.", "#88ff88")
+                else:
+                    self._panel.log(
+                        "Frame layout not saved (cancelled).", "#ffaa44")
+            except Exception as e:
+                self._panel.log(f"Frame layout step error: {e}", "#ff4444")
         else:
             self._panel.log("Frame recipe save failed.", "#ff4444")
             self._clear_frame_overlays()
@@ -5347,11 +5679,17 @@ class MainWindow(QtWidgets.QWidget):
         grid = self._io_recipe if from_io and self._io_recipe \
                else self._panel.grid_letters()
 
-        # Pre-flight: validate recipe + templates exist
+        # Pre-flight: validate recipe + layout + templates exist
         missing = self._ctrl.prepare(grid)
         if missing:
             if "__NO_RECIPE__" in missing:
                 msg = "No frame recipe found.\nCreate a frame template first."
+            elif "__NO_LAYOUT__" in missing:
+                msg = ("No frame layout found.\n"
+                       "Create a frame template — the wizard will ask you to\n"
+                       "stamp the expected frame positions (step 4).")
+            elif "__LAYOUT_ERROR__" in missing:
+                msg = "Failed to load frame_layout.json.\nRe-save the frame template."
             elif "__NO_GRID__" in missing:
                 msg = "Grid letters are empty.\nEnter letters in the Grid Letters field."
             elif "__RECIPE_ERROR__" in missing:
@@ -5370,8 +5708,7 @@ class MainWindow(QtWidgets.QWidget):
         # Store search params once — worker reads from ctrl per frame
         sm = self._sm
         pin_params = {
-            "score_thr":   sm.get("pin_score_threshold"),
-            "max_matches": int(sm.get("max_matches")),
+            "score_thr": sm.get("pin_score_threshold"),
         }
         self._ctrl.set_run_params(pin_params)
 
