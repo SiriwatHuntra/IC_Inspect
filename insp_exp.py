@@ -2539,6 +2539,34 @@ class ResultAnnotator:
                       (0, 0, 0), cv2.FILLED)
         cv2.putText(display, lbl, (tx, ty), font, fscl, (160, 160, 160), thick, cv2.LINE_AA)
 
+    # ---- Drop-work label (no-lead / Drop by Pin) --------------------
+    @staticmethod
+    def draw_drop_label(display: np.ndarray,
+                        acx: int, acy: int,
+                        aw: int, ah: int):
+        """Draw 'DROP' label centred on a mold whose leads are absent."""
+        ih, iw = display.shape[:2]
+        ax1 = max(0,    acx - aw // 2)
+        ay1 = max(0,    acy - ah // 2)
+        ax2 = min(iw-1, ax1 + aw)
+        ay2 = min(ih-1, ay1 + ah)
+
+        overlay = display.copy()
+        cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (180, 180, 0), cv2.FILLED)
+        cv2.addWeighted(overlay, 0.18, display, 0.82, 0, display)
+        cv2.rectangle(display, (ax1, ay1), (ax2, ay2), (0, 200, 200), 1)
+
+        lbl   = "DROP"
+        font  = cv2.FONT_HERSHEY_SIMPLEX
+        fscl  = 0.55
+        thick = 1
+        (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
+        tx = acx - tw // 2
+        ty = acy + th // 2
+        cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
+                      (0, 0, 0), cv2.FILLED)
+        cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 200, 200), thick, cv2.LINE_AA)
+
     # ---- Last-lot image-level banner --------------------------------
     @staticmethod
     def draw_last_lot_image_flag(display: np.ndarray,
@@ -3187,15 +3215,7 @@ class InspectionController:
                     "roi_canvas":  None,
                 })
 
-            # Draw "Drop Work" label centred on mold
-            lbl = "Drop Work"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            (tw, th), bl = cv2.getTextSize(lbl, font, 0.5, 1)
-            tx = acx - tw // 2
-            ty = acy + th // 2
-            cv2.rectangle(display, (tx - 2, ty - th - bl), (tx + tw + 2, ty + bl),
-                           (0, 0, 0), cv2.FILLED)
-            cv2.putText(display, lbl, (tx, ty), font, 0.5, (0, 200, 200), 1)
+            ResultAnnotator.draw_drop_label(display, acx, acy, mold_w, mold_h)
             return results
 
         # ── Normal font inspection ────────────────────────────────
