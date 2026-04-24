@@ -656,13 +656,7 @@ def cv2_draw_dashed_rect(img: np.ndarray, pt1: tuple, pt2: tuple,
     dashed_line((x2, y2), (x1, y2))
     dashed_line((x1, y2), (x1, y1))
     
-def _touches_border(contour: np.ndarray, w: int, h: int) -> bool:
-        """Return True if any contour point lies on the canvas edge."""
-        pts = contour.reshape(-1, 2)
-        return bool(
-            np.any(pts[:, 0] == 0) or np.any(pts[:, 0] >= w - 1) or
-            np.any(pts[:, 1] == 0) or np.any(pts[:, 1] >= h - 1)
-        )
+
 # =========================================================
 # A.  ContourTemplate  — modular extraction pipeline
 # =========================================================
@@ -791,7 +785,7 @@ class ContourTemplate:
         return out
 
     @staticmethod
-    def _morph_font(binary: np.ndarray, mold_size: int = 150) -> np.ndarray:
+    def _morph_font(binary: np.ndarray) -> np.ndarray:
         # OPEN first  — kills isolated speck noise before stitching
         # CLOSE after — bridges stroke gaps with a larger kernel
         k_open  = max(2, 3)#mold_size // 60)           # ~2px at mold=150
@@ -994,7 +988,7 @@ class ContourTemplate:
         """
         h, w   = gray.shape[:2]
         thresh = ContourTemplate._thresh_font(gray, mold_size)
-        clean  = ContourTemplate._morph_font(thresh, mold_size)
+        clean  = ContourTemplate._morph_font(thresh)
 
         if debug_prefix:
             _write_debug(debug_prefix, gray, thresh, clean)
@@ -1526,7 +1520,7 @@ class InspectionEngine:
                 aspect_diff is fractional deviation from tmpl_aspect.
         """
         all_pts        = np.vstack([c.reshape(-1, 2) for c in contours])
-        bx, by, bw, bh = cv2.boundingRect(all_pts)
+        _, _, bw, bh = cv2.boundingRect(all_pts)
         roi_aspect     = round(bw / max(bh, 1), 4)
         aspect_diff    = abs(roi_aspect - tmpl_aspect) / max(tmpl_aspect, 1e-6)
         return roi_aspect, aspect_diff
@@ -1973,7 +1967,6 @@ class InspectionEngine:
         if not new_contours:
             return -1.0, roi_holes, canvas, contours
 
-        new_outer = new_contours[0]
         new_holes = new_contours[1:] if len(new_contours) > 1 else []
         score2    = _hole_score(new_holes)
 
@@ -2150,7 +2143,7 @@ class InspectionEngine:
         candidates.sort(key=lambda c: c[2], reverse=True)
         kept = []
         for cand in candidates:
-            cx, cy, score, w, h, scale = cand
+            cx, cy, score, w, h, _ = cand
             x1, y1 = cx - w // 2, cy - h // 2
             x2, y2 = x1 + w,      y1 + h
             suppressed = False
@@ -2314,9 +2307,9 @@ class InspectionEngine:
 
         # ── Step 1 : Presence (hard) ─────────────────────────────────
         if precomputed is not None:
-            contours, canvas, clean_binary, others = precomputed
+            contours, canvas, _, others = precomputed
         else:
-            contours, canvas, clean_binary, others = self._check_presence(gray, mold_size)
+            contours, canvas, _, others = self._check_presence(gray, mold_size)
 
         if not contours:
             return _fail(1, "missing mark")
@@ -2525,8 +2518,7 @@ class ResultAnnotator:
     # ---- Ignored frame (last-lot empty column) ----------------------
     @staticmethod
     def draw_ignored_frame(display: np.ndarray,
-                           acx: int, acy: int,
-                           fw: int,  fh: int):
+                           acx: int, acy: int):
         """
         'IGNORED' text with black background, centred on an empty-column frame.
         No area overlay — the frame image remains visible beneath.
@@ -2604,7 +2596,7 @@ class ResultAnnotator:
         chip_cols  — frame-columns that have physical chips (leading)
         total_cols — total frame-columns detected in this image
         """
-        ih, iw = display.shape[:2]
+        _, iw = display.shape[:2]
         bar_h = 30
         overlay = display.copy()
         cv2.rectangle(overlay, (0, 0), (iw, bar_h), (0, 140, 255), cv2.FILLED)
@@ -2616,7 +2608,7 @@ class ResultAnnotator:
         font = cv2.FONT_HERSHEY_SIMPLEX
         fscl = 0.55
         thick = 1
-        (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
+        (tw, th), _ = cv2.getTextSize(lbl, font, fscl, thick)
         tx = iw // 2 - tw // 2
         ty = bar_h // 2 + th // 2
         cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 255, 255), thick, cv2.LINE_AA)
@@ -2635,7 +2627,6 @@ class ResultAnnotator:
         ocr_char    = result.get("ocr_char", "?")
         ocr_conf    = result.get("ocr_conf",  0.0)
         roi_thresh  = result.get("roi_thresh")
-        tmpl_canvas = result.get("tmpl_canvas")
 
         col      = ResultAnnotator.COLOR_PASS if passed else ResultAnnotator.COLOR_FAIL
         cell_w   = lx2 - lx1
@@ -3046,8 +3037,7 @@ class InspectionController:
 
     # ---- inspection pipeline ----
     def run(self,
-        image_bgr: np.ndarray,
-        mask:      np.ndarray = None) -> "InspectionResult":
+        image_bgr: np.ndarray) -> "InspectionResult":
         self.results = []
         src     = image_bgr if image_bgr.ndim == 2 \
                 else cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -3192,7 +3182,7 @@ class InspectionController:
                 if fidx_to_col.get(f_idx, -1) >= img_chip_cols:
                     anc_cx, anc_cy = fentry["cx"], fentry["cy"]
                     fw, fh = fentry["fw"], fentry["fh"]
-                    ResultAnnotator.draw_ignored_frame(display, anc_cx, anc_cy, fw, fh)
+                    ResultAnnotator.draw_ignored_frame(display, anc_cx, anc_cy)
 
             ResultAnnotator.draw_last_lot_image_flag(
                 display, img_chip_cols, img_total_cols)
@@ -3603,7 +3593,7 @@ class RunWorker(QtCore.QThread):
     # ---- helpers ----
     def _inspect_one(self, img_gray: np.ndarray) -> "InspectionResult":
         t0     = time.perf_counter()
-        result = self._ctrl.run(img_gray, mask=self._mask)
+        result = self._ctrl.run(img_gray)
         result.elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
         return result
 
@@ -3640,8 +3630,7 @@ class RunWorker(QtCore.QThread):
             f"  ({chip_cols}/3 col)",
             "#ffaa00")
 
-    def _append_csv(self, ic_groups: dict, image_name: str,
-                    last_lot: bool = False):
+    def _append_csv(self, ic_groups: dict, image_name: str):
         """
         Auto-append one row per IC result to run_log/result_YYYYMMDD.csv.
         Skips no-lead molds. Writes header on first entry of the day.
@@ -3787,7 +3776,7 @@ class RunWorker(QtCore.QThread):
                 self._save_last_lot(img, result.display, result.last_lot_cols)
                 self._io.on_last_lot(result.last_lot_cols)
 
-            self._append_csv(ic_groups, fname, last_lot=result.last_lot)
+            self._append_csv(ic_groups, fname)
             self._io.on_frame_result(result.passed, result.total)
             total_passed  += result.passed
             total_letters += result.total
@@ -3902,7 +3891,7 @@ class RunWorker(QtCore.QThread):
                 self._io.on_last_lot(result.last_lot_cols)
 
             ts_label = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._append_csv(ic_groups, f"cam_{ts_label}", last_lot=result.last_lot)
+            self._append_csv(ic_groups, f"cam_{ts_label}")
             self._io.on_frame_result(result.passed, result.total)
             total_passed  += result.passed
             total_letters += result.total
@@ -4167,7 +4156,7 @@ class ImageView(QtWidgets.QLabel):
 
         p.end()
     
-    def mouseReleaseEvent(self, e):
+    def mouseReleaseEvent(self, _):
         if self._draw_mode and self._start and self._rect:
             ir = QtCore.QRect(
                 self._to_img(self._rect.topLeft()),
@@ -4407,9 +4396,9 @@ class FrameLayoutDialog(QtWidgets.QDialog):
     Step 4 of the frame template wizard.
 
     Displays the full image; user left-clicks to stamp expected anchor
-    positions in order F1…FN.  Each stamp creates an ROI box sized to
-    cover the complete frame (anchor + mold A + mold B) computed from
-    the saved recipe.
+    positions in order F1…FN.  Each stamp creates an ROI box whose size
+    matches the anchor template canvas exactly — the click point is the
+    ROI centre.  TM runs inside this ROI to confirm presence.
 
     Undo removes the last stamp.  Confirm saves frame_layout.json.
     """
@@ -4424,21 +4413,15 @@ class FrameLayoutDialog(QtWidgets.QDialog):
         self.setModal(True)
 
         self._image_bgr = image_bgr
-        self._recipe    = recipe
-        self._stamps    = []   # list of (anchor_cx, anchor_cy) in image coords
+        self._stamps    = []   # list of (cx, cy) in image coords — ROI centre
 
-        # Compute ROI dimensions from recipe
-        aw, ah         = recipe["mold_size"]
-        dx_a, dy_a     = recipe["mold_a_shift"]
-        _dx_b, dy_b    = recipe["mold_b_shift"]
-        self._anc_w    = aw
-        self._anc_h    = ah
-        self._dy_a     = dy_a
-        self._dy_b     = dy_b
-        # Full frame width: anchor half + mold-A x-shift + mold half
-        self._roi_w    = aw // 2 + int(dx_a) + aw // 2
-        # Full frame height: mold B bottom - mold A top
-        self._roi_h    = int(dy_b - dy_a) + ah
+        # ROI size = anchor canvas dimensions
+        anc_canvas      = recipe["anchor"].get("canvas")
+        if anc_canvas is not None and anc_canvas.ndim >= 2:
+            self._roi_h, self._roi_w = anc_canvas.shape[:2]
+        else:
+            # fallback: use mold_size if canvas unavailable
+            self._roi_w, self._roi_h = recipe["mold_size"]
 
         # Scale image to fit dialog display area
         ih, iw         = image_bgr.shape[:2]
@@ -4456,7 +4439,8 @@ class FrameLayoutDialog(QtWidgets.QDialog):
 
         # Hint label
         hint = QtWidgets.QLabel(
-            "Left-click the anchor centre of each expected frame (F1, F2, …). "
+            f"Left-click the centre of each expected anchor position (F1, F2, …).  "
+            f"ROI size = anchor canvas ({self._roi_w}×{self._roi_h} px).  "
             "Undo removes the last stamp.  Confirm saves the layout.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#aaa; font-size:9px")
@@ -4512,17 +4496,14 @@ class FrameLayoutDialog(QtWidgets.QDialog):
                 "Place at least one frame stamp before confirming.")
             return
 
-        aw   = self._anc_w
-        ah   = self._anc_h
-        dy_a = self._dy_a
-        rw   = self._roi_w
-        rh   = self._roi_h
+        rw = self._roi_w
+        rh = self._roi_h
 
         frames = []
         for i, (cx, cy) in enumerate(self._stamps):
-            # ROI top-left: anchor left edge, mold-A top edge
-            rx = cx - aw // 2
-            ry = cy + int(dy_a) - ah // 2
+            # ROI centred on click point (= expected anchor centre)
+            rx = cx - rw // 2
+            ry = cy - rh // 2
             frames.append({
                 "id":  f"F{i + 1}",
                 "roi": [rx, ry, rw, rh],
@@ -4542,12 +4523,9 @@ class FrameLayoutDialog(QtWidgets.QDialog):
     # ---- display refresh ----
 
     def _refresh(self):
-        s    = self._scale
-        aw   = self._anc_w
-        ah   = self._anc_h
-        dy_a = self._dy_a
-        rw   = self._roi_w
-        rh   = self._roi_h
+        s  = self._scale
+        rw = self._roi_w
+        rh = self._roi_h
 
         disp = cv2.resize(self._image_bgr,
                           (int(self._image_bgr.shape[1] * s),
@@ -4556,9 +4534,9 @@ class FrameLayoutDialog(QtWidgets.QDialog):
         dh, dw = disp.shape[:2]
 
         for i, (cx, cy) in enumerate(self._stamps):
-            # ROI in image coords
-            rx = cx - aw // 2
-            ry = cy + int(dy_a) - ah // 2
+            # ROI centred on click point in image coords
+            rx = cx - rw // 2
+            ry = cy - rh // 2
 
             # Convert to display coords
             drx  = max(0,    int(rx * s))
@@ -4574,12 +4552,6 @@ class FrameLayoutDialog(QtWidgets.QDialog):
                         (drx + 4, dry + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                         (0, 224, 255), 2, cv2.LINE_AA)
-
-            # Green cross at anchor centre
-            dcx = max(0, min(dw-1, int(cx * s)))
-            dcy = max(0, min(dh-1, int(cy * s)))
-            cv2.drawMarker(disp, (dcx, dcy), (0, 255, 0),
-                           cv2.MARKER_CROSS, 14, 2)
 
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
@@ -4706,8 +4678,7 @@ class SetupPreviewDialog(QtWidgets.QDialog):
     MAX_DIALOG_W = 1000
     MAX_DIALOG_H =  800
 
-    def __init__(self, image_bgr: np.ndarray, recipe: dict,
-                 ct: "ContourTemplate", parent=None):
+    def __init__(self, image_bgr: np.ndarray, recipe: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Inspection Setup Preview")
         self.setModal(True)
@@ -5565,7 +5536,7 @@ class MainWindow(QtWidgets.QWidget):
         self._pending = None
         self._mode    = None
 
-    def _on_frame_roi(self, _rect: QtCore.QRect):
+    def _on_frame_roi(self, *_):
         # Frame mode is now YOLO-only; rubber-band draws in frame mode are ignored.
         pass
 
