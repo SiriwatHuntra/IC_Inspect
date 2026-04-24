@@ -2519,6 +2519,26 @@ class ResultAnnotator:
                       (0, 0, 0), cv2.FILLED)
         cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 165, 255), thick)
 
+    # ---- Ignored frame (last-lot empty column) ----------------------
+    @staticmethod
+    def draw_ignored_frame(display: np.ndarray,
+                           acx: int, acy: int,
+                           fw: int,  fh: int):
+        """
+        'IGNORED' text with black background, centred on an empty-column frame.
+        No area overlay — the frame image remains visible beneath.
+        """
+        lbl  = "IGNORED"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fscl = 0.40
+        thick = 1
+        (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
+        tx = acx - tw // 2
+        ty = acy + th // 2
+        cv2.rectangle(display, (tx - 2, ty - th - bl), (tx + tw + 2, ty + bl),
+                      (0, 0, 0), cv2.FILLED)
+        cv2.putText(display, lbl, (tx, ty), font, fscl, (160, 160, 160), thick, cv2.LINE_AA)
+
     # ---- Last-lot image-level banner --------------------------------
     @staticmethod
     def draw_last_lot_image_flag(display: np.ndarray,
@@ -2567,12 +2587,6 @@ class ResultAnnotator:
         col      = ResultAnnotator.COLOR_PASS if passed else ResultAnnotator.COLOR_FAIL
         cell_w   = lx2 - lx1
         cell_h   = ly2 - ly1
-
-        # ── Template ghost — dim gray edges show expected shape ───
-        if tmpl_canvas is not None and tmpl_canvas.size > 0 and cell_w > 0 and cell_h > 0:
-            trs = cv2.resize(tmpl_canvas, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
-            tcnts, _ = cv2.findContours(trs, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(display[ly1:ly2, lx1:lx2], tcnts, -1, (90, 90, 90), 1)
 
         # ── Dirty region red overlay ──────────────────────────────
         if not passed and cell_w > 0 and cell_h > 0:
@@ -2916,7 +2930,7 @@ class InspectionController:
         n_chip    = LAST_LOT_CHIP_FRAME_COLS
 
         if n_cols <= n_chip:
-            return False, 0, n_cols
+            return False, 0, n_cols, {}
 
         # Build reverse map: f_idx → 0-based column index
         fidx_to_col: dict = {}
@@ -2938,14 +2952,14 @@ class InspectionController:
         # First n_chip columns must ALL have chips
         for c in range(n_chip):
             if not col_has_chip[c]:
-                return False, 0, n_cols
+                return False, 0, n_cols, {}
 
         # Remaining columns must ALL be empty (no chip contours)
         for c in range(n_chip, n_cols):
             if col_has_chip[c]:
-                return False, 0, n_cols
+                return False, 0, n_cols, {}
 
-        return True, n_chip, n_cols
+        return True, n_chip, n_cols, fidx_to_col
 
     # ---- inspection pipeline ----
     def run(self,
@@ -3035,27 +3049,39 @@ class InspectionController:
 
         # ── Image-level last-lot check (runs after all chips inspected) ──
         col_snap = max(1, anchor_tmpl.get("canvas_w", 60) // 2)
-        img_ll, img_chip_cols, img_total_cols = \
+        img_ll, img_chip_cols, img_total_cols, fidx_to_col = \
             self._check_last_lot_image(matches, self.results, col_snap)
 
         if img_ll:
+            # Tag every result; mark empty columns (index >= img_chip_cols) as ignored
             for r in self.results:
                 r["last_lot"]      = True
                 r["last_lot_cols"] = img_chip_cols
+                fi = r.get("frame_idx", 0) - 1      # frame_idx is 1-based
+                if fidx_to_col.get(fi, -1) >= img_chip_cols:
+                    r["ignored"] = True
+
+            # Gray overlay on each ignored (empty-column) frame
+            for f_idx, (anc_cx, anc_cy, _, fw, fh, _) in enumerate(matches):
+                if fidx_to_col.get(f_idx, -1) >= img_chip_cols:
+                    ResultAnnotator.draw_ignored_frame(display, anc_cx, anc_cy, fw, fh)
+
             ResultAnnotator.draw_last_lot_image_flag(
                 display, img_chip_cols, img_total_cols)
             print(f"[Pipeline] LAST LOT — {img_chip_cols}/{img_total_cols} "
                   f"frame-col(s) filled")
 
-        total_ms    = round((time.perf_counter() - t0_total) * 1000, 1)
-        passed      = sum(1 for r in self.results if r["pass"])
+        total_ms = round((time.perf_counter() - t0_total) * 1000, 1)
+        # Only count active (non-ignored) results toward pass/fail
+        active      = [r for r in self.results if not r.get("ignored")]
+        passed      = sum(1 for r in active if r["pass"])
         any_ll      = any(r.get("last_lot") for r in self.results)
         max_ll_cols = max((r.get("last_lot_cols", 0) for r in self.results), default=0)
         result = InspectionResult(
             display        = display,
             results        = self.results,
             passed         = passed,
-            total          = len(self.results),
+            total          = len(active),
             elapsed_ms     = total_ms,
             last_lot       = any_ll,
             last_lot_cols  = max_ll_cols,
@@ -3479,6 +3505,8 @@ class RunWorker(QtCore.QThread):
                                 "fail_causes", "elapsed_ms", "last_lot"])
                 for ic_num in sorted(ic_groups.keys()):
                     group = ic_groups[ic_num]
+                    if all(r.get("ignored") for r in group):
+                        continue
                     if all(r.get("reason") == "dropped" for r in group):
                         continue
                     r0       = group[0]
@@ -3552,14 +3580,22 @@ class RunWorker(QtCore.QThread):
                 verdict  = "PASS" if passed else "NG"
                 color    = "#88ff88" if passed else "#ff4444"
 
-                # Check no-lead
+                # Check no-lead / last-lot ignored
                 no_lead = all(r.get("reason") == "dropped" for r in group)
+                ignored = all(r.get("ignored") for r in group)
                 if no_lead:
                     self._log(
                         f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
                         f"DROP WORK — skipped (pass)  "
                         f"[{mold_ms:.1f}ms]",
                         "#888888")
+                    continue
+                if ignored:
+                    self._log(
+                        f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
+                        f"LAST LOT — ignored (empty col)  "
+                        f"[{mold_ms:.1f}ms]",
+                        "#666666")
                     continue
 
                 # Build OCR string — slot-ordered 9 chars, space for inactive
@@ -3661,6 +3697,14 @@ class RunWorker(QtCore.QThread):
                 color    = "#88ff88" if passed else "#ff4444"
 
                 no_lead = all(r.get("reason") == "dropped" for r in group)
+                ignored = all(r.get("ignored") for r in group)
+                if ignored:
+                    self._log(
+                        f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
+                        f"LAST LOT — ignored (empty col)  "
+                        f"[{mold_ms:.1f}ms]",
+                        "#666666")
+                    continue
                 if no_lead:
                     self._log(
                         f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
