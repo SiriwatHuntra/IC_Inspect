@@ -790,21 +790,19 @@ class ContourTemplate:
         return out
 
     @staticmethod
-    def _morph_font(binary: np.ndarray) -> np.ndarray:
-        # OPEN first  — kills isolated speck noise before stitching
-        # CLOSE after — bridges stroke gaps with a larger kernel
-        k_open  = max(2, 3)#mold_size // 60)           # ~2px at mold=150
-        k_close = max(2, 3) #mold_size // 50)           # ~3px at mold=150  — bridges small gaps only
-        # CLOSE first — fills 1-2px breaks (serif junctions) without closing letter holes
-        # OPEN after  — removes isolated noise blobs
-        out = binary
+    def _morph_font(binary: np.ndarray, use_close: bool = True) -> np.ndarray:
+        """
+        use_close=True  (template saving):  OPEN → CLOSE — idealized clean shape.
+        use_close=False (runtime detection): OPEN only    — preserves defect gaps/protrusions.
+        """
+        k = 3
         out = cv2.morphologyEx(
-            out,    cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (k_open,  k_open)))
-        out = cv2.morphologyEx(
-            out, cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close)))
-        
+            binary, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+        if use_close:
+            out = cv2.morphologyEx(
+                out, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
         return out
 
     # =========================================================
@@ -979,21 +977,23 @@ class ContourTemplate:
     @staticmethod
     def extract_font_template(gray: np.ndarray,
                               mold_size:    int = 150,
-                              debug_prefix: str = "") -> tuple:
+                              debug_prefix: str = "",
+                              thresh:       "np.ndarray | None" = None,
+                              use_close:    bool = True) -> tuple:
         """
         Full pipeline for FONT / LETTER ROIs.
-          _thresh_font -> _morph_font -> _find_contours_all
+          _thresh_font → _morph_font(use_close) → _find_contours_all
 
-        Input : grayscale ndarray, mold_size (px) for kernel scaling
+        thresh     : precomputed Otsu binary — pass to avoid redundant _thresh_font call.
+        use_close  : True  (template saving)  → OPEN+CLOSE, idealized shape.
+                     False (runtime detection) → OPEN only, defect gaps preserved.
+
         Output: (main_list, canvas_main, clean_binary, others)
-                main_list    — [primary_root, ...holes]  ([] when nothing found)
-                canvas_main  — binary canvas of primary_root only
-                clean_binary — post-morph binary (for dirty residual check)
-                others       — secondary valid root contours (dirty detection)
         """
-        h, w   = gray.shape[:2]
-        thresh = ContourTemplate._thresh_font(gray, mold_size)
-        clean  = ContourTemplate._morph_font(thresh)
+        h, w  = gray.shape[:2]
+        if thresh is None:
+            thresh = ContourTemplate._thresh_font(gray, mold_size)
+        clean = ContourTemplate._morph_font(thresh, use_close=use_close)
 
         if debug_prefix:
             _write_debug(debug_prefix, gray, thresh, clean)
@@ -1346,19 +1346,16 @@ class InspectionEngine:
 
     @staticmethod
     def _check_presence(gray:      np.ndarray,
-                        mold_size: int) -> tuple:
+                        mold_size: int,
+                        thresh:    "np.ndarray | None" = None) -> tuple:
         """
-        Step 1 — Presence.
-        Extract font contours from the ROI.
+        Step 1 — Presence.  Runtime path: OPEN-only morph preserves defect gaps.
 
-        Input : gray (H×W uint8), mold_size (px)
-        Output: (contours, canvas, clean_binary, others)
-                contours     — main font contour list ([] → no mark found)
-                canvas       — binary canvas of main contour only
-                clean_binary — post-morph binary (for dirty residual analysis)
-                others       — secondary valid roots (for dirty extra-contour check)
+        thresh : precomputed Otsu binary from _thresh_font — eliminates redundant call.
+        Output : (contours, canvas, clean_binary, others)
         """
-        contours, canvas, clean_binary, others = ContourTemplate.extract_font_template(gray, mold_size=mold_size)
+        contours, canvas, clean_binary, others = ContourTemplate.extract_font_template(
+            gray, mold_size=mold_size, thresh=thresh, use_close=False)
         return contours, canvas, clean_binary, others
 
     @staticmethod
@@ -2279,11 +2276,12 @@ class InspectionEngine:
                 mold_cy:      int,
                 mold_size:    int   = 150,
                 is_retry:     bool  = False,
-                precomputed:  tuple = None) -> dict:
+                precomputed:  tuple = None,
+                roi_thresh:   "np.ndarray | None" = None) -> dict:
         """
         precomputed : (contours, canvas, clean_binary, others) from a prior
                       _check_presence call — skips Step 1 re-extraction.
-                      Pass None to extract fresh.
+        roi_thresh  : precomputed Otsu binary — eliminates redundant _thresh_font call.
         """
 
         gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY) \
@@ -2291,7 +2289,8 @@ class InspectionEngine:
 
         orig_roi_h, orig_roi_w = gray.shape[:2]
         roi_h, roi_w = gray.shape[:2]
-        roi_thresh = ContourTemplate._thresh_font(gray, mold_size)
+        if roi_thresh is None:
+            roi_thresh = ContourTemplate._thresh_font(gray, mold_size)
 
         tmpl_contours = tmpl.get("contours", [])
 
@@ -2333,7 +2332,7 @@ class InspectionEngine:
         if precomputed is not None:
             contours, canvas, _, others = precomputed
         else:
-            contours, canvas, _, others = self._check_presence(gray, mold_size)
+            contours, canvas, _, others = self._check_presence(gray, mold_size, thresh=roi_thresh)
 
         if not contours:
             return _fail(1, "missing mark")
@@ -2656,16 +2655,17 @@ class ResultAnnotator:
         cell_w   = lx2 - lx1
         cell_h   = ly2 - ly1
 
-        # ── Defect circle — two morphological flows ──────────────────
-        # Coordinates stay in roi space (orig_roi_w × orig_roi_h) throughout.
-        # Centroid scaled to cell via sx/sy — no _centre_align remapping.
+        # ── Defect circle — two morphological self-check flows ───────
+        # Source: roi_thresh (raw Otsu, pre-morph) — defects not yet erased.
+        # Coordinates stay in roi space; centroid scaled to cell via sx/sy.
         #
-        # Flow 1 (CLOSING 5×5 on roi_canvas): fills stroke gaps.
-        #   CLOSE(roi) − roi  →  void pixels = mousebite / closing-defect voids
+        # Flow 1 (missing_stroke / step-4):
+        #   src_opened = OPEN(roi_thresh)         — denoise without filling gaps
+        #   src_closed = CLOSE(src_opened)        — fills gaps
+        #   defect_map = src_closed − src_opened  — gap pixels = mousebite / hole voids
         #
-        # Flow 2 (OPENING 3×3 on roi_thresh): strips thin protrusions.
-        #   roi_thresh − OPEN(roi_thresh)  →  removed pixels = hair / overflow / thin short
-        #   Uses roi_thresh (not roi_canvas) so hair filtered from canvas is still visible.
+        # Flow 2 (foreign_object):
+        #   defect_map = roi_thresh − src_opened  — removed pixels = hair / thin short
         #
         # Thick-short fallback: others_center_norm stored in dirty dict.
         if not passed and cell_w > 0 and cell_h > 0:
@@ -2685,30 +2685,44 @@ class ResultAnnotator:
             _kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # closing: fill ≤2 px gaps
             _ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # opening: strip 1 px strands
 
-            if roi_canvas is not None and roi_canvas.size > 0:
+            # All flows use roi_thresh (raw Otsu, pre-morph) as source so defects
+            # not yet erased by preprocessing are still visible.
+            src = roi_thresh if roi_thresh is not None and roi_thresh.size > 0 else None
+
+            if src is not None:
+                # Shared: OPEN(roi_thresh) denoises without filling defect gaps
+                src_opened = cv2.morphologyEx(src, cv2.MORPH_OPEN, _ko)
 
                 if d_type == "missing_stroke":
-                    # Flow 1 (CLOSING): closing fills stroke gaps → gap pixels = mousebite
-                    rc_closed  = cv2.morphologyEx(roi_canvas, cv2.MORPH_CLOSE, _kc)
-                    defect_map = cv2.subtract(rc_closed, roi_canvas)
+                    # Flow 1 (CLOSING on denoised thresh): fill gaps → gap pixels = mousebite
+                    src_closed = cv2.morphologyEx(src_opened, cv2.MORPH_CLOSE, _kc)
+                    defect_map = cv2.subtract(src_closed, src_opened)
 
                 elif d_type == "foreign_object":
-                    # Flow 2 (OPENING on roi_thresh): opening strips thin strands
-                    src = roi_thresh if roi_thresh is not None and roi_thresh.size > 0 \
-                          else roi_canvas
-                    rc_opened  = cv2.morphologyEx(src, cv2.MORPH_OPEN, _ko)
-                    defect_map = cv2.subtract(src, rc_opened)
-                    # Thick-short / secondary-contour fallback
+                    # Flow 2 (OPENING): removes thin protrusions — hair / thin short
+                    defect_map = cv2.subtract(src, src_opened)
+
                     if not np.any(defect_map):
-                        norm_pt    = dirty_info.get("others_center_norm")
-                        defect_map = None
+                        # Thick blob: pixels in thresh outside the dilated expected canvas
+                        if roi_canvas is not None and roi_canvas.size > 0:
+                            _ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                            defect_map = cv2.subtract(src, cv2.dilate(roi_canvas, _ke))
+
+                    if not np.any(defect_map if defect_map is not None else np.zeros(1, np.uint8)):
+                        # Secondary-contour centroid from dirty check
+                        norm_pt = dirty_info.get("others_center_norm")
+                        # Empty-slot: roi_canvas IS the blob — use its centroid
+                        if norm_pt is None and roi_canvas is not None and np.any(roi_canvas):
+                            defect_map = roi_canvas
+                        else:
+                            defect_map = None
 
                 elif defect_step == 4:
-                    # Closing defect: hole fill — closing reveals remaining voids
-                    rc_closed  = cv2.morphologyEx(roi_canvas, cv2.MORPH_CLOSE, _kc)
-                    defect_map = cv2.subtract(rc_closed, roi_canvas)
-                    # If mark already fully solid: use mark centroid as fallback location
-                    if not np.any(defect_map):
+                    # Closing defect: hole fill — CLOSE on denoised thresh reveals remaining voids
+                    src_closed = cv2.morphologyEx(src_opened, cv2.MORPH_CLOSE, _kc)
+                    defect_map = cv2.subtract(src_closed, src_opened)
+                    # Fully solid mark (hole completely filled): fall back to mark centroid
+                    if not np.any(defect_map) and roi_canvas is not None and roi_canvas.size > 0:
                         defect_map = roi_canvas
 
             # Circle radius ∝ sqrt(defect area in cell space)
@@ -3441,11 +3455,12 @@ class InspectionController:
 
             roi = image_bgr[ly1:ly2, lx1:lx2]
 
-            # ── Extract contours once — reused by defect check ───────
-            gray_slot = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) \
-                        if roi.ndim == 3 else roi
+            # ── Thresh + contours once — reused by defect check and compare_roi ──
+            gray_slot   = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) \
+                          if roi.ndim == 3 else roi
+            slot_thresh = ContourTemplate._thresh_font(gray_slot, mold_size)
             slot_contours, slot_canvas, slot_clean_binary, slot_others = \
-                self._eng._check_presence(gray_slot, mold_size)
+                self._eng._check_presence(gray_slot, mold_size, thresh=slot_thresh)
 
             # ── Empty slot: foreign-object check first, then unexpected-mark ──
             if not letter:
@@ -3477,6 +3492,9 @@ class InspectionController:
                             "elapsed_ms":  0.0,
                             "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
                             "roi_canvas":  slot_canvas,
+                            "roi_thresh":  slot_thresh,
+                            "orig_roi_w":  gray_slot.shape[1],
+                            "orig_roi_h":  gray_slot.shape[0],
                             "dirty":       {"detected": True, "type": "foreign_object",
                                             "area_ratio": round(area_ratio, 4)},
                         })
@@ -3509,6 +3527,9 @@ class InspectionController:
                         "elapsed_ms":  0.0,
                         "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
                         "roi_canvas":  slot_canvas,
+                        "roi_thresh":  slot_thresh,
+                        "orig_roi_w":  gray_slot.shape[1],
+                        "orig_roi_h":  gray_slot.shape[0],
                         "dirty":       {"detected": False, "type": "none", "area_ratio": 0.0},
                     })
                     ResultAnnotator.draw_letter(display, results[-1])
@@ -3533,7 +3554,8 @@ class InspectionController:
                 mold_cy     = acy,
                 mold_size   = tmpl_mold_size,
                 precomputed = (slot_contours, slot_canvas,
-                               slot_clean_binary, slot_others))
+                               slot_clean_binary, slot_others),
+                roi_thresh  = slot_thresh)
 
             # ── Retry on holes/shape failures (steps 4/5) ────────────
             if res["defect_step"] in {4, 5}:
