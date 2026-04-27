@@ -158,7 +158,7 @@ def _compute_hog(canvas: np.ndarray) -> np.ndarray:
 
 # ---- OCR Constants (HOG cosine similarity — range 0.0–1.0) ----
 OCR_CONF_EXPECTED  = 0.88   # fast path: return immediately if ≥ this
-OCR_MIN_CONF       = 0.55   # below this → report "?" (unreadable)
+OCR_MIN_CONF       = 0.60   # below this → report "?" (unreadable)
 OCR_CONF_GAP_MIN   = 0.10   # best must exceed 2nd-best by this — filters circular reflections
                              # that score similarly on "2","0","O","8" (small gap → "?")
 
@@ -2199,42 +2199,54 @@ class InspectionEngine:
             missing_ratio  — count(missing) / union_area
             area_ratio     — max(extra_ratio, missing_ratio)  (for logging compat)
         """
+        N = InspectionEngine._ALIGN_SIZE
+        _empty = np.zeros((N, N), dtype=np.uint8)
+
         # ── Aligned canvas comparison ─────────────────────────────────
-        rc = InspectionEngine._centre_align(canvas) \
-             if canvas is not None else \
-             np.zeros((InspectionEngine._ALIGN_SIZE,
-                       InspectionEngine._ALIGN_SIZE), dtype=np.uint8)
-        tc = InspectionEngine._centre_align(tmpl_canvas) \
-             if tmpl_canvas is not None else \
-             np.zeros((InspectionEngine._ALIGN_SIZE,
-                       InspectionEngine._ALIGN_SIZE), dtype=np.uint8)
+        rc = InspectionEngine._centre_align(canvas) if canvas is not None else _empty
 
-        union_area = max(int(np.count_nonzero(cv2.bitwise_or(rc, tc))), 1)
-
-        # Dilate both canvases to absorb laser position drift before diff.
-        # union_area stays on raw canvases so ratio scale is consistent.
-        if DIRTY_CANVAS_DILATE_PX > 0:
-            _dk = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (DIRTY_CANVAS_DILATE_PX * 2 + 1, DIRTY_CANVAS_DILATE_PX * 2 + 1))
-            rc_cmp = cv2.dilate(rc, _dk)
-            tc_cmp = cv2.dilate(tc, _dk)
+        # No template canvas → skip pixel diff; only secondary-contour check fires.
+        # (Avoids extra_ratio=1.0 false-positive when template lacks a canvas field.)
+        if tmpl_canvas is None or not np.any(tmpl_canvas):
+            extra_ratio   = 0.0
+            missing_ratio = 0.0
+            extra         = _empty
+            missing       = _empty
         else:
-            rc_cmp, tc_cmp = rc, tc
+            tc = InspectionEngine._centre_align(tmpl_canvas)
 
-        extra   = cv2.subtract(rc, tc_cmp)   # pixels in ROI outside dilated template
-        missing = cv2.subtract(tc, rc_cmp)   # template pixels not covered by dilated ROI
+            union_area = max(int(np.count_nonzero(cv2.bitwise_or(rc, tc))), 1)
 
-        extra_ratio   = round(int(np.count_nonzero(extra))   / union_area, 4)
-        missing_ratio = round(int(np.count_nonzero(missing)) / union_area, 4)
+            # Dilate both canvases to absorb laser position drift before diff.
+            # union_area stays on raw canvases so ratio scale is consistent.
+            if DIRTY_CANVAS_DILATE_PX > 0:
+                _dk = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (DIRTY_CANVAS_DILATE_PX * 2 + 1, DIRTY_CANVAS_DILATE_PX * 2 + 1))
+                rc_cmp = cv2.dilate(rc, _dk)
+                tc_cmp = cv2.dilate(tc, _dk)
+            else:
+                rc_cmp, tc_cmp = rc, tc
+
+            extra   = cv2.subtract(rc, tc_cmp)   # pixels in ROI outside dilated template
+            missing = cv2.subtract(tc, rc_cmp)   # template pixels not covered by dilated ROI
+
+            extra_ratio   = round(int(np.count_nonzero(extra))   / union_area, 4)
+            missing_ratio = round(int(np.count_nonzero(missing)) / union_area, 4)
 
         # ── Secondary-contour check (blobs outside aligned bbox) ─────
-        roi_area          = max(roi_h * roi_w, 1)
-        others_max_ratio  = 0.0
+        roi_area           = max(roi_h * roi_w, 1)
+        others_max_ratio   = 0.0
+        others_center_norm = None   # (nx, ny) of largest qualifying secondary contour
         for c in others:
             r = cv2.contourArea(c) / roi_area
-            if r >= ANOMALY_MIN_AREA_RATIO:
-                others_max_ratio = max(others_max_ratio, r)
+            if r >= ANOMALY_MIN_AREA_RATIO and r > others_max_ratio:
+                others_max_ratio = r
+                M = cv2.moments(c)
+                if M["m00"] > 0:
+                    others_center_norm = (
+                        float(M["m10"] / M["m00"]) / max(roi_w, 1),
+                        float(M["m01"] / M["m00"]) / max(roi_h, 1))
 
         # ── Decision ─────────────────────────────────────────────────
         dirty_type = "none"
@@ -2246,13 +2258,14 @@ class InspectionEngine:
         area_ratio = round(max(extra_ratio, missing_ratio, others_max_ratio), 4)
 
         return {
-            "detected":      dirty_type != "none",
-            "type":          dirty_type,
-            "extra_ratio":   extra_ratio,
-            "missing_ratio": missing_ratio,
-            "area_ratio":    area_ratio,
-            "extra_map":     extra,    # 64×64 uint8 — pixels present in ROI but absent from template
-            "missing_map":   missing,  # 64×64 uint8 — pixels in template absent from ROI
+            "detected":           dirty_type != "none",
+            "type":               dirty_type,
+            "extra_ratio":        extra_ratio,
+            "missing_ratio":      missing_ratio,
+            "area_ratio":         area_ratio,
+            "extra_map":          extra,    # 64×64 — pixels in ROI absent from template
+            "missing_map":        missing,  # 64×64 — template pixels absent from ROI
+            "others_center_norm": others_center_norm,
         }
 
     # =========================================================
@@ -2322,9 +2335,9 @@ class InspectionEngine:
 
         # ── Step 1 : Presence (hard) ─────────────────────────────────
         if precomputed is not None:
-            contours, canvas, _, others = precomputed
+            contours, canvas, clean_binary, others = precomputed
         else:
-            contours, canvas, _, others = self._check_presence(gray, mold_size, thresh=roi_thresh)
+            contours, canvas, clean_binary, others = self._check_presence(gray, mold_size, thresh=roi_thresh)
 
         if not contours:
             return _fail(1, "missing mark")
@@ -2332,62 +2345,79 @@ class InspectionEngine:
         roi_outer = contours[0]
         roi_holes = contours[1:] if len(contours) > 1 else []
 
-        # ── Step 2 : Align + Dirty check (hard) ─────────────────────
-        dirty = self._check_dirty(others, canvas, tmpl.get("canvas"), roi_h, roi_w)
-        if dirty["detected"]:
-            return _fail(2,
-                f"dirty:{dirty['type']} area={dirty['area_ratio']:.3f}",
-                {"roi_canvas": canvas, "dirty": dirty})
+        failures: list = []   # (step, reason, extras)
 
-        # ── Step 3 : Shift (hard) ────────────────────────────────────
+        # ── Step 2 : Align + Dirty check ─────────────────────────────
+        # Contour-masked binary: actual pixel content inside the outer letter boundary.
+        # Preserves defect gaps (mousebites, stroke breaks) without scatter misalignment.
+        _cmask = np.zeros_like(clean_binary)
+        cv2.drawContours(_cmask, [roi_outer], -1, 255, cv2.FILLED)
+        roi_for_dirty = cv2.bitwise_and(clean_binary, _cmask)
+        dirty = self._check_dirty(others, roi_for_dirty, tmpl.get("canvas"), roi_h, roi_w)
+        if dirty["detected"]:
+            failures.append((2,
+                f"dirty:{dirty['type']} area={dirty['area_ratio']:.3f}",
+                {"roi_canvas": canvas, "dirty": dirty}))
+
+        # ── Step 3 : Shift ────────────────────────────────────────────
         shift_px, shift_ratio = self._check_shift(
             contours, tmpl, exp_dx, exp_dy, mold_cx, mold_cy, roi_w, roi_h)
 
         if shift_ratio > FONT_SHIFT_RATIO_MAX:
-            return _fail(3,
+            failures.append((3,
                 f"shift ratio={shift_ratio:.3f} > {FONT_SHIFT_RATIO_MAX}",
-                {"shift_px":    shift_px,
-                 "shift_ratio": shift_ratio,
-                 "roi_canvas":  canvas})
+                {"shift_px": shift_px, "shift_ratio": shift_ratio, "roi_canvas": canvas}))
 
-        # ── Step 4 : Holes (hard, with cleanup retry) ────────────────
+        # ── Step 4 : Holes (with cleanup retry) ──────────────────────
         hole_score, roi_holes, canvas, contours = self._check_holes(
             gray, roi_outer, roi_holes, canvas, contours,
             tmpl_hole_count, tmpl_hole_ratios, mold_size)
 
         if hole_score < 0:
-            return _fail(4,
+            failures.append((4,
                 f"hole mismatch got={len(roi_holes)} expected={tmpl_hole_count}",
-                {"shift_px":    shift_px,
-                 "shift_ratio": shift_ratio,
-                 "roi_canvas":  canvas})
+                {"shift_px": shift_px, "shift_ratio": shift_ratio, "roi_canvas": canvas}))
 
-        # ── Step 5 : Shape score (confidence) ────────────────────────
+        # ── Step 5 : Shape score ──────────────────────────────────────
         confidence = self._compute_shape_score(canvas, contours, tmpl)
 
         conf_thr = max(0.0, FONT_CONFIDENCE_MIN - 0.05) if is_retry \
                    else FONT_CONFIDENCE_MIN
         if confidence < conf_thr:
-            return _fail(5,
+            failures.append((5,
                 f"low shape_score={confidence:.3f} < {conf_thr:.3f}",
                 {"confidence":  confidence,
                  "shift_px":    shift_px,
                  "shift_ratio": shift_ratio,
-                 "roi_canvas":  canvas})
+                 "roi_canvas":  canvas}))
+
+        if failures:
+            # Merge extras from all failures (later steps fill in richer data)
+            merged: dict = {"dirty": _no_dirty}
+            for _, _, ex in failures:
+                if ex:
+                    merged.update(ex)
+            first_step, first_reason, _ = failures[0]
+            result = _fail(first_step, first_reason, merged)
+            result["reasons"]      = [r for _, r, _ in failures]
+            result["defect_steps"] = [s for s, _, _ in failures]
+            return result
 
         return {
-            "pass":        True,
-            "confidence":  round(confidence, 4),
-            "shift_px":    shift_px,
-            "shift_ratio": shift_ratio,
-            "reason":      "OK",
-            "defect_step": 0,
-            "roi_canvas":  canvas,
-            "roi_thresh":  roi_thresh,
-            "tmpl_canvas": tmpl.get("canvas"),
-            "orig_roi_w":  orig_roi_w,
-            "orig_roi_h":  orig_roi_h,
-            "dirty":       _no_dirty,
+            "pass":         True,
+            "confidence":   round(confidence, 4),
+            "shift_px":     shift_px,
+            "shift_ratio":  shift_ratio,
+            "reason":       "OK",
+            "reasons":      ["OK"],
+            "defect_step":  0,
+            "defect_steps": [],
+            "roi_canvas":   canvas,
+            "roi_thresh":   roi_thresh,
+            "tmpl_canvas":  tmpl.get("canvas"),
+            "orig_roi_w":   orig_roi_w,
+            "orig_roi_h":   orig_roi_h,
+            "dirty":        _no_dirty,
         }
 
 
@@ -2648,47 +2678,61 @@ class ResultAnnotator:
         cell_h   = ly2 - ly1
 
         # ── Defect region circle highlight ───────────────────────────
-        # Mousebite  → missing_map centroid
-        # Shorting   → extra_map centroid; secondary-contour short → others_center_norm
-        # Closing    → fill region computed from canvas diff (step 4 hole mismatch)
+        # Step 2 dirty  → foreign_object: extra_map / norm_pt
+        #                 missing_stroke: missing_map
+        # Step 4 hole   → hole-fill diff (canvas diff)
         if not passed and cell_w > 0 and cell_h > 0:
-            dirty_info  = result.get("dirty", {})
-            d_type      = dirty_info.get("type", "none")
-            defect_step = result.get("defect_step", 0)
-            roi_canvas  = result.get("roi_canvas")
-            tmpl_canvas = result.get("tmpl_canvas")
+            dirty_info   = result.get("dirty", {})
+            d_type       = dirty_info.get("type", "none")
+            defect_steps = result.get("defect_steps", [result.get("defect_step", 0)])
+            roi_canvas   = result.get("roi_canvas")
+            tmpl_canvas  = result.get("tmpl_canvas")
 
-            defect_map  = None   # 64×64 binary → centroid scaled to cell
-            norm_pt     = None   # (nx, ny) in [0,1]² → scaled to cell directly
-
-            if d_type == "foreign_object":
-                defect_map = dirty_info.get("extra_map")
-                if defect_map is None or not np.any(defect_map):
-                    # secondary-contour short — use stored centroid
-                    norm_pt    = dirty_info.get("others_center_norm")
-                    defect_map = None
-            elif d_type == "missing_stroke":
-                defect_map = dirty_info.get("missing_map")
-            elif defect_step == 4 and roi_canvas is not None and tmpl_canvas is not None:
-                # Closing: hole filled — find the fill pixels in canvas diff
-                tc = InspectionEngine._centre_align(tmpl_canvas)
-                rc = InspectionEngine._centre_align(roi_canvas)
-                defect_map = cv2.subtract(rc, tc)
-
-            if defect_map is not None and defect_map.size > 0:
-                pts = cv2.findNonZero(defect_map)
-                if pts is not None:
-                    x, y, w, h = cv2.boundingRect(pts)
-                    map_w, map_h = defect_map.shape[1], defect_map.shape[0]
+            def _circle_from_map(dmap) -> bool:
+                """Draw one circle per individual contour in a 64×64 binary map."""
+                if dmap is None or not dmap.size or not np.any(dmap):
+                    return False
+                cnts, _ = cv2.findContours(dmap, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts:
+                    return False
+                map_w, map_h = dmap.shape[1], dmap.shape[0]
+                drew = False
+                for cnt in cnts:
+                    if cv2.contourArea(cnt) < 2:   # skip single-pixel noise
+                        continue
+                    x, y, w, h = cv2.boundingRect(cnt)
                     cx = lx1 + int((x + w / 2) * cell_w / map_w)
                     cy = ly1 + int((y + h / 2) * cell_h / map_h)
-                    r  = max(5, int(max(w * cell_w / map_w,
-                                       h * cell_h / map_h) / 2) + 4)
+                    sw = w * cell_w / map_w
+                    sh = h * cell_h / map_h
+                    r  = max(4, int(np.hypot(sw, sh) * 0.40))
                     cv2.circle(display, (cx, cy), r, (0, 0, 255), 2)
-            elif norm_pt is not None:
-                cx = lx1 + int(norm_pt[0] * cell_w)
-                cy = ly1 + int(norm_pt[1] * cell_h)
-                cv2.circle(display, (cx, cy), 8, (0, 0, 255), 2)
+                    drew = True
+                return drew
+
+            # Step 2 — dirty pixel region
+            if d_type == "foreign_object":
+                extra_map = dirty_info.get("extra_map")
+                if extra_map is not None and np.any(extra_map):
+                    _circle_from_map(extra_map)
+                else:
+                    norm_pt = dirty_info.get("others_center_norm")
+                    if norm_pt is not None:
+                        cx = lx1 + int(norm_pt[0] * cell_w)
+                        cy = ly1 + int(norm_pt[1] * cell_h)
+                        r  = max(4, int(min(cell_w, cell_h) * 0.12))
+                        cv2.circle(display, (cx, cy), r, (0, 0, 255), 2)
+            elif d_type == "missing_stroke":
+                _circle_from_map(dirty_info.get("missing_map"))
+
+            # Step 4 — hole fill/loss: circle over canvas diff region
+            if 4 in defect_steps and roi_canvas is not None and tmpl_canvas is not None:
+                tc   = InspectionEngine._centre_align(tmpl_canvas)
+                rc   = InspectionEngine._centre_align(roi_canvas)
+                diff = cv2.subtract(rc, tc)
+                if np.any(diff):
+                    _circle_from_map(diff)
 
         # ── Extracted edges — threshold contours in pass/fail color ──
         if roi_thresh is not None and roi_thresh.size > 0 and cell_w > 0 and cell_h > 0:
@@ -2712,6 +2756,7 @@ class ResultAnnotator:
                       (tx + tw, ty + baseline),
                       (0, 0, 0), cv2.FILLED)
         cv2.putText(display, lbl, (tx, ty), font, font_scale, col, thickness)
+
                 
     
 # =========================================================
@@ -2929,7 +2974,7 @@ class InspectionController:
         try:
             self._ct.save(name, roi_bgr, roi_rect, mold_size=mold_size)
             self.cache.pop(name, None)
-            TemplatePreviewDialog(roi_bgr, name,  mold_size=mold_size, parent=parent_widget).exec_()
+            TemplatePreviewDialog(roi_bgr, name, mold_size=mold_size, parent=parent_widget).exec_()
             return True
         except Exception as e:
             print(f"[Controller] Font '{name}' save error: {e}")
@@ -3508,7 +3553,7 @@ class InspectionController:
                 roi_thresh  = slot_thresh)
 
             # ── Retry on holes/shape failures (steps 4/5) ────────────
-            if res["defect_step"] in {4, 5}:
+            if any(s in {4, 5} for s in res.get("defect_steps", [res["defect_step"]])):
                 rx_w = int(roi_w * 1.15)
                 rx_h = int(roi_h * 1.15)
                 rlx1 = max(0,  cell_cx - rx_w // 2)
@@ -3554,9 +3599,11 @@ class InspectionController:
                 "confidence":  res["confidence"],
                 "shift_px":    res["shift_px"],
                 "shift_ratio": res["shift_ratio"],
-                "defect_step": res["defect_step"],
-                "defect_type": res.get("defect_type", ""),
-                "reason":      res["reason"],
+                "defect_step":  res["defect_step"],
+                "defect_steps": res.get("defect_steps", [res["defect_step"]] if res["defect_step"] else []),
+                "defect_type":  res.get("defect_type", ""),
+                "reason":       res["reason"],
+                "reasons":      res.get("reasons", [res["reason"]]),
                 "ocr_char":    ocr_char,
                 "ocr_conf":    ocr_conf,
                 "cell_cx":     cell_cx,
@@ -3580,7 +3627,7 @@ class InspectionController:
                     f" shift={res['shift_ratio']:.3f}"
                     f" dirty={dirty_info['type']}({dirty_info['area_ratio']:.3f})"
                     f" cnts={len(slot_contours)}"
-                    f" | {res['reason']}")
+                    f" | {'; '.join(res.get('reasons', [res['reason']]))}")
                 if not passed and step == 1:
                     pfx = f"debug/FAIL_F{f_idx+1}_{mold_label}_s{slot_idx}_{letter}"
                     ContourTemplate.extract_font_template(
@@ -4375,6 +4422,70 @@ class FrameLayoutPanel(QtWidgets.QWidget):
     def closeEvent(self, e):
         self._on_cancel()
         e.accept()
+
+
+# =========================================================
+# TEMPLATE PREVIEW DIALOG
+# =========================================================
+class TemplatePreviewDialog(QtWidgets.QDialog):
+    """
+    Modal shown after saving a font template.
+    Displays the original ROI crop alongside the extracted 64×64 canvas.
+    """
+    _CANVAS_SCALE = 4   # 64×64 → 256×256
+
+    def __init__(self, roi_bgr: np.ndarray, name: str,
+                 mold_size: int = 150, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Template Saved — '{name}'")
+        self.setModal(True)
+
+        # ── Extract canvas from ROI ───────────────────────────────
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY) \
+               if roi_bgr.ndim == 3 else roi_bgr.copy()
+        _, canvas, *_ = ContourTemplate.extract_font_template(
+            gray, mold_size=mold_size, use_close=True)
+
+        # ── Build layout ──────────────────────────────────────────
+        layout = QtWidgets.QVBoxLayout(self)
+        row    = QtWidgets.QHBoxLayout()
+
+        def _make_lbl(img_bgr: np.ndarray, caption: str) -> QtWidgets.QWidget:
+            box = QtWidgets.QVBoxLayout()
+            lbl = QtWidgets.QLabel()
+            lbl.setAlignment(QtCore.Qt.AlignCenter)
+            lbl.setFixedSize(256, 256)
+            if img_bgr is not None and img_bgr.size > 0:
+                h, w = img_bgr.shape[:2]
+                scale = min(256 / max(w, 1), 256 / max(h, 1))
+                sw, sh = max(1, int(w * scale)), max(1, int(h * scale))
+                resized = cv2.resize(img_bgr, (sw, sh))
+                if resized.ndim == 2:
+                    resized = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+                qimg = QtGui.QImage(resized.data, sw, sh, sw * 3,
+                                    QtGui.QImage.Format_BGR888)
+                lbl.setPixmap(QtGui.QPixmap.fromImage(qimg))
+            cap = QtWidgets.QLabel(caption)
+            cap.setAlignment(QtCore.Qt.AlignCenter)
+            cap.setStyleSheet("color:#aaaaaa;font-size:11px")
+            box.addWidget(lbl)
+            box.addWidget(cap)
+            w_wrap = QtWidgets.QWidget()
+            w_wrap.setLayout(box)
+            return w_wrap
+
+        row.addWidget(_make_lbl(roi_bgr, "ROI crop"))
+        canvas_vis = (canvas * 255).astype(np.uint8) \
+                     if canvas is not None and canvas.max() <= 1 else canvas
+        row.addWidget(_make_lbl(canvas_vis, "Extracted template"))
+
+        btn = QtWidgets.QPushButton("OK")
+        btn.setFixedWidth(80)
+        btn.clicked.connect(self.accept)
+
+        layout.addLayout(row)
+        layout.addWidget(btn, alignment=QtCore.Qt.AlignHCenter)
+        self.adjustSize()
 
 
 # =========================================================
