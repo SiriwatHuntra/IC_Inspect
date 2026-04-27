@@ -2229,18 +2229,11 @@ class InspectionEngine:
         missing_ratio = round(int(np.count_nonzero(missing)) / union_area, 4)
 
         # ── Secondary-contour check (blobs outside aligned bbox) ─────
-        roi_area           = max(roi_h * roi_w, 1)
-        others_max_ratio   = 0.0
-        others_center_norm = None   # (nx, ny) normalized to roi dims — for circle viz
+        roi_area          = max(roi_h * roi_w, 1)
+        others_max_ratio  = 0.0
         for c in others:
             r = cv2.contourArea(c) / roi_area
             if r >= ANOMALY_MIN_AREA_RATIO:
-                if r > others_max_ratio:
-                    M = cv2.moments(c)
-                    if M["m00"] > 0:
-                        others_center_norm = (
-                            (M["m10"] / M["m00"]) / max(roi_w, 1),
-                            (M["m01"] / M["m00"]) / max(roi_h, 1))
                 others_max_ratio = max(others_max_ratio, r)
 
         # ── Decision ─────────────────────────────────────────────────
@@ -2253,14 +2246,13 @@ class InspectionEngine:
         area_ratio = round(max(extra_ratio, missing_ratio, others_max_ratio), 4)
 
         return {
-            "detected":           dirty_type != "none",
-            "type":               dirty_type,
-            "extra_ratio":        extra_ratio,
-            "missing_ratio":      missing_ratio,
-            "area_ratio":         area_ratio,
-            "extra_map":          extra,              # 64×64 uint8
-            "missing_map":        missing,            # 64×64 uint8
-            "others_center_norm": others_center_norm, # (nx,ny) or None
+            "detected":      dirty_type != "none",
+            "type":          dirty_type,
+            "extra_ratio":   extra_ratio,
+            "missing_ratio": missing_ratio,
+            "area_ratio":    area_ratio,
+            "extra_map":     extra,    # 64×64 uint8 — pixels present in ROI but absent from template
+            "missing_map":   missing,  # 64×64 uint8 — pixels in template absent from ROI
         }
 
     # =========================================================
@@ -2655,90 +2647,26 @@ class ResultAnnotator:
         cell_w   = lx2 - lx1
         cell_h   = ly2 - ly1
 
-        # ── Defect circle — two morphological self-check flows ───────
-        # Source: roi_thresh (raw Otsu, pre-morph) — defects not yet erased.
-        # Coordinates stay in roi space; centroid scaled to cell via sx/sy.
-        #
-        # Flow 1 (missing_stroke / step-4):
-        #   src_opened = OPEN(roi_thresh)         — denoise without filling gaps
-        #   src_closed = CLOSE(src_opened)        — fills gaps
-        #   defect_map = src_closed − src_opened  — gap pixels = mousebite / hole voids
-        #
-        # Flow 2 (foreign_object):
-        #   defect_map = roi_thresh − src_opened  — removed pixels = hair / thin short
-        #
-        # Thick-short fallback: others_center_norm stored in dirty dict.
+        # ── Dirty region red overlay ──────────────────────────────
         if not passed and cell_w > 0 and cell_h > 0:
-            dirty_info  = result.get("dirty", {})
-            d_type      = dirty_info.get("type", "none")
-            defect_step = result.get("defect_step", 0)
-            roi_canvas  = result.get("roi_canvas")
-            orig_roi_w  = result.get("orig_roi_w", cell_w)
-            orig_roi_h  = result.get("orig_roi_h", cell_h)
+            dirty_info = result.get("dirty", {})
+            d_type     = dirty_info.get("type", "none")
+            if d_type == "foreign_object":
+                dmap = dirty_info.get("extra_map")
+            elif d_type == "missing_stroke":
+                dmap = dirty_info.get("missing_map")
+            else:
+                dmap = None
 
-            defect_map = None
-            norm_pt    = None
-
-            sx = cell_w / max(orig_roi_w, 1)
-            sy = cell_h / max(orig_roi_h, 1)
-
-            _kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # closing: fill ≤2 px gaps
-            _ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # opening: strip 1 px strands
-
-            # All flows use roi_thresh (raw Otsu, pre-morph) as source so defects
-            # not yet erased by preprocessing are still visible.
-            src = roi_thresh if roi_thresh is not None and roi_thresh.size > 0 else None
-
-            if src is not None:
-                # Shared: OPEN(roi_thresh) denoises without filling defect gaps
-                src_opened = cv2.morphologyEx(src, cv2.MORPH_OPEN, _ko)
-
-                if d_type == "missing_stroke":
-                    # Flow 1 (CLOSING on denoised thresh): fill gaps → gap pixels = mousebite
-                    src_closed = cv2.morphologyEx(src_opened, cv2.MORPH_CLOSE, _kc)
-                    defect_map = cv2.subtract(src_closed, src_opened)
-
-                elif d_type == "foreign_object":
-                    # Flow 2 (OPENING): removes thin protrusions — hair / thin short
-                    defect_map = cv2.subtract(src, src_opened)
-
-                    if not np.any(defect_map):
-                        # Thick blob: pixels in thresh outside the dilated expected canvas
-                        if roi_canvas is not None and roi_canvas.size > 0:
-                            _ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                            defect_map = cv2.subtract(src, cv2.dilate(roi_canvas, _ke))
-
-                    if not np.any(defect_map if defect_map is not None else np.zeros(1, np.uint8)):
-                        # Secondary-contour centroid from dirty check
-                        norm_pt = dirty_info.get("others_center_norm")
-                        # Empty-slot: roi_canvas IS the blob — use its centroid
-                        if norm_pt is None and roi_canvas is not None and np.any(roi_canvas):
-                            defect_map = roi_canvas
-                        else:
-                            defect_map = None
-
-                elif defect_step == 4:
-                    # Closing defect: hole fill — CLOSE on denoised thresh reveals remaining voids
-                    src_closed = cv2.morphologyEx(src_opened, cv2.MORPH_CLOSE, _kc)
-                    defect_map = cv2.subtract(src_closed, src_opened)
-                    # Fully solid mark (hole completely filled): fall back to mark centroid
-                    if not np.any(defect_map) and roi_canvas is not None and roi_canvas.size > 0:
-                        defect_map = roi_canvas
-
-            # Circle radius ∝ sqrt(defect area in cell space)
-            if defect_map is not None and np.any(defect_map):
-                pts = cv2.findNonZero(defect_map)
-                if pts is not None:
-                    x, y, w, h = cv2.boundingRect(pts)
-                    cx  = lx1 + int((x + w / 2) * sx)
-                    cy  = ly1 + int((y + h / 2) * sy)
-                    dpx = int(np.count_nonzero(defect_map))
-                    r   = max(5, int(np.sqrt(dpx * sx * sy / np.pi)) + 3)
-                    cv2.circle(display, (cx, cy), r, (0, 0, 255), 2)
-            elif norm_pt is not None:
-                cx = lx1 + int(norm_pt[0] * cell_w)
-                cy = ly1 + int(norm_pt[1] * cell_h)
-                cv2.circle(display, (cx, cy), 8, (0, 0, 255), 2)
+            if d_type in ("foreign_object", "missing_stroke"):
+                cell_roi  = display[ly1:ly2, lx1:lx2]
+                red_layer = np.zeros_like(cell_roi)
+                if dmap is not None and dmap.size > 0:
+                    dmap_rs = cv2.resize(dmap, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
+                    red_layer[dmap_rs > 0] = (0, 0, 220)
+                else:
+                    red_layer[:] = (0, 0, 100)   # fallback: dim-red tint on whole cell
+                cell_roi[:] = cv2.addWeighted(cell_roi, 0.55, red_layer, 0.45, 0)
 
         # ── Extracted edges — threshold contours in pass/fail color ──
         if roi_thresh is not None and roi_thresh.size > 0 and cell_w > 0 and cell_h > 0:
