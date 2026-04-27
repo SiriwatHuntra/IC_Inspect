@@ -1133,6 +1133,25 @@ class ContourTemplate:
                                   if outer is not None else None
         data["topo_feat"]      = InspectionEngine._skeleton_features(data["canvas"])
 
+        # Pre-aligned 64×64 canvas — avoids repeated _centre_align(tmpl_canvas)
+        # inside every compare_roi / _check_dirty / _check_similarity call.
+        data["canvas_aligned"] = InspectionEngine._centre_align(data["canvas"]) \
+                                  if data.get("canvas") is not None \
+                                  else np.zeros((InspectionEngine._ALIGN_SIZE,
+                                                 InspectionEngine._ALIGN_SIZE), dtype=np.uint8)
+
+        # Pre-compute hole ratios — avoids recomputing contourArea per slot.
+        if data["contours"]:
+            _outer_area = cv2.contourArea(data["contours"][0])
+            _holes      = data["contours"][1:]
+            data["tmpl_outer_area"]  = _outer_area
+            data["tmpl_hole_ratios"] = [
+                cv2.contourArea(h) / max(_outer_area, 1) for h in _holes
+            ]
+        else:
+            data["tmpl_outer_area"]  = 0.0
+            data["tmpl_hole_ratios"] = []
+
         # Backfill missing fields from older templates
         if not data.get("expected_pixels") and data["canvas"] is not None:
             data["expected_pixels"] = int(np.count_nonzero(data["canvas"]))
@@ -1492,19 +1511,22 @@ class InspectionEngine:
 
     @staticmethod
     def _check_similarity(canvas:      np.ndarray,
-                          tmpl_canvas: np.ndarray) -> float:
+                          tmpl_canvas: np.ndarray,
+                          tc:          np.ndarray = None) -> float:
         """
         Centre-aligned IoU at _ALIGN_SIZE resolution.
         Positional offset removed — shift is checked separately.
 
-        Input : canvas (from _check_presence), tmpl_canvas (from template dict)
+        Input : canvas (from _check_presence), tmpl_canvas (from template dict),
+                tc — optional pre-aligned template canvas (from template["canvas_aligned"])
         Output: float 0.0–1.0
         """
         if tmpl_canvas is None or tmpl_canvas.size == 0:
             return 0.0
 
         rc = InspectionEngine._centre_align(canvas)
-        tc = InspectionEngine._centre_align(tmpl_canvas)
+        if tc is None:
+            tc = InspectionEngine._centre_align(tmpl_canvas)
 
         intersection = np.count_nonzero(cv2.bitwise_and(rc, tc))
         union        = np.count_nonzero(cv2.bitwise_or(rc, tc))
@@ -1834,7 +1856,8 @@ class InspectionEngine:
         q_hog = _compute_hog(canvas_q)
         hog   = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
 
-        filled = InspectionEngine._check_similarity(canvas_q, tmpl.get("canvas"))
+        filled = InspectionEngine._check_similarity(
+            canvas_q, tmpl.get("canvas"), tmpl.get("canvas_aligned"))
 
         skel = InspectionEngine._skeleton_iou(canvas_q, tmpl.get("canvas", np.zeros((1,1), np.uint8)))
         topo = InspectionEngine._topology_score(
@@ -2018,7 +2041,8 @@ class InspectionEngine:
 
         def _score(tmpl: dict) -> float:
             hog    = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
-            filled = InspectionEngine._check_similarity(canvas, tmpl.get("canvas"))
+            filled = InspectionEngine._check_similarity(
+                canvas, tmpl.get("canvas"), tmpl.get("canvas_aligned"))
             signal = InspectionEngine._contour_signal_sim(q_signal,
                                                           tmpl.get("contour_signal"))
             approx = InspectionEngine._approx_score(q_approx,
@@ -2168,11 +2192,12 @@ class InspectionEngine:
         return kept
 
     @staticmethod
-    def _check_dirty(others:      list,
-                     canvas:      np.ndarray,
-                     tmpl_canvas: np.ndarray,
-                     roi_h:       int,
-                     roi_w:       int) -> dict:
+    def _check_dirty(others:               list,
+                     canvas:               np.ndarray,
+                     tmpl_canvas:          np.ndarray,
+                     roi_h:                int,
+                     roi_w:                int,
+                     tmpl_canvas_aligned:  np.ndarray = None) -> dict:
         """
         Step 3 — Dirty check.
 
@@ -2213,7 +2238,9 @@ class InspectionEngine:
             extra         = _empty
             missing       = _empty
         else:
-            tc = InspectionEngine._centre_align(tmpl_canvas)
+            tc = tmpl_canvas_aligned \
+                 if tmpl_canvas_aligned is not None \
+                 else InspectionEngine._centre_align(tmpl_canvas)
 
             union_area = max(int(np.count_nonzero(cv2.bitwise_or(rc, tc))), 1)
 
@@ -2323,15 +2350,17 @@ class InspectionEngine:
         if not tmpl_contours:
             return _fail(0, "no template contours")
 
-        # Template geometry
+        # Template geometry — use pre-cached values when available (set in ContourTemplate.load)
         tmpl_outer      = tmpl_contours[0]
         tmpl_holes      = tmpl_contours[1:] if len(tmpl_contours) > 1 else []
         tmpl_hole_count = len(tmpl_holes)
-        tmpl_outer_area = cv2.contourArea(tmpl_outer)
-        tmpl_hole_ratios = [
-            cv2.contourArea(h) / max(tmpl_outer_area, 1)
-            for h in tmpl_holes
-        ]
+        tmpl_outer_area  = tmpl.get("tmpl_outer_area") \
+                           if tmpl.get("tmpl_outer_area") is not None \
+                           else cv2.contourArea(tmpl_outer)
+        tmpl_hole_ratios = tmpl.get("tmpl_hole_ratios") \
+                           if tmpl.get("tmpl_hole_ratios") is not None \
+                           else [cv2.contourArea(h) / max(tmpl_outer_area, 1)
+                                 for h in tmpl_holes]
 
         # ── Step 1 : Presence (hard) ─────────────────────────────────
         if precomputed is not None:
@@ -2353,7 +2382,8 @@ class InspectionEngine:
         _cmask = np.zeros_like(clean_binary)
         cv2.drawContours(_cmask, [roi_outer], -1, 255, cv2.FILLED)
         roi_for_dirty = cv2.bitwise_and(clean_binary, _cmask)
-        dirty = self._check_dirty(others, roi_for_dirty, tmpl.get("canvas"), roi_h, roi_w)
+        dirty = self._check_dirty(others, roi_for_dirty, tmpl.get("canvas"), roi_h, roi_w,
+                                   tmpl_canvas_aligned=tmpl.get("canvas_aligned"))
         if dirty["detected"]:
             failures.append((2,
                 f"dirty:{dirty['type']} area={dirty['area_ratio']:.3f}",
@@ -3146,7 +3176,7 @@ class InspectionController:
             return empty
 
         frame_results = self._step1_find_frames(
-            image_bgr, anchor_tmpl, pin_params, layout)
+            src, anchor_tmpl, pin_params, layout)
 
         if not frame_results:
             print("[Pipeline] Frame layout is empty.")
@@ -3288,7 +3318,7 @@ class InspectionController:
         result.total_ms = total_ms
         return result
 
-    def _step1_find_frames(self, image_bgr, anchor_tmpl, pin_params, layout):
+    def _step1_find_frames(self, image_gray, anchor_tmpl, pin_params, layout):
         """
         For each frame in layout (F1→FN), crop the image at the pre-defined ROI
         and run a local TM to confirm presence.
@@ -3297,8 +3327,7 @@ class InspectionController:
           { id, roi, found, cx, cy, score, fw, fh }
         Order is always the layout order — no sorting, no index reassignment.
         """
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY) \
-            if image_bgr.ndim == 3 else image_bgr.copy()
+        gray = image_gray  # caller (run()) already converts to grayscale
 
         tmpl_canvas = anchor_tmpl.get("canvas")
         if tmpl_canvas is None or tmpl_canvas.size == 0:
@@ -3459,9 +3488,11 @@ class InspectionController:
 
             # ── Empty slot: foreign-object check first, then unexpected-mark ──
             if not letter:
-                # Re-filter: tophat removes large reflection blobs, keeps thin strokes
-                slot_contours, slot_canvas, slot_clean_binary, slot_others = \
-                    InspectionEngine._suppress_large_blobs(slot_clean_binary, mold_size)
+                # Re-filter: tophat removes large reflection blobs, keeps thin strokes.
+                # Skip if nothing found — avoids expensive morphology on clear slots.
+                if slot_contours:
+                    slot_contours, slot_canvas, slot_clean_binary, slot_others = \
+                        InspectionEngine._suppress_large_blobs(slot_clean_binary, mold_size)
                 slot_roi_area = (ly2 - ly1) * (lx2 - lx1)
                 if slot_contours:
                     main_area  = cv2.contourArea(slot_contours[0])
