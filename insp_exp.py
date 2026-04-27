@@ -115,8 +115,14 @@ MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 1
 
 # ---- Dirty / Anomaly Detection ----
 ANOMALY_MIN_AREA_RATIO    = 0.30  # secondary contour / roi_area — below → noise, ignore
-DIRTY_EXTRA_RATIO_MAX     = 0.20  # extra pixels / union  > 15%  → foreign object / splatter
+DIRTY_EXTRA_RATIO_MAX     = 0.20  # extra pixels / union  > 20%  → foreign object / splatter
 DIRTY_MISSING_RATIO_MAX   = 0.40  # missing pixels / union > 40% → severe stroke loss
+# Dilation applied to both aligned canvases before computing extra/missing ratios.
+# Tolerates laser position drift (~2 px on 64 px canvas) without hiding real defects:
+#   mousebite  ≥ 5 px  → still caught (missing area > tolerance band)
+#   closing fill > 2 px → still caught as extra pixels inside hole
+#   shorting             → caught by secondary-contour check (unaffected by dilation)
+DIRTY_CANVAS_DILATE_PX    = 2
 
 # ---- HOG descriptor (shared: template load + runtime OCR) ----
 # win 64×64 → 7×7 block positions × 4 cells × 9 bins = 1764-dim vector
@@ -2208,8 +2214,19 @@ class InspectionEngine:
 
         union_area = max(int(np.count_nonzero(cv2.bitwise_or(rc, tc))), 1)
 
-        extra   = cv2.subtract(rc, tc)   # residual  — in ROI, not in template
-        missing = cv2.subtract(tc, rc)   # union-gap — in template, not in ROI
+        # Dilate both canvases to absorb laser position drift before diff.
+        # union_area stays on raw canvases so ratio scale is consistent.
+        if DIRTY_CANVAS_DILATE_PX > 0:
+            _dk = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (DIRTY_CANVAS_DILATE_PX * 2 + 1, DIRTY_CANVAS_DILATE_PX * 2 + 1))
+            rc_cmp = cv2.dilate(rc, _dk)
+            tc_cmp = cv2.dilate(tc, _dk)
+        else:
+            rc_cmp, tc_cmp = rc, tc
+
+        extra   = cv2.subtract(rc, tc_cmp)   # pixels in ROI outside dilated template
+        missing = cv2.subtract(tc, rc_cmp)   # template pixels not covered by dilated ROI
 
         extra_ratio   = round(int(np.count_nonzero(extra))   / union_area, 4)
         missing_ratio = round(int(np.count_nonzero(missing)) / union_area, 4)
