@@ -2232,11 +2232,18 @@ class InspectionEngine:
         missing_ratio = round(int(np.count_nonzero(missing)) / union_area, 4)
 
         # ── Secondary-contour check (blobs outside aligned bbox) ─────
-        roi_area          = max(roi_h * roi_w, 1)
-        others_max_ratio  = 0.0
+        roi_area           = max(roi_h * roi_w, 1)
+        others_max_ratio   = 0.0
+        others_center_norm = None   # (nx, ny) normalized to roi dims — for circle viz
         for c in others:
             r = cv2.contourArea(c) / roi_area
             if r >= ANOMALY_MIN_AREA_RATIO:
+                if r > others_max_ratio:
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        others_center_norm = (
+                            (M["m10"] / M["m00"]) / max(roi_w, 1),
+                            (M["m01"] / M["m00"]) / max(roi_h, 1))
                 others_max_ratio = max(others_max_ratio, r)
 
         # ── Decision ─────────────────────────────────────────────────
@@ -2249,13 +2256,14 @@ class InspectionEngine:
         area_ratio = round(max(extra_ratio, missing_ratio, others_max_ratio), 4)
 
         return {
-            "detected":      dirty_type != "none",
-            "type":          dirty_type,
-            "extra_ratio":   extra_ratio,
-            "missing_ratio": missing_ratio,
-            "area_ratio":    area_ratio,
-            "extra_map":     extra,    # 64×64 uint8 — pixels present in ROI but absent from template
-            "missing_map":   missing,  # 64×64 uint8 — pixels in template absent from ROI
+            "detected":           dirty_type != "none",
+            "type":               dirty_type,
+            "extra_ratio":        extra_ratio,
+            "missing_ratio":      missing_ratio,
+            "area_ratio":         area_ratio,
+            "extra_map":          extra,              # 64×64 uint8
+            "missing_map":        missing,            # 64×64 uint8
+            "others_center_norm": others_center_norm, # (nx,ny) or None
         }
 
     # =========================================================
@@ -2648,26 +2656,48 @@ class ResultAnnotator:
         cell_w   = lx2 - lx1
         cell_h   = ly2 - ly1
 
-        # ── Dirty region red overlay ──────────────────────────────
+        # ── Defect region circle highlight ───────────────────────────
+        # Mousebite  → missing_map centroid
+        # Shorting   → extra_map centroid; secondary-contour short → others_center_norm
+        # Closing    → fill region computed from canvas diff (step 4 hole mismatch)
         if not passed and cell_w > 0 and cell_h > 0:
-            dirty_info = result.get("dirty", {})
-            d_type     = dirty_info.get("type", "none")
-            if d_type == "foreign_object":
-                dmap = dirty_info.get("extra_map")
-            elif d_type == "missing_stroke":
-                dmap = dirty_info.get("missing_map")
-            else:
-                dmap = None
+            dirty_info  = result.get("dirty", {})
+            d_type      = dirty_info.get("type", "none")
+            defect_step = result.get("defect_step", 0)
+            roi_canvas  = result.get("roi_canvas")
+            tmpl_canvas = result.get("tmpl_canvas")
 
-            if d_type in ("foreign_object", "missing_stroke"):
-                cell_roi  = display[ly1:ly2, lx1:lx2]
-                red_layer = np.zeros_like(cell_roi)
-                if dmap is not None and dmap.size > 0:
-                    dmap_rs = cv2.resize(dmap, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
-                    red_layer[dmap_rs > 0] = (0, 0, 220)
-                else:
-                    red_layer[:] = (0, 0, 100)   # fallback: dim-red tint on whole cell
-                cell_roi[:] = cv2.addWeighted(cell_roi, 0.55, red_layer, 0.45, 0)
+            defect_map  = None   # 64×64 binary → centroid scaled to cell
+            norm_pt     = None   # (nx, ny) in [0,1]² → scaled to cell directly
+
+            if d_type == "foreign_object":
+                defect_map = dirty_info.get("extra_map")
+                if defect_map is None or not np.any(defect_map):
+                    # secondary-contour short — use stored centroid
+                    norm_pt    = dirty_info.get("others_center_norm")
+                    defect_map = None
+            elif d_type == "missing_stroke":
+                defect_map = dirty_info.get("missing_map")
+            elif defect_step == 4 and roi_canvas is not None and tmpl_canvas is not None:
+                # Closing: hole filled — find the fill pixels in canvas diff
+                tc = InspectionEngine._centre_align(tmpl_canvas)
+                rc = InspectionEngine._centre_align(roi_canvas)
+                defect_map = cv2.subtract(rc, tc)
+
+            if defect_map is not None and defect_map.size > 0:
+                pts = cv2.findNonZero(defect_map)
+                if pts is not None:
+                    x, y, w, h = cv2.boundingRect(pts)
+                    map_w, map_h = defect_map.shape[1], defect_map.shape[0]
+                    cx = lx1 + int((x + w / 2) * cell_w / map_w)
+                    cy = ly1 + int((y + h / 2) * cell_h / map_h)
+                    r  = max(5, int(max(w * cell_w / map_w,
+                                       h * cell_h / map_h) / 2) + 4)
+                    cv2.circle(display, (cx, cy), r, (0, 0, 255), 2)
+            elif norm_pt is not None:
+                cx = lx1 + int(norm_pt[0] * cell_w)
+                cy = ly1 + int(norm_pt[1] * cell_h)
+                cv2.circle(display, (cx, cy), 8, (0, 0, 255), 2)
 
         # ── Extracted edges — threshold contours in pass/fail color ──
         if roi_thresh is not None and roi_thresh.size > 0 and cell_w > 0 and cell_h > 0:
