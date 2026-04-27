@@ -2656,43 +2656,70 @@ class ResultAnnotator:
         cell_w   = lx2 - lx1
         cell_h   = ly2 - ly1
 
-        # ── Defect region circle highlight ───────────────────────────
-        # Mousebite  → missing_map centroid
-        # Shorting   → extra_map centroid; secondary-contour short → others_center_norm
-        # Closing    → fill region computed from canvas diff (step 4 hole mismatch)
+        # ── Defect circle — two morphological flows ──────────────────
+        # Coordinates stay in roi space (orig_roi_w × orig_roi_h) throughout.
+        # Centroid scaled to cell via sx/sy — no _centre_align remapping.
+        #
+        # Flow 1 (CLOSING 5×5 on roi_canvas): fills stroke gaps.
+        #   CLOSE(roi) − roi  →  void pixels = mousebite / closing-defect voids
+        #
+        # Flow 2 (OPENING 3×3 on roi_thresh): strips thin protrusions.
+        #   roi_thresh − OPEN(roi_thresh)  →  removed pixels = hair / overflow / thin short
+        #   Uses roi_thresh (not roi_canvas) so hair filtered from canvas is still visible.
+        #
+        # Thick-short fallback: others_center_norm stored in dirty dict.
         if not passed and cell_w > 0 and cell_h > 0:
             dirty_info  = result.get("dirty", {})
             d_type      = dirty_info.get("type", "none")
             defect_step = result.get("defect_step", 0)
             roi_canvas  = result.get("roi_canvas")
-            tmpl_canvas = result.get("tmpl_canvas")
+            orig_roi_w  = result.get("orig_roi_w", cell_w)
+            orig_roi_h  = result.get("orig_roi_h", cell_h)
 
-            defect_map  = None   # 64×64 binary → centroid scaled to cell
-            norm_pt     = None   # (nx, ny) in [0,1]² → scaled to cell directly
+            defect_map = None
+            norm_pt    = None
 
-            if d_type == "foreign_object":
-                defect_map = dirty_info.get("extra_map")
-                if defect_map is None or not np.any(defect_map):
-                    # secondary-contour short — use stored centroid
-                    norm_pt    = dirty_info.get("others_center_norm")
-                    defect_map = None
-            elif d_type == "missing_stroke":
-                defect_map = dirty_info.get("missing_map")
-            elif defect_step == 4 and roi_canvas is not None and tmpl_canvas is not None:
-                # Closing: hole filled — find the fill pixels in canvas diff
-                tc = InspectionEngine._centre_align(tmpl_canvas)
-                rc = InspectionEngine._centre_align(roi_canvas)
-                defect_map = cv2.subtract(rc, tc)
+            sx = cell_w / max(orig_roi_w, 1)
+            sy = cell_h / max(orig_roi_h, 1)
 
-            if defect_map is not None and defect_map.size > 0:
+            _kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # closing: fill ≤2 px gaps
+            _ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # opening: strip 1 px strands
+
+            if roi_canvas is not None and roi_canvas.size > 0:
+
+                if d_type == "missing_stroke":
+                    # Flow 1 (CLOSING): closing fills stroke gaps → gap pixels = mousebite
+                    rc_closed  = cv2.morphologyEx(roi_canvas, cv2.MORPH_CLOSE, _kc)
+                    defect_map = cv2.subtract(rc_closed, roi_canvas)
+
+                elif d_type == "foreign_object":
+                    # Flow 2 (OPENING on roi_thresh): opening strips thin strands
+                    src = roi_thresh if roi_thresh is not None and roi_thresh.size > 0 \
+                          else roi_canvas
+                    rc_opened  = cv2.morphologyEx(src, cv2.MORPH_OPEN, _ko)
+                    defect_map = cv2.subtract(src, rc_opened)
+                    # Thick-short / secondary-contour fallback
+                    if not np.any(defect_map):
+                        norm_pt    = dirty_info.get("others_center_norm")
+                        defect_map = None
+
+                elif defect_step == 4:
+                    # Closing defect: hole fill — closing reveals remaining voids
+                    rc_closed  = cv2.morphologyEx(roi_canvas, cv2.MORPH_CLOSE, _kc)
+                    defect_map = cv2.subtract(rc_closed, roi_canvas)
+                    # If mark already fully solid: use mark centroid as fallback location
+                    if not np.any(defect_map):
+                        defect_map = roi_canvas
+
+            # Circle radius ∝ sqrt(defect area in cell space)
+            if defect_map is not None and np.any(defect_map):
                 pts = cv2.findNonZero(defect_map)
                 if pts is not None:
                     x, y, w, h = cv2.boundingRect(pts)
-                    map_w, map_h = defect_map.shape[1], defect_map.shape[0]
-                    cx = lx1 + int((x + w / 2) * cell_w / map_w)
-                    cy = ly1 + int((y + h / 2) * cell_h / map_h)
-                    r  = max(5, int(max(w * cell_w / map_w,
-                                       h * cell_h / map_h) / 2) + 4)
+                    cx  = lx1 + int((x + w / 2) * sx)
+                    cy  = ly1 + int((y + h / 2) * sy)
+                    dpx = int(np.count_nonzero(defect_map))
+                    r   = max(5, int(np.sqrt(dpx * sx * sy / np.pi)) + 3)
                     cv2.circle(display, (cx, cy), r, (0, 0, 255), 2)
             elif norm_pt is not None:
                 cx = lx1 + int(norm_pt[0] * cell_w)
