@@ -2475,29 +2475,20 @@ class InspectionEngine:
 
             # ── Empty slot ────────────────────────────────────────
             if not letter:
-                cell_area = max(ch * cw, 1)
-
-                # Suppression runs once; result used by both checks.
-                filt_cnts, filt_canvas, _, _ = \
-                    InspectionEngine._suppress_large_blobs(cell_bin, mold_size)
-                filt_area = cv2.contourArea(filt_cnts[0]) if filt_cnts else 0.0
-
                 if cell_cnts:
-                    raw_area   = cv2.contourArea(cell_cnts[0])
-                    raw_ratio  = raw_area / cell_area
-                    surv_ratio = filt_area / max(raw_area, 1.0)
+                    cell_area  = max(ch * cw, 1)
+                    main_area  = cv2.contourArea(cell_cnts[0])
+                    area_ratio = main_area / cell_area
 
-                    # Large-blob FO: suppression removed most of the primary
-                    # contour area.  Thin bleed-over from adjacent marks
-                    # survives suppression (surv_ratio ≈ 1.0) so it never
-                    # fires here.  Slot 4/8 mold-mark exception added later.
-                    if (raw_ratio  >= ANOMALY_MIN_AREA_RATIO
-                            and surv_ratio < 0.20
-                            and not InspectionEngine._is_laser_mark(cell_canvas)):
+                    # Stage 1: large blob detected before suppression.
+                    # _suppress_large_blobs would erase this, so check first.
+                    # Slot 4 / 8 mold-mark exception handled in a later pass.
+                    if area_ratio >= ANOMALY_MIN_AREA_RATIO \
+                            and not InspectionEngine._is_laser_mark(cell_canvas):
                         results.append({
                             "detected":   True,
                             "type":       "foreign_object",
-                            "area_ratio": round(raw_ratio, 4),
+                            "area_ratio": round(area_ratio, 4),
                             "hole_score": 0.0,
                             "extra_map":          None,
                             "missing_map":        None,
@@ -2507,24 +2498,27 @@ class InspectionEngine:
                         })
                         continue
 
-                # Thin-mark check on suppressed binary (original path).
-                if filt_cnts:
-                    filt_ratio = filt_area / cell_area
-                    if filt_ratio >= ANOMALY_MIN_AREA_RATIO:
-                        is_mark = InspectionEngine._is_laser_mark(filt_canvas)
-                        results.append({
-                            "detected":   True,
-                            "type":       "unexpected_mark" if is_mark
-                                          else "foreign_object",
-                            "area_ratio": round(filt_ratio, 4),
-                            "hole_score": 0.0,
-                            "extra_map":          None,
-                            "missing_map":        None,
-                            "others_center_norm": None,
-                            "canvas":     filt_canvas,
-                            "contours":   filt_cnts,
-                        })
-                        continue
+                    # Stage 2: thin mark check after suppression.
+                    filt_cnts, filt_canvas, _, _ = \
+                        InspectionEngine._suppress_large_blobs(cell_bin, mold_size)
+                    if filt_cnts:
+                        filt_area  = cv2.contourArea(filt_cnts[0])
+                        filt_ratio = filt_area / cell_area
+                        if filt_ratio >= ANOMALY_MIN_AREA_RATIO:
+                            is_mark = InspectionEngine._is_laser_mark(filt_canvas)
+                            results.append({
+                                "detected":   True,
+                                "type":       "unexpected_mark" if is_mark
+                                              else "foreign_object",
+                                "area_ratio": round(filt_ratio, 4),
+                                "hole_score": 0.0,
+                                "extra_map":          None,
+                                "missing_map":        None,
+                                "others_center_norm": None,
+                                "canvas":     filt_canvas,
+                                "contours":   filt_cnts,
+                            })
+                            continue
                 results.append(dict(_none))
                 continue
 
