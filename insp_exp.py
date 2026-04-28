@@ -88,7 +88,7 @@ CAMERA_WARMUP_FRAMES = 5
 CAMERA_EXPOSURE_US   = 8000     # µs — overridden by RightPanel at runtime
 
 # ---- Font Inspection Constants (hardcoded, not user-tunable) ----
-FONT_CONFIDENCE_MIN        = 0.80
+FONT_CONFIDENCE_MIN        = 0.70
 FONT_SHIFT_RATIO_MAX       = 0.50
 FONT_ASPECT_TOLERANCE      = 0.25
 FONT_HOLE_COUNT_TOLERANCE  = 1
@@ -2358,11 +2358,18 @@ class InspectionEngine:
                           ih:           int,
                           grid_letters: list,
                           tmpl_map:     dict,
-                          mold_size:    int) -> list:
+                          mold_size:    int,
+                          mold_x1:      int = 0,
+                          mold_y1:      int = 0,
+                          mold_x2:      int = 0,
+                          mold_y2:      int = 0) -> list:
         """
         Pipeline 2 — Defect / Anomaly scan.
         Thresholds the full grid region once; per-cell defect checks run on
         crops of that single global binary.  No per-slot re-thresh.
+
+        mold_x1/y1/x2/y2: clip grid crop to mold boundary so no cell ROI
+        bleeds into an adjacent frame.  Default 0/0/0/0 = no clipping.
 
         Returns list[9] of dicts:
           detected, type, area_ratio, hole_score, canvas, contours
@@ -2373,13 +2380,18 @@ class InspectionEngine:
             "canvas": None, "contours": [],
         }
 
-        # ── 1. Crop whole grid region from original image ─────────
+        if mold_x2 <= mold_x1:
+            mold_x1, mold_x2 = 0, iw
+        if mold_y2 <= mold_y1:
+            mold_y1, mold_y2 = 0, ih
+
+        # ── 1. Crop whole grid region, clipped to mold boundary ───
         half_gw = (roi_w * 3) // 2
         half_gh = (roi_h * 3) // 2
-        gx1 = max(0,  grid_cx - half_gw)
-        gy1 = max(0,  grid_cy - half_gh)
-        gx2 = min(iw, grid_cx + half_gw)
-        gy2 = min(ih, grid_cy + half_gh)
+        gx1 = max(mold_x1, grid_cx - half_gw)
+        gy1 = max(mold_y1, grid_cy - half_gh)
+        gx2 = min(mold_x2, grid_cx + half_gw)
+        gy2 = min(mold_y2, grid_cy + half_gh)
 
         if gx2 <= gx1 or gy2 <= gy1:
             return [dict(_none) for _ in range(9)]
@@ -2389,6 +2401,45 @@ class InspectionEngine:
         # ── 2. Single thresh + morph for whole grid ───────────────
         grid_thresh = ContourTemplate._thresh_font(grid_crop, mold_size)
         grid_clean  = ContourTemplate._morph_font(grid_thresh, use_close=False)
+
+        # ── 2b. Grid-level anomaly pre-scan ──────────────────────
+        # Find blobs outside all expected letter-slot bounding boxes.
+        # Catches FO regardless of shape, quality filters, or whether
+        # it straddles slot boundaries.
+        _gw, _gh  = gx2 - gx1, gy2 - gy1
+        _exp_mask = np.zeros((_gh, _gw), dtype=np.uint8)
+        _slot_cxy = []
+        _cell_ref = max(cell_w * cell_h, 1)
+        for _si in range(9):
+            _sl = (grid_letters[_si].upper()
+                   if _si < len(grid_letters) and grid_letters[_si] else "")
+            _r = _si // 3;  _c = _si % 3
+            _scx = (grid_cx + (_c - 1) * cell_w) - gx1
+            _scy = (grid_cy + (_r - 1) * cell_h) - gy1
+            _slot_cxy.append((_scx, _scy))
+            if _sl:
+                _ex1 = max(0,   _scx - cell_w // 2)
+                _ey1 = max(0,   _scy - cell_h // 2)
+                _ex2 = min(_gw, _scx + cell_w // 2)
+                _ey2 = min(_gh, _scy + cell_h // 2)
+                _exp_mask[_ey1:_ey2, _ex1:_ex2] = 255
+
+        _anom     = cv2.bitwise_and(grid_clean, cv2.bitwise_not(_exp_mask))
+        _acnts, _ = cv2.findContours(
+            _anom, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        _grid_fo_slots: set = set()
+        for _cnt in _acnts:
+            if cv2.contourArea(_cnt) / _cell_ref < ANOMALY_MIN_AREA_RATIO:
+                continue
+            _M = cv2.moments(_cnt)
+            if _M["m00"] <= 0:
+                continue
+            _bx = int(_M["m10"] / _M["m00"])
+            _by = int(_M["m01"] / _M["m00"])
+            _nearest = min(range(9),
+                           key=lambda i: (_bx - _slot_cxy[i][0]) ** 2
+                                       + (_by - _slot_cxy[i][1]) ** 2)
+            _grid_fo_slots.add(_nearest)
 
         results = []
 
@@ -2421,20 +2472,29 @@ class InspectionEngine:
 
             # ── Empty slot ────────────────────────────────────────
             if not letter:
-                if cell_cnts:
-                    cell_area  = max(ch * cw, 1)
-                    main_area  = cv2.contourArea(cell_cnts[0])
-                    area_ratio = main_area / cell_area
+                cell_area = max(ch * cw, 1)
 
-                    # Stage 1: large blob detected before suppression.
-                    # _suppress_large_blobs would erase this, so check first.
-                    # Slot 4 / 8 mold-mark exception handled in a later pass.
-                    if area_ratio >= ANOMALY_MIN_AREA_RATIO \
-                            and not InspectionEngine._is_laser_mark(cell_canvas):
+                # Run suppression once; used by both checks below.
+                filt_cnts, filt_canvas, _, _ = \
+                    InspectionEngine._suppress_large_blobs(cell_bin, mold_size)
+                filt_area = cv2.contourArea(filt_cnts[0]) if filt_cnts else 0.0
+
+                if cell_cnts:
+                    raw_area   = cv2.contourArea(cell_cnts[0])
+                    raw_ratio  = raw_area / cell_area
+                    surv_ratio = filt_area / max(raw_area, 1.0)
+
+                    # Large-blob FO: suppression removed most of the primary
+                    # contour area.  Thin bleed-over from adjacent marks
+                    # survives suppression (surv_ratio ≈ 1.0) so it never
+                    # fires here.  Slot 4/8 mold-mark exception added later.
+                    if (raw_ratio  >= ANOMALY_MIN_AREA_RATIO
+                            and surv_ratio < 0.20
+                            and not InspectionEngine._is_laser_mark(cell_canvas)):
                         results.append({
                             "detected":   True,
                             "type":       "foreign_object",
-                            "area_ratio": round(area_ratio, 4),
+                            "area_ratio": round(raw_ratio, 4),
                             "hole_score": 0.0,
                             "extra_map":          None,
                             "missing_map":        None,
@@ -2444,27 +2504,24 @@ class InspectionEngine:
                         })
                         continue
 
-                    # Stage 2: thin mark check after suppression.
-                    filt_cnts, filt_canvas, _, _ = \
-                        InspectionEngine._suppress_large_blobs(cell_bin, mold_size)
-                    if filt_cnts:
-                        filt_area  = cv2.contourArea(filt_cnts[0])
-                        filt_ratio = filt_area / cell_area
-                        if filt_ratio >= ANOMALY_MIN_AREA_RATIO:
-                            is_mark = InspectionEngine._is_laser_mark(filt_canvas)
-                            results.append({
-                                "detected":   True,
-                                "type":       "unexpected_mark" if is_mark
-                                              else "foreign_object",
-                                "area_ratio": round(filt_ratio, 4),
-                                "hole_score": 0.0,
-                                "extra_map":          None,
-                                "missing_map":        None,
-                                "others_center_norm": None,
-                                "canvas":     filt_canvas,
-                                "contours":   filt_cnts,
-                            })
-                            continue
+                # Thin-mark check on suppressed binary (original path).
+                if filt_cnts:
+                    filt_ratio = filt_area / cell_area
+                    if filt_ratio >= ANOMALY_MIN_AREA_RATIO:
+                        is_mark = InspectionEngine._is_laser_mark(filt_canvas)
+                        results.append({
+                            "detected":   True,
+                            "type":       "unexpected_mark" if is_mark
+                                          else "foreign_object",
+                            "area_ratio": round(filt_ratio, 4),
+                            "hole_score": 0.0,
+                            "extra_map":          None,
+                            "missing_map":        None,
+                            "others_center_norm": None,
+                            "canvas":     filt_canvas,
+                            "contours":   filt_cnts,
+                        })
+                        continue
                 results.append(dict(_none))
                 continue
 
@@ -2497,6 +2554,24 @@ class InspectionEngine:
                 tmpl.get("canvas"), ch, cw,
                 tmpl_canvas_aligned=tmpl.get("canvas_aligned"))
 
+            # Outside-contour pixel check: catches FO blobs that lie outside
+            # the character boundary — invisible to both the pixel diff and
+            # the secondary-contour checks (which can fail quality filters).
+            if not dirty["detected"]:
+                _outside_bin  = cv2.bitwise_and(cell_bin, cv2.bitwise_not(_cmask))
+                outside_ratio = int(cv2.countNonZero(_outside_bin)) / max(ch * cw, 1)
+                if outside_ratio >= DIRTY_EXTRA_RATIO_MAX:
+                    dirty = {
+                        "detected":           True,
+                        "type":               "foreign_object",
+                        "extra_ratio":        round(outside_ratio, 4),
+                        "missing_ratio":      0.0,
+                        "area_ratio":         round(outside_ratio, 4),
+                        "extra_map":          None,
+                        "missing_map":        None,
+                        "others_center_norm": None,
+                    }
+
             # Hole check — uses original gray for retry path
             cell_gray = image_gray[gy1 + y1: gy1 + y2, gx1 + x1: gx1 + x2]
             hole_score, cell_holes, cell_canvas, cell_cnts = self._check_holes(
@@ -2526,6 +2601,22 @@ class InspectionEngine:
                 "canvas":     cell_canvas,
                 "contours":   cell_cnts,
             })
+
+        # ── Post-loop: apply grid-level anomaly detections ────────
+        _fo_base = {
+            "detected":           True,
+            "type":               "foreign_object",
+            "area_ratio":         round(ANOMALY_MIN_AREA_RATIO, 4),
+            "hole_score":         1.0,
+            "extra_map":          None,
+            "missing_map":        None,
+            "others_center_norm": None,
+            "canvas":             None,
+            "contours":           [],
+        }
+        for _si in _grid_fo_slots:
+            if _si < len(results) and not results[_si]["detected"]:
+                results[_si] = dict(_fo_base)
 
         return results
 
@@ -3698,10 +3789,18 @@ class InspectionController:
                 if _u not in tmpl_map:
                     tmpl_map[_u] = self.cache.get(_u)
 
+        # Mold boundary — cell ROIs must not bleed into adjacent frames.
+        mold_x1 = max(0,  acx - mold_w // 2)
+        mold_x2 = min(iw, acx + mold_w // 2)
+        mold_y1 = max(0,  acy - mold_h // 2)
+        mold_y2 = min(ih, acy + mold_h // 2)
+
         defect_map = self._eng._defect_scan_mold(
             image_gray,
             grid_cx, grid_cy, cell_w, cell_h, roi_w, roi_h,
-            iw, ih, grid_letters, tmpl_map, mold_size)
+            iw, ih, grid_letters, tmpl_map, mold_size,
+            mold_x1=mold_x1, mold_y1=mold_y1,
+            mold_x2=mold_x2, mold_y2=mold_y2)
 
         # ── Per-slot: P1 identity + merge with P2 ────────────────
         for slot_idx, letter in enumerate(grid_letters):
@@ -3715,10 +3814,10 @@ class InspectionController:
             cell_cx = grid_cx + dx
             cell_cy = grid_cy + dy
 
-            lx1 = max(0,  cell_cx - roi_w // 2)
-            ly1 = max(0,  cell_cy - roi_h // 2)
-            lx2 = min(iw, lx1 + roi_w)
-            ly2 = min(ih, ly1 + roi_h)
+            lx1 = max(mold_x1, cell_cx - roi_w // 2)
+            ly1 = max(mold_y1, cell_cy - roi_h // 2)
+            lx2 = min(mold_x2, lx1 + roi_w)
+            ly2 = min(mold_y2, ly1 + roi_h)
 
             if lx2 <= lx1 or ly2 <= ly1:
                 continue
@@ -3787,14 +3886,14 @@ class InspectionController:
             if not id_res["present"]:
                 failures.append((1, "missing_mark"))
             else:
-                if id_res["shift_ratio"] > FONT_SHIFT_RATIO_MAX:
-                    failures.append((3,
-                        f"shift ratio={id_res['shift_ratio']:.3f}"
-                        f" > {FONT_SHIFT_RATIO_MAX}"))
                 if defect["detected"]:
                     failures.append((2,
                         f"{defect['type']}"
                         f"(area={defect['area_ratio']:.3f})"))
+                if id_res["shift_ratio"] > FONT_SHIFT_RATIO_MAX:
+                    failures.append((3,
+                        f"shift ratio={id_res['shift_ratio']:.3f}"
+                        f" > {FONT_SHIFT_RATIO_MAX}"))
                 if id_res["char"] != "?" and id_res["char"] != letter:
                     failures.append((5,
                         f"wrong_char(got={id_res['char']},exp={letter})"))
@@ -3802,6 +3901,7 @@ class InspectionController:
                     failures.append((5,
                         f"low_conf={id_res['confidence']:.3f}"
                         f" < {FONT_CONFIDENCE_MIN}"))
+            failures.sort(key=lambda x: x[0])
 
             passed      = len(failures) == 0
             defect_step = failures[0][0] if failures else 0
@@ -3971,7 +4071,8 @@ class RunWorker(QtCore.QThread):
                     ocr_map  = {r["slot"]: r.get("ocr_char", " ") for r in group}
                     ocr_str  = "".join(ocr_map.get(i, " ") for i in range(9))
                     causes   = ";".join(
-                        f"slot{r['slot']}({r['letter']}):{r['reason']}"
+                        f"slot{r['slot']}({r['letter']}):"
+                        f"{'; '.join(r.get('reasons', [r['reason']]))}"
                         for r in group if not r["pass"])
                     mold_ms  = sum(r.get("elapsed_ms", 0.0) for r in group)
                     mold_ll  = any(r.get("last_lot") for r in group)
@@ -4065,7 +4166,7 @@ class RunWorker(QtCore.QThread):
                     if not r["pass"]:
                         fail_causes.append(
                             f"slot{r['slot']}({r['letter']}):"
-                            f"{r['reason']}")
+                            f"{'; '.join(r.get('reasons', [r['reason']]))}")
 
                 cause_str = "  " + "  ".join(fail_causes) if fail_causes else ""
                 self._log(
@@ -4179,7 +4280,7 @@ class RunWorker(QtCore.QThread):
                     if not r["pass"]:
                         fail_causes.append(
                             f"slot{r['slot']}({r['letter']}):"
-                            f"{r['reason']}")
+                            f"{'; '.join(r.get('reasons', [r['reason']]))}")
 
                 cause_str = "  " + "  ".join(fail_causes) if fail_causes else ""
                 self._log(
