@@ -90,7 +90,7 @@ CAMERA_EXPOSURE_US   = 8000     # µs — overridden by RightPanel at runtime
 # ---- Font Inspection Constants (hardcoded, not user-tunable) ----
 FONT_CONFIDENCE_MIN        = 0.80
 FONT_SHIFT_RATIO_MAX       = 0.50
-FONT_ASPECT_TOLERANCE      = 0.25
+FONT_ASPECT_TOLERANCE      = 0.30
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
 
@@ -2358,11 +2358,18 @@ class InspectionEngine:
                           ih:           int,
                           grid_letters: list,
                           tmpl_map:     dict,
-                          mold_size:    int) -> list:
+                          mold_size:    int,
+                          mold_x1:      int = 0,
+                          mold_y1:      int = 0,
+                          mold_x2:      int = 0,
+                          mold_y2:      int = 0) -> list:
         """
         Pipeline 2 — Defect / Anomaly scan.
         Thresholds the full grid region once; per-cell defect checks run on
         crops of that single global binary.  No per-slot re-thresh.
+
+        mold_x1/y1/x2/y2 clip the grid crop to the mold boundary so no
+        cell ROI bleeds into an adjacent frame.
 
         Returns list[9] of dicts:
           detected, type, area_ratio, hole_score, canvas, contours
@@ -2373,13 +2380,19 @@ class InspectionEngine:
             "canvas": None, "contours": [],
         }
 
-        # ── 1. Crop whole grid region from original image ─────────
+        # Fall back to full image when caller does not supply mold bounds.
+        if mold_x2 <= mold_x1:
+            mold_x1, mold_x2 = 0, iw
+        if mold_y2 <= mold_y1:
+            mold_y1, mold_y2 = 0, ih
+
+        # ── 1. Crop whole grid region, clipped to mold boundary ───
         half_gw = (roi_w * 3) // 2
         half_gh = (roi_h * 3) // 2
-        gx1 = max(0,  grid_cx - half_gw)
-        gy1 = max(0,  grid_cy - half_gh)
-        gx2 = min(iw, grid_cx + half_gw)
-        gy2 = min(ih, grid_cy + half_gh)
+        gx1 = max(mold_x1, grid_cx - half_gw)
+        gy1 = max(mold_y1, grid_cy - half_gh)
+        gx2 = min(mold_x2, grid_cx + half_gw)
+        gy2 = min(mold_y2, grid_cy + half_gh)
 
         if gx2 <= gx1 or gy2 <= gy1:
             return [dict(_none) for _ in range(9)]
@@ -2421,24 +2434,56 @@ class InspectionEngine:
 
             # ── Empty slot ────────────────────────────────────────
             if not letter:
+                cell_area = max(ch * cw, 1)
+
+                # Suppression runs once; result used by both checks.
+                filt_cnts, filt_canvas, _, _ = \
+                    InspectionEngine._suppress_large_blobs(cell_bin, mold_size)
+                filt_area = cv2.contourArea(filt_cnts[0]) if filt_cnts else 0.0
+
                 if cell_cnts:
-                    filt_cnts, filt_canvas, _, _ = \
-                        InspectionEngine._suppress_large_blobs(cell_bin, mold_size)
-                    if filt_cnts:
-                        main_area  = cv2.contourArea(filt_cnts[0])
-                        area_ratio = main_area / max(ch * cw, 1)
-                        if area_ratio >= ANOMALY_MIN_AREA_RATIO:
-                            is_mark = InspectionEngine._is_laser_mark(filt_canvas)
-                            results.append({
-                                "detected":   True,
-                                "type":       "unexpected_mark" if is_mark
-                                              else "foreign_object",
-                                "area_ratio": round(area_ratio, 4),
-                                "hole_score": 0.0,
-                                "canvas":     filt_canvas,
-                                "contours":   filt_cnts,
-                            })
-                            continue
+                    raw_area   = cv2.contourArea(cell_cnts[0])
+                    raw_ratio  = raw_area / cell_area
+                    surv_ratio = filt_area / max(raw_area, 1.0)
+
+                    # Large-blob FO: suppression removed most of the primary
+                    # contour area.  Thin bleed-over from adjacent marks
+                    # survives suppression (surv_ratio ≈ 1.0) so it never
+                    # fires here.  Slot 4/8 mold-mark exception added later.
+                    if (raw_ratio  >= ANOMALY_MIN_AREA_RATIO
+                            and surv_ratio < 0.20
+                            and not InspectionEngine._is_laser_mark(cell_canvas)):
+                        results.append({
+                            "detected":   True,
+                            "type":       "foreign_object",
+                            "area_ratio": round(raw_ratio, 4),
+                            "hole_score": 0.0,
+                            "extra_map":          None,
+                            "missing_map":        None,
+                            "others_center_norm": None,
+                            "canvas":     cell_canvas,
+                            "contours":   cell_cnts,
+                        })
+                        continue
+
+                # Thin-mark check on suppressed binary (original path).
+                if filt_cnts:
+                    filt_ratio = filt_area / cell_area
+                    if filt_ratio >= ANOMALY_MIN_AREA_RATIO:
+                        is_mark = InspectionEngine._is_laser_mark(filt_canvas)
+                        results.append({
+                            "detected":   True,
+                            "type":       "unexpected_mark" if is_mark
+                                          else "foreign_object",
+                            "area_ratio": round(filt_ratio, 4),
+                            "hole_score": 0.0,
+                            "extra_map":          None,
+                            "missing_map":        None,
+                            "others_center_norm": None,
+                            "canvas":     filt_canvas,
+                            "contours":   filt_cnts,
+                        })
+                        continue
                 results.append(dict(_none))
                 continue
 
@@ -3664,6 +3709,12 @@ class InspectionController:
             ResultAnnotator.draw_drop_label(display, acx, acy, mold_w, mold_h, ic_id=ic_id)
             return results
 
+        # ── Mold boundary — cell ROIs must not cross into adjacent frames
+        mold_x1 = max(0,  acx - mold_w // 2)
+        mold_x2 = min(iw, acx + mold_w // 2)
+        mold_y1 = max(0,  acy - mold_h // 2)
+        mold_y2 = min(ih, acy + mold_h // 2)
+
         # ── P2: defect scan — one pass over the whole mold grid ─────
         tmpl_map = {}
         for _l in grid_letters:
@@ -3675,7 +3726,9 @@ class InspectionController:
         defect_map = self._eng._defect_scan_mold(
             image_gray,
             grid_cx, grid_cy, cell_w, cell_h, roi_w, roi_h,
-            iw, ih, grid_letters, tmpl_map, mold_size)
+            iw, ih, grid_letters, tmpl_map, mold_size,
+            mold_x1=mold_x1, mold_y1=mold_y1,
+            mold_x2=mold_x2, mold_y2=mold_y2)
 
         # ── Per-slot: P1 identity + merge with P2 ────────────────
         for slot_idx, letter in enumerate(grid_letters):
@@ -3689,10 +3742,10 @@ class InspectionController:
             cell_cx = grid_cx + dx
             cell_cy = grid_cy + dy
 
-            lx1 = max(0,  cell_cx - roi_w // 2)
-            ly1 = max(0,  cell_cy - roi_h // 2)
-            lx2 = min(iw, lx1 + roi_w)
-            ly2 = min(ih, ly1 + roi_h)
+            lx1 = max(mold_x1, cell_cx - roi_w // 2)
+            ly1 = max(mold_y1, cell_cy - roi_h // 2)
+            lx2 = min(mold_x2, lx1 + roi_w)
+            ly2 = min(mold_y2, ly1 + roi_h)
 
             if lx2 <= lx1 or ly2 <= ly1:
                 continue
