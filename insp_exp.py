@@ -244,7 +244,6 @@ class SettingsManager:
 
     def _apply_statics(self):
         """Push static section values into module-level globals."""
-        global FONT_CONFIDENCE_MIN, FONT_SHIFT_RATIO_MAX
         global FONT_HOLE_COUNT_TOLERANCE, FONT_HOLE_AREA_TOLERANCE
         global LAST_LOT_CHIP_FRAME_COLS, MIN_TOPHAT_SIGNAL, PIN_EDGE_RATIO
         s = self._static
@@ -329,11 +328,7 @@ class SettingsManager:
                     d = self._data[hdr]
                     d["min"]   = float(entry["min"]) if is_float else int(entry["min"])
                     d["max"]   = float(entry["max"]) if is_float else int(entry["max"])
-                    try:
-                        val = float(entry["value"])
-                    except Exception:
-                        print(f"[Settings] Invalid value for {hdr}, using default")
-                        continue
+                    val        = float(entry["value"])
                     clamped    = max(d["min"], min(d["max"], val))
                     d["value"] = float(clamped) if is_float else int(round(clamped))
 
