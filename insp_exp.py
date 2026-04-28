@@ -88,7 +88,7 @@ CAMERA_WARMUP_FRAMES = 5
 CAMERA_EXPOSURE_US   = 8000     # µs — overridden by RightPanel at runtime
 
 # ---- Font Inspection Constants (hardcoded, not user-tunable) ----
-FONT_CONFIDENCE_MIN        = 0.60
+FONT_CONFIDENCE_MIN        = 0.80
 FONT_SHIFT_RATIO_MAX       = 0.50
 FONT_ASPECT_TOLERANCE      = 0.25
 FONT_HOLE_COUNT_TOLERANCE  = 1
@@ -172,7 +172,7 @@ SETTINGS_FILE = "inspection_settings.txt"   # legacy — migrated to Setup.json 
 # Static constants loaded from Setup.json ["static"] section.
 # Values here are only the in-code fallback; Setup.json overrides them at runtime.
 _SETUP_STATIC_DEFAULTS = {
-    "font_confidence_min":        0.60,
+    "font_confidence_min":        0.80,
     "font_shift_ratio_max":       0.50,
     "font_aspect_tolerance":      0.25,
     "font_hole_count_tolerance":  1,
@@ -2483,15 +2483,19 @@ class InspectionEngine:
                     "type":       "hole_mismatch",
                     "area_ratio": 0.0,
                     "hole_score": float(hole_score),
+                    # pixel maps absent for hole fail; draw_letter uses canvas diff
+                    "extra_map":          None,
+                    "missing_map":        None,
+                    "others_center_norm": None,
                     "canvas":     cell_canvas,
                     "contours":   cell_cnts,
                 })
                 continue
 
+            # Spread full _check_dirty output so draw_letter gets extra_map,
+            # missing_map, others_center_norm for circle annotation.
             results.append({
-                "detected":   dirty["detected"],
-                "type":       dirty["type"],
-                "area_ratio": dirty["area_ratio"],
+                **dirty,
                 "hole_score": round(hole_score, 4),
                 "canvas":     cell_canvas,
                 "contours":   cell_cnts,
@@ -2945,7 +2949,7 @@ class ResultAnnotator:
                     drew = True
                 return drew
 
-            # Step 2 — dirty pixel region
+            # Dirty pixel region circles
             if d_type == "foreign_object":
                 extra_map = dirty_info.get("extra_map")
                 if extra_map is not None and np.any(extra_map):
@@ -2959,14 +2963,14 @@ class ResultAnnotator:
                         cv2.circle(display, (cx, cy), r, (0, 0, 255), 2)
             elif d_type == "missing_stroke":
                 _circle_from_map(dirty_info.get("missing_map"))
-
-            # Step 4 — hole fill/loss: circle over canvas diff region
-            if 4 in defect_steps and roi_canvas is not None and tmpl_canvas is not None:
-                tc   = InspectionEngine._centre_align(tmpl_canvas)
-                rc   = InspectionEngine._centre_align(roi_canvas)
-                diff = cv2.subtract(rc, tc)
-                if np.any(diff):
-                    _circle_from_map(diff)
+            elif d_type == "hole_mismatch":
+                # Canvas diff between template and ROI shows hole position
+                if roi_canvas is not None and tmpl_canvas is not None:
+                    tc   = InspectionEngine._centre_align(tmpl_canvas)
+                    rc   = InspectionEngine._centre_align(roi_canvas)
+                    diff = cv2.subtract(tc, rc)   # template holes absent in ROI
+                    if np.any(diff):
+                        _circle_from_map(diff)
 
         # ── Extracted edges — threshold contours in pass/fail color ──
         if roi_thresh is not None and roi_thresh.size > 0 and cell_w > 0 and cell_h > 0:
@@ -3765,6 +3769,9 @@ class InspectionController:
                     failures.append((2,
                         f"{defect['type']}"
                         f"(area={defect['area_ratio']:.3f})"))
+                if id_res["char"] != "?" and id_res["char"] != letter:
+                    failures.append((5,
+                        f"wrong_char(got={id_res['char']},exp={letter})"))
                 if id_res["confidence"] < FONT_CONFIDENCE_MIN:
                     failures.append((5,
                         f"low_conf={id_res['confidence']:.3f}"
@@ -3774,11 +3781,11 @@ class InspectionController:
             defect_step = failures[0][0] if failures else 0
             reasons     = [r for _, r in failures] if failures else ["OK"]
 
-            dirty_info = {
-                "detected":   defect["detected"],
-                "type":       defect["type"],
-                "area_ratio": defect["area_ratio"],
-            }
+            # Full dirty dict from P2 — preserves extra_map/missing_map/
+            # others_center_norm so draw_letter can place defect circles.
+            # Strip non-dirty P2 fields (canvas, contours, hole_score).
+            dirty_info = {k: v for k, v in defect.items()
+                          if k not in ("canvas", "contours", "hole_score")}
 
             results.append({
                 "frame_idx":    f_idx + 1,
@@ -3802,6 +3809,7 @@ class InspectionController:
                 "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
                 "roi_canvas":   id_res["canvas"],
                 "roi_thresh":   id_res["thresh"],
+                "tmpl_canvas":  tmpl.get("canvas"),
                 "orig_roi_w":   slot_gray.shape[1],
                 "orig_roi_h":   slot_gray.shape[0],
                 "dirty":        dirty_info,
