@@ -3881,6 +3881,33 @@ class InspectionController:
                 ocr_templates = self._ocr_templates)
             elapsed_ms = (time.perf_counter() - t0) * 1000
 
+            # ── Raw-thresh outside check ──────────────────────────
+            # P2 uses a quality-filtered contour set — blobs that fail
+            # SOLIDITY or EXTENT filters are invisible to dirty checks even
+            # if they are real features in the raw Otsu binary.  Check the
+            # raw thresh directly against the P1 contour fill so such blobs
+            # raise a defect before the failure collection below.
+            if not defect["detected"] and id_res["present"]:
+                _p1_thresh = id_res["thresh"]
+                _h_r, _w_r = _p1_thresh.shape[:2]
+                _cmask_r   = np.zeros((_h_r, _w_r), dtype=np.uint8)
+                cv2.drawContours(
+                    _cmask_r, [id_res["contours"][0]], -1, 255, cv2.FILLED)
+                _out_raw   = cv2.bitwise_and(
+                    _p1_thresh, cv2.bitwise_not(_cmask_r))
+                _raw_ratio = int(cv2.countNonZero(_out_raw)) / max(_h_r * _w_r, 1)
+                if _raw_ratio >= DIRTY_EXTRA_RATIO_MAX / 4:   # 0.05
+                    defect = {
+                        "detected":           True,
+                        "type":               "foreign_object",
+                        "extra_ratio":        round(_raw_ratio, 4),
+                        "missing_ratio":      0.0,
+                        "area_ratio":         round(_raw_ratio, 4),
+                        "extra_map":          None,
+                        "missing_map":        None,
+                        "others_center_norm": None,
+                    }
+
             # ── Collect failures from P1 + P2 ────────────────────
             failures = []
             if not id_res["present"]:
