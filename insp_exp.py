@@ -2511,10 +2511,28 @@ class InspectionEngine:
             cv2.drawContours(_cmask, [cell_outer], -1, 255, cv2.FILLED)
             cell_masked = cv2.bitwise_and(cell_bin, _cmask)
 
+            # Outside-contour pixel ratio: catches FO blobs that lie outside
+            # the character boundary and would be invisible to both the pixel
+            # diff and the secondary-contour checks in _check_dirty.
+            _outside_bin  = cv2.bitwise_and(cell_bin, cv2.bitwise_not(_cmask))
+            outside_ratio = int(cv2.countNonZero(_outside_bin)) / max(ch * cw, 1)
+
             dirty = InspectionEngine._check_dirty(
                 cell_others, cell_masked,
                 tmpl.get("canvas"), ch, cw,
                 tmpl_canvas_aligned=tmpl.get("canvas_aligned"))
+
+            if not dirty["detected"] and outside_ratio >= DIRTY_EXTRA_RATIO_MAX:
+                dirty = {
+                    "detected":           True,
+                    "type":               "foreign_object",
+                    "extra_ratio":        round(outside_ratio, 4),
+                    "missing_ratio":      0.0,
+                    "area_ratio":         round(outside_ratio, 4),
+                    "extra_map":          None,
+                    "missing_map":        None,
+                    "others_center_norm": None,
+                }
 
             # Hole check — uses original gray for retry path
             cell_gray = image_gray[gy1 + y1: gy1 + y2, gx1 + x1: gx1 + x2]
