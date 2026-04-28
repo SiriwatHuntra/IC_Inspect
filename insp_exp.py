@@ -90,7 +90,6 @@ CAMERA_EXPOSURE_US   = 8000     # µs — overridden by RightPanel at runtime
 # ---- Font Inspection Constants (hardcoded, not user-tunable) ----
 FONT_CONFIDENCE_MIN        = 0.70
 FONT_SHIFT_RATIO_MAX       = 0.50
-FONT_ASPECT_TOLERANCE      = 0.25
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
 
@@ -174,7 +173,6 @@ SETTINGS_FILE = "inspection_settings.txt"   # legacy — migrated to Setup.json 
 _SETUP_STATIC_DEFAULTS = {
     "font_confidence_min":        0.80,
     "font_shift_ratio_max":       0.50,
-    "font_aspect_tolerance":      0.25,
     "font_hole_count_tolerance":  1,
     "font_hole_area_tolerance":   0.30,
     "last_lot_chip_frame_cols":   1,
@@ -186,7 +184,6 @@ _SETUP_STATIC_DEFAULTS = {
 # (header, default, min, max, is_float)
 _SETTINGS_DEFAULTS = [
     ("pin_score_threshold",  0.75,  0.50,  1.00,  True ),
-    ("max_matches",             6,     1,    12,  False),
     ("camera_exposure_us",   8000,   100, 100000,  False),
     ("grid_scale",            0.85,  0.50,  1.20,  True ),
     ("grid_x_frac",           0.00, -0.30,  0.30,  True ),
@@ -247,13 +244,11 @@ class SettingsManager:
 
     def _apply_statics(self):
         """Push static section values into module-level globals."""
-        global FONT_CONFIDENCE_MIN, FONT_SHIFT_RATIO_MAX, FONT_ASPECT_TOLERANCE
         global FONT_HOLE_COUNT_TOLERANCE, FONT_HOLE_AREA_TOLERANCE
         global LAST_LOT_CHIP_FRAME_COLS, MIN_TOPHAT_SIGNAL, PIN_EDGE_RATIO
         s = self._static
         FONT_CONFIDENCE_MIN        = float(s.get("font_confidence_min",        FONT_CONFIDENCE_MIN))
         FONT_SHIFT_RATIO_MAX       = float(s.get("font_shift_ratio_max",       FONT_SHIFT_RATIO_MAX))
-        FONT_ASPECT_TOLERANCE      = float(s.get("font_aspect_tolerance",      FONT_ASPECT_TOLERANCE))
         FONT_HOLE_COUNT_TOLERANCE  = int(  s.get("font_hole_count_tolerance",  FONT_HOLE_COUNT_TOLERANCE))
         FONT_HOLE_AREA_TOLERANCE   = float(s.get("font_hole_area_tolerance",   FONT_HOLE_AREA_TOLERANCE))
         LAST_LOT_CHIP_FRAME_COLS   = int(  s.get("last_lot_chip_frame_cols",   LAST_LOT_CHIP_FRAME_COLS))
