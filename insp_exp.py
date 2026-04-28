@@ -2403,6 +2403,47 @@ class InspectionEngine:
         grid_thresh = ContourTemplate._thresh_font(grid_crop, mold_size)
         grid_clean  = ContourTemplate._morph_font(grid_thresh, use_close=False)
 
+        # ── 2b. Grid-level anomaly scan ───────────────────────────
+        # Build expected_mask: tight cell_w×cell_h box for every letter slot.
+        # Anything binary-white outside these boxes is an anomaly regardless
+        # of contour shape, quality filters, or slot boundary position.
+        _gw, _gh   = gx2 - gx1, gy2 - gy1
+        _exp_mask  = np.zeros((_gh, _gw), dtype=np.uint8)
+        _slot_cxy  = []   # (cx, cy) in grid-crop space for each slot
+        _cell_ref  = max(cell_w * cell_h, 1)
+
+        for _si in range(9):
+            _letter = (grid_letters[_si].upper()
+                       if _si < len(grid_letters) and grid_letters[_si] else "")
+            _row = _si // 3;  _col = _si % 3
+            _cx  = (grid_cx + (_col - 1) * cell_w) - gx1
+            _cy  = (grid_cy + (_row - 1) * cell_h) - gy1
+            _slot_cxy.append((_cx, _cy))
+            if _letter:
+                _x1 = max(0, _cx - cell_w // 2)
+                _y1 = max(0, _cy - cell_h // 2)
+                _x2 = min(_gw, _cx + cell_w // 2)
+                _y2 = min(_gh, _cy + cell_h // 2)
+                _exp_mask[_y1:_y2, _x1:_x2] = 255
+
+        _anom_bin  = cv2.bitwise_and(grid_clean, cv2.bitwise_not(_exp_mask))
+        _anom_cnts, _ = cv2.findContours(
+            _anom_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        _grid_fo_slots: set = set()
+        for _cnt in _anom_cnts:
+            if cv2.contourArea(_cnt) / _cell_ref < ANOMALY_MIN_AREA_RATIO:
+                continue
+            _M = cv2.moments(_cnt)
+            if _M["m00"] <= 0:
+                continue
+            _bx = int(_M["m10"] / _M["m00"])
+            _by = int(_M["m01"] / _M["m00"])
+            _nearest = min(range(9),
+                           key=lambda i: (_bx - _slot_cxy[i][0]) ** 2
+                                       + (_by - _slot_cxy[i][1]) ** 2)
+            _grid_fo_slots.add(_nearest)
+
         results = []
 
         for slot_idx in range(9):
@@ -2563,6 +2604,25 @@ class InspectionEngine:
                 "canvas":     cell_canvas,
                 "contours":   cell_cnts,
             })
+
+        # ── Post-loop: apply grid-level anomaly detections ────────
+        # If the grid scan found a FO near a slot that per-slot checks
+        # missed (e.g. failed quality filters, spanned slot boundary,
+        # sat outside the contour mask), flag it now.
+        _fo_base = {
+            "detected":           True,
+            "type":               "foreign_object",
+            "area_ratio":         round(ANOMALY_MIN_AREA_RATIO, 4),
+            "hole_score":         1.0,
+            "extra_map":          None,
+            "missing_map":        None,
+            "others_center_norm": None,
+            "canvas":             None,
+            "contours":           [],
+        }
+        for _si in _grid_fo_slots:
+            if _si < len(results) and not results[_si]["detected"]:
+                results[_si] = dict(_fo_base)
 
         return results
 
