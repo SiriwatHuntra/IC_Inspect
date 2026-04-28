@@ -2422,19 +2422,45 @@ class InspectionEngine:
             # ── Empty slot ────────────────────────────────────────
             if not letter:
                 if cell_cnts:
+                    cell_area  = max(ch * cw, 1)
+                    main_area  = cv2.contourArea(cell_cnts[0])
+                    area_ratio = main_area / cell_area
+
+                    # Stage 1: large blob detected before suppression.
+                    # _suppress_large_blobs would erase this, so check first.
+                    # Slot 4 / 8 mold-mark exception handled in a later pass.
+                    if area_ratio >= ANOMALY_MIN_AREA_RATIO \
+                            and not InspectionEngine._is_laser_mark(cell_canvas):
+                        results.append({
+                            "detected":   True,
+                            "type":       "foreign_object",
+                            "area_ratio": round(area_ratio, 4),
+                            "hole_score": 0.0,
+                            "extra_map":          None,
+                            "missing_map":        None,
+                            "others_center_norm": None,
+                            "canvas":     cell_canvas,
+                            "contours":   cell_cnts,
+                        })
+                        continue
+
+                    # Stage 2: thin mark check after suppression.
                     filt_cnts, filt_canvas, _, _ = \
                         InspectionEngine._suppress_large_blobs(cell_bin, mold_size)
                     if filt_cnts:
-                        main_area  = cv2.contourArea(filt_cnts[0])
-                        area_ratio = main_area / max(ch * cw, 1)
-                        if area_ratio >= ANOMALY_MIN_AREA_RATIO:
+                        filt_area  = cv2.contourArea(filt_cnts[0])
+                        filt_ratio = filt_area / cell_area
+                        if filt_ratio >= ANOMALY_MIN_AREA_RATIO:
                             is_mark = InspectionEngine._is_laser_mark(filt_canvas)
                             results.append({
                                 "detected":   True,
                                 "type":       "unexpected_mark" if is_mark
                                               else "foreign_object",
-                                "area_ratio": round(area_ratio, 4),
+                                "area_ratio": round(filt_ratio, 4),
                                 "hole_score": 0.0,
+                                "extra_map":          None,
+                                "missing_map":        None,
+                                "others_center_norm": None,
                                 "canvas":     filt_canvas,
                                 "contours":   filt_cnts,
                             })
