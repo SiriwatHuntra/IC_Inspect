@@ -68,78 +68,39 @@ class InspectionResult:
 # CONFIG
 # =========================================================
 DEBUG_MODE     = True
-PIN_ROI_W          = 120       # fixed capture size in image-space px
-PIN_ROI_H          = 150
-PIN_SOBEL_MAG      = 40        # minimum Sobel Y magnitude counted as a strong edge
-PIN_EDGE_RATIO     = 0.150      # fraction of inner-ROI pixels that must be strong edges
-PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in result map
-PIN_IOU_THR     = 0.50   # NMS overlap threshold
+PIN_SOBEL_MAG      = 40        # Sobel Y threshold for lead-edge detection
+PIN_EDGE_RATIO     = 0.150     # min edge-pixel fraction in lead ROI
+PIN_TM_STRIDE      = 4         # coarse TM grid step (px)
+PIN_IOU_THR        = 0.50      # NMS overlap threshold
 
 MIN_CONTOUR_AREA     = 1
-MIN_CONTOUR_SOLIDITY = 0.35   # convex-hull fill ratio; rough surface noise < 0.35; serif I ≈ 0.40
-MIN_CONTOUR_EXTENT   = 0.20   # area / bounding-rect; sparse blobs fail this
-MIN_CONTOUR_REL_AREA = 0.003  # fraction of ROI area; rejects sub-0.3% specks
+MIN_CONTOUR_SOLIDITY = 0.35   # < 0.35 → noise; serif I ≈ 0.40
+MIN_CONTOUR_EXTENT   = 0.20   # area / bbox; sparse blobs fail
+MIN_CONTOUR_REL_AREA = 0.003  # sub-0.3% of ROI → speck
 IMAGE_SOURCE_DIR  = "image_source/"
 OUTPUT_DIR        = "Inspection_result"
 
-# Camera
 CAMERA_SERIAL        = "22202392"
 CAMERA_WARMUP_FRAMES = 5
-CAMERA_EXPOSURE_US   = 8000     # µs — overridden by RightPanel at runtime
+CAMERA_EXPOSURE_US   = 8000   # µs — overridden by RightPanel
 
-# ---- Font Inspection Constants (hardcoded, not user-tunable) ----
 FONT_CONFIDENCE_MIN        = 0.70
 FONT_SHIFT_RATIO_MAX       = 0.50
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
-
-# ---- Last-lot detection ----
-# Number of leading frame-columns (by X position) that must contain chips.
-# Trailing columns must have frames detected but no chip contours.
 LAST_LOT_CHIP_FRAME_COLS   = 1
+MIN_TOPHAT_SIGNAL          = 20  # empty slot top-hat peak < 20 → skip Otsu
 
-# ---- Empty-slot guard (Otsu false-contour suppression) ----
-# Minimum peak value in the white top-hat image required before Otsu runs.
-# An empty (black) slot produces a near-zero top-hat; Otsu on that signal
-# picks threshold ~2–5 and turns camera noise into false contours.
-# Real laser marks produce top-hat peak >> 30.  Tune down if faint marks are
-# missed; tune up if empty slots still produce false contours.
-MIN_TOPHAT_SIGNAL          = 20
+# P2 defect thresholds — normalised against canvas_area (letter pixels, not cell)
+DIRTY_EXTRA_RATIO_MAX     = 0.15  # extra  > 15% → foreign object
+DIRTY_MISSING_RATIO_MAX   = 0.25  # missing > 25% → broken stroke
 
-# ---- Reflection / False-mark Filter (empty slots only) ----
-# Laser marks are thin strokes; IC surface reflections are blobs.
-# Both checks must pass for a contour to be reported as unexpected mark.
-MARK_MAX_FILL_RATIO       = 0.65  # non_zero / bbox_area  — blobs fill > 65%
-MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 18%
-
-# ---- Dirty / Anomaly Detection ----
-ANOMALY_MIN_AREA_RATIO    = 0.30  # secondary contour / roi_area — below → noise, ignore
-DIRTY_EXTRA_RATIO_MAX     = 0.20  # extra pixels / union  > 20%  → foreign object / splatter
-DIRTY_MISSING_RATIO_MAX   = 0.40  # missing pixels / union > 40% → severe stroke loss
-# Dilation applied to both aligned canvases before computing extra/missing ratios.
-# Tolerates laser position drift (~2 px on 64 px canvas) without hiding real defects:
-#   mousebite  ≥ 5 px  → still caught (missing area > tolerance band)
-#   closing fill > 2 px → still caught as extra pixels inside hole
-#   shorting             → caught by secondary-contour check (unaffected by dilation)
-DIRTY_CANVAS_DILATE_PX    = 2
-
-# ---- HOG descriptor (shared: template load + runtime OCR) ----
-# win 64×64 → 7×7 block positions × 4 cells × 9 bins = 1764-dim vector
+# HOG: 64×64 win, 16×16 block, 8×8 stride, 8×8 cell, 9 bins → 1764-dim
 _HOG_WIN  = (64, 64)
 _HOG_DESC = cv2.HOGDescriptor(_HOG_WIN, (16, 16), (8, 8), (8, 8), 9)
 
 def _compute_hog(canvas: np.ndarray) -> np.ndarray:
-    """
-    L2-normalised HOG vector from a binary canvas.
-
-    Crops to the contour bounding box (+ 4px padding) before resizing,
-    so the HOG window is filled with stroke signal regardless of the
-    slot ROI size the canvas came from.  Makes HOG slot-size-invariant.
-
-    Input : uint8 binary ndarray (any size).
-    Output: float32 ndarray shape (1764,), L2-normalised.
-            All-zero vector when canvas is empty or has no non-zero pixels.
-    """
+    """L2-normalised 1764-dim HOG vector; zero vector when canvas is empty."""
     if canvas is None or canvas.size == 0:
         return np.zeros(1764, dtype=np.float32)
     pts = cv2.findNonZero(canvas)
@@ -171,13 +132,15 @@ SETTINGS_FILE = "inspection_settings.txt"   # legacy — migrated to Setup.json 
 # Static constants loaded from Setup.json ["static"] section.
 # Values here are only the in-code fallback; Setup.json overrides them at runtime.
 _SETUP_STATIC_DEFAULTS = {
-    "font_confidence_min":        0.80,
+    "font_confidence_min":        0.70,
     "font_shift_ratio_max":       0.50,
     "font_hole_count_tolerance":  1,
     "font_hole_area_tolerance":   0.30,
     "last_lot_chip_frame_cols":   1,
     "min_tophat_signal":          20,
     "pin_edge_ratio":             0.150,
+    "dirty_extra_ratio_max":      0.15,
+    "dirty_missing_ratio_max":    0.25,
 }
 
 # User-tunable setup values — stored in Setup.json ["setup"] section.
@@ -239,13 +202,13 @@ class SettingsManager:
 
     # ---- static access ---------------------------------------------------
 
-    def get_static(self, key: str, default=None):
-        return self._static.get(key, default)
+    #     return self._static.get(key, default)
 
     def _apply_statics(self):
         """Push static section values into module-level globals."""
         global FONT_HOLE_COUNT_TOLERANCE, FONT_HOLE_AREA_TOLERANCE
         global LAST_LOT_CHIP_FRAME_COLS, MIN_TOPHAT_SIGNAL, PIN_EDGE_RATIO
+        global DIRTY_EXTRA_RATIO_MAX, DIRTY_MISSING_RATIO_MAX
         s = self._static
         FONT_CONFIDENCE_MIN        = float(s.get("font_confidence_min",        FONT_CONFIDENCE_MIN))
         FONT_SHIFT_RATIO_MAX       = float(s.get("font_shift_ratio_max",       FONT_SHIFT_RATIO_MAX))
@@ -254,6 +217,8 @@ class SettingsManager:
         LAST_LOT_CHIP_FRAME_COLS   = int(  s.get("last_lot_chip_frame_cols",   LAST_LOT_CHIP_FRAME_COLS))
         MIN_TOPHAT_SIGNAL          = int(  s.get("min_tophat_signal",          MIN_TOPHAT_SIGNAL))
         PIN_EDGE_RATIO             = float(s.get("pin_edge_ratio",             PIN_EDGE_RATIO))
+        DIRTY_EXTRA_RATIO_MAX      = float(s.get("dirty_extra_ratio_max",      DIRTY_EXTRA_RATIO_MAX))
+        DIRTY_MISSING_RATIO_MAX    = float(s.get("dirty_missing_ratio_max",    DIRTY_MISSING_RATIO_MAX))
 
     # ---- setup (numeric) access ------------------------------------------
 
@@ -699,44 +664,6 @@ class ContourTemplate:
         _, binary = cv2.threshold(
             blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return binary
-
-    @staticmethod
-    def _hysteresis(tophat:     np.ndarray,
-                    high_ratio: float = 0.60,
-                    low_ratio:  float = 0.25) -> np.ndarray:
-        """
-        Two-threshold hysteresis on the top-hat image.
-
-        Otsu is used to find a stable high anchor automatically — no manual
-        tuning required.  The low threshold extends downward from there.
-
-        high_val = otsu_val * high_ratio  →  definite stroke pixels
-        low_val  = otsu_val * low_ratio   →  candidate pixels
-
-        A candidate pixel is kept only if it belongs to a connected
-        component that contains at least one definite pixel.
-        Isolated dim noise (no strong neighbour) is discarded.
-
-        high_ratio : 0.60  — fraction of Otsu value for "definite" gate
-        low_ratio  : 0.25  — fraction of Otsu value for "candidate" gate
-        """
-        otsu_val, _ = cv2.threshold(
-            tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        high_val  = max(1, int(otsu_val * high_ratio))
-        low_val   = max(1, int(otsu_val * low_ratio))
-
-        definite  = (tophat >= high_val).astype(np.uint8) * 255
-        candidate = (tophat >= low_val ).astype(np.uint8) * 255
-
-        n, labels = cv2.connectedComponents(candidate, connectivity=8)
-
-        result = np.zeros_like(candidate)
-        for i in range(1, n):
-            comp = labels == i
-            if np.any(definite[comp]):
-                result[comp] = 255
-        return result
 
     @staticmethod
     def _thresh_font(gray: np.ndarray, mold_size: int = 150) -> np.ndarray:
@@ -1373,25 +1300,6 @@ class InspectionEngine:
         return contours, canvas, clean_binary, others
 
     @staticmethod
-    def _suppress_large_blobs(clean_binary: np.ndarray, mold_size: int) -> tuple:
-        """
-        Empty-slot reflection suppressor: binary white top-hat with a large kernel.
-
-        TOPHAT(binary, k) = binary - OPEN(binary, k).
-        Structures narrower than k survive (OPEN erases them → TOPHAT = binary).
-        Large blobs wider than k are suppressed (OPEN ≈ blob → TOPHAT ≈ 0).
-
-        Keeps thin laser strokes while removing wide specular reflection blobs.
-        Returns (main_list, canvas, filtered_binary, others).
-        """
-        h, w = clean_binary.shape[:2]
-        k = max(13, mold_size // 6)   # ~25px at mold=150; adjust up if marks still survive
-        kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        filtered = cv2.morphologyEx(clean_binary, cv2.MORPH_TOPHAT, kernel)
-        main_list, others, canvas = ContourTemplate._find_contours_all(filtered, h, w)
-        return main_list, canvas, filtered, others
-
-    @staticmethod
     def _check_shift(contours:  list,
                      tmpl:      dict,
                      exp_dx:    int,
@@ -1527,23 +1435,6 @@ class InspectionEngine:
         union        = np.count_nonzero(cv2.bitwise_or(rc, tc))
         return round(float(intersection / max(union, 1)), 4)
     
-    @staticmethod
-    def _check_aspect(contours:    list,
-                      tmpl_aspect: float) -> tuple:
-        """
-        Step 6 — Aspect ratio.
-        Bounding-box aspect ratio vs template — catches horizontal / vertical distortion.
-
-        Input : contours (from _check_presence), tmpl_aspect (from template dict)
-        Output: (roi_aspect: float, aspect_diff: float)
-                aspect_diff is fractional deviation from tmpl_aspect.
-        """
-        all_pts        = np.vstack([c.reshape(-1, 2) for c in contours])
-        _, _, bw, bh = cv2.boundingRect(all_pts)
-        roi_aspect     = round(bw / max(bh, 1), 4)
-        aspect_diff    = abs(roi_aspect - tmpl_aspect) / max(tmpl_aspect, 1e-6)
-        return roi_aspect, aspect_diff
-
     @staticmethod
     def _hog_cosine(q_hog: np.ndarray, tmpl_hog: np.ndarray) -> float:
         """
@@ -1887,50 +1778,6 @@ class InspectionEngine:
 
         return round(float(np.clip(score, 0.0, 1.0)), 4)
 
-    @staticmethod
-    def _is_laser_mark(canvas: np.ndarray) -> bool:
-        """
-        Return True if canvas looks like a genuine thin-stroke laser mark.
-        Return False if it resembles an IC surface reflection (blob).
-
-        Used only for EMPTY slot unexpected-mark detection — prevents
-        medium-area specular reflections from being reported as marks.
-
-        Two checks (both must pass):
-          1. Fill ratio  — laser strokes fill < MARK_MAX_FILL_RATIO of bbox
-          2. Stroke thinness — max inscribed circle radius / slot size
-                               < MARK_MAX_THICKNESS_RATIO
-
-        A ring-shaped reflection passes check 1 (ring ≈ low fill) but
-        fails check 2 (ring wall is thicker than a laser stroke).
-        A solid blob fails check 1 immediately.
-        """
-        if canvas is None:
-            return False
-        white = int(cv2.countNonZero(canvas))
-        if white == 0:
-            return False
-
-        pts = cv2.findNonZero(canvas)
-        if pts is None:
-            return False
-        _, _, bw, bh = cv2.boundingRect(pts)
-        if bw == 0 or bh == 0:
-            return False
-
-        # Check 1: fill ratio
-        fill_ratio = white / max(bw * bh, 1)
-        if fill_ratio > MARK_MAX_FILL_RATIO:
-            return False
-
-        # Check 2: stroke thinness via distance transform
-        dist      = cv2.distanceTransform(canvas, cv2.DIST_L2, 3)
-        slot_size = float(max(canvas.shape[0], canvas.shape[1]))
-        if dist.max() / max(slot_size, 1.0) > MARK_MAX_THICKNESS_RATIO:
-            return False
-
-        return True
-
     def _check_holes(self,
                     gray:             np.ndarray,
                     roi_outer:        np.ndarray,
@@ -1994,120 +1841,6 @@ class InspectionEngine:
             return -1.0, roi_holes, canvas, contours
 
         return score2, new_holes, new_canvas, new_contours
-
-    @staticmethod
-    def ocr_identify(canvas:        np.ndarray,
-                     contours:      list,
-                     expected_char: str,
-                     all_templates: dict) -> tuple:
-        """
-        OCR identification using the same multi-descriptor scorer as compare_roi.
-
-        Query features pre-computed once — reused across all template comparisons.
-        Skeleton descriptors omitted (ximgproc absent); weights redistributed to
-        HOG, filled IoU, contour signal, and polygon approx.
-
-        Effective weights (skeleton absent):
-          HOG     0.40   filled IoU  0.25   signal  0.20   approx  0.15
-
-        Three-stage search:
-
-        Stage 1 — Expected char fast path
-            Score expected template directly.
-            If score >= OCR_CONF_EXPECTED (0.88) return immediately.
-
-        Stage 2 — Group search (fallback)
-            Alpha / numeric groups ordered by expected char type.
-            Skip next group only when best already exceeds exp_conf.
-
-        Returns (char: str, conf: float).
-        Returns ("?", conf) if nothing clears OCR_MIN_CONF (0.55).
-        """
-        if not all_templates or canvas is None:
-            return "?", 0.0
-
-        # ── Pre-compute query features once ───────────────────────
-        outer    = contours[0] if contours else None
-        q_hog    = _compute_hog(canvas)
-        q_signal = InspectionEngine._resample_contour_signal(outer) \
-                   if outer is not None else None
-        q_approx = InspectionEngine._approx_features(outer) \
-                   if outer is not None else None
-
-        def _score(tmpl: dict) -> float:
-            hog    = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
-            filled = InspectionEngine._check_similarity(
-                canvas, tmpl.get("canvas"), tmpl.get("canvas_aligned"))
-            signal = InspectionEngine._contour_signal_sim(q_signal,
-                                                          tmpl.get("contour_signal"))
-            approx = InspectionEngine._approx_score(q_approx,
-                                                    tmpl.get("approx_feat"))
-            return hog * 0.40 + filled * 0.25 + signal * 0.20 + approx * 0.15
-
-        # ── Empty slot: flat scan, no group ordering ───────────────
-        if not expected_char:
-            best_char   = "?"
-            best_conf   = 0.0
-            second_conf = 0.0
-            for name, tmpl in all_templates.items():
-                score = _score(tmpl)
-                if score > best_conf:
-                    second_conf = best_conf
-                    best_conf   = score
-                    best_char   = name
-                elif score > second_conf:
-                    second_conf = score
-            if best_conf < OCR_MIN_CONF:
-                return "?", round(best_conf, 4)
-            if best_conf - second_conf < OCR_CONF_GAP_MIN:
-                return "?", round(best_conf, 4)
-            return best_char, round(best_conf, 4)
-
-        # ── Stage 1: expected char fast path ──────────────────────
-        exp_conf = 0.0
-        exp_tmpl = all_templates.get(expected_char)
-        if exp_tmpl is not None:
-            exp_conf = _score(exp_tmpl)
-
-        if exp_conf >= OCR_CONF_EXPECTED:
-            return expected_char, round(exp_conf, 4)
-
-        # ── Stage 2: group search — seeded with expected char ──────
-        # Same-type group runs first (alpha→alpha, num→num).
-        # Each group is fully scored before deciding whether to continue.
-        # Skip remaining groups only when a template already beat exp_conf —
-        # a different-type match can never be more reliable than same-type.
-        best_char   = expected_char if exp_conf >= OCR_MIN_CONF else "?"
-        best_conf   = exp_conf
-        second_conf = 0.0
-
-        alpha_group   = {k: v for k, v in all_templates.items()
-                         if k.isalpha() and k != expected_char}
-        numeric_group = {k: v for k, v in all_templates.items()
-                         if not k.isalpha() and k != expected_char}
-
-        groups = [alpha_group, numeric_group] if expected_char.isalpha() \
-                 else [numeric_group, alpha_group]
-
-        for group in groups:
-            for name, tmpl in group.items():
-                score = _score(tmpl)
-                if score > best_conf:
-                    second_conf = best_conf
-                    best_conf   = score
-                    best_char   = name
-                elif score > second_conf:
-                    second_conf = score
-            # Full group scored — only skip next group if a winner beat exp_conf
-            if best_conf > exp_conf:
-                break
-
-        if best_conf < OCR_MIN_CONF:
-            return "?", round(best_conf, 4)
-        if best_char != expected_char and best_conf - second_conf < OCR_CONF_GAP_MIN:
-            return "?", round(best_conf, 4)
-
-        return best_char, round(best_conf, 4)
 
     def find_all_pin_templates(self,
                            image_bgr:   np.ndarray,
@@ -2186,56 +1919,6 @@ class InspectionEngine:
 
         return kept
 
-    @staticmethod
-    def _identify_slot(slot_gray:     np.ndarray,
-                       tmpl:          dict,
-                       expected_char: str,
-                       exp_dx:        int,
-                       exp_dy:        int,
-                       mold_cx:       int,
-                       mold_cy:       int,
-                       mold_size:     int,
-                       ocr_templates: dict) -> dict:
-        """
-        Pipeline 1 — OCR / Identity.
-        Image access ends after _thresh_font; all remaining ops are contour/canvas domain.
-
-        Returns dict:
-          present, char, ocr_conf, confidence,
-          shift_px, shift_ratio, contours, canvas, thresh, others
-        """
-        thresh = ContourTemplate._thresh_font(slot_gray, mold_size)
-        contours, canvas, _, others = ContourTemplate.extract_font_template(
-            slot_gray, mold_size=mold_size, thresh=thresh, use_close=False)
-
-        roi_h, roi_w = slot_gray.shape[:2]
-
-        if not contours:
-            return {
-                "present":    False,
-                "char":       "?",    "ocr_conf":    0.0,
-                "confidence": 0.0,
-                "shift_px":   0.0,    "shift_ratio": 0.0,
-                "contours":   [],     "canvas":      canvas,
-                "thresh":     thresh, "others":      others,
-            }
-
-        shift_px, shift_ratio = InspectionEngine._check_shift(
-            contours, tmpl, exp_dx, exp_dy, mold_cx, mold_cy, roi_w, roi_h)
-
-        confidence = InspectionEngine._compute_shape_score(canvas, contours, tmpl)
-
-        char, ocr_conf = InspectionEngine.ocr_identify(
-            canvas, contours, expected_char, ocr_templates)
-
-        return {
-            "present":    True,
-            "char":       char,         "ocr_conf":    round(ocr_conf, 4),
-            "confidence": confidence,
-            "shift_px":   shift_px,     "shift_ratio": shift_ratio,
-            "contours":   contours,     "canvas":      canvas,
-            "thresh":     thresh,       "others":      others,
-        }
 
     @staticmethod
     def _check_dirty(others:               list,
@@ -2290,16 +1973,10 @@ class InspectionEngine:
 
             union_area = max(int(np.count_nonzero(cv2.bitwise_or(rc, tc))), 1)
 
-            # Dilate both canvases to absorb laser position drift before diff.
-            # union_area stays on raw canvases so ratio scale is consistent.
-            if DIRTY_CANVAS_DILATE_PX > 0:
-                _dk = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE,
-                    (DIRTY_CANVAS_DILATE_PX * 2 + 1, DIRTY_CANVAS_DILATE_PX * 2 + 1))
-                rc_cmp = cv2.dilate(rc, _dk)
-                tc_cmp = cv2.dilate(tc, _dk)
-            else:
-                rc_cmp, tc_cmp = rc, tc
+            # 2px dilation absorbs laser position drift without hiding real defects
+            _dk    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            rc_cmp = cv2.dilate(rc, _dk)
+            tc_cmp = cv2.dilate(tc, _dk)
 
             extra   = cv2.subtract(rc, tc_cmp)   # pixels in ROI outside dilated template
             missing = cv2.subtract(tc, rc_cmp)   # template pixels not covered by dilated ROI
@@ -2313,7 +1990,7 @@ class InspectionEngine:
         others_center_norm = None   # (nx, ny) of largest qualifying secondary contour
         for c in others:
             r = cv2.contourArea(c) / roi_area
-            if r >= ANOMALY_MIN_AREA_RATIO and r > others_max_ratio:
+            if r >= 0.30 and r > others_max_ratio:
                 others_max_ratio = r
                 M = cv2.moments(c)
                 if M["m00"] > 0:
@@ -2323,7 +2000,7 @@ class InspectionEngine:
 
         # ── Decision ─────────────────────────────────────────────────
         dirty_type = "none"
-        if extra_ratio > DIRTY_EXTRA_RATIO_MAX or others_max_ratio >= ANOMALY_MIN_AREA_RATIO:
+        if extra_ratio > DIRTY_EXTRA_RATIO_MAX or others_max_ratio >= 0.30:
             dirty_type = "foreign_object"
         elif missing_ratio > DIRTY_MISSING_RATIO_MAX:
             dirty_type = "missing_stroke"
@@ -2341,238 +2018,79 @@ class InspectionEngine:
             "others_center_norm": others_center_norm,
         }
 
-    def _defect_scan_mold(self,
-                          image_gray:   np.ndarray,
-                          grid_cx:      int,
-                          grid_cy:      int,
-                          cell_w:       int,
-                          cell_h:       int,
-                          roi_w:        int,
-                          roi_h:        int,
-                          iw:           int,
-                          ih:           int,
-                          grid_letters: list,
-                          tmpl_map:     dict,
-                          mold_size:    int,
-                          mold_x1:      int = 0,
-                          mold_y1:      int = 0,
-                          mold_x2:      int = 0,
-                          mold_y2:      int = 0) -> list:
+    # =========================================================
+    # P1  — Presence · Shape score · Shift
+    # =========================================================
+
+    @staticmethod
+    def _identify_slot(contours:   list,
+                       canvas:     np.ndarray,
+                       tmpl:       dict,
+                       exp_dx:     int,
+                       exp_dy:     int,
+                       mold_cx:    int,
+                       mold_cy:    int,
+                       roi_h:      int,
+                       roi_w:      int) -> dict:
         """
-        Pipeline 2 — Defect / Anomaly scan.
-        Thresholds the full grid region once; per-cell defect checks run on
-        crops of that single global binary.  No per-slot re-thresh.
-
-        Returns list[9] of dicts:
-          detected, type, area_ratio, hole_score, canvas, contours
+        Input : contours + canvas from extract_font_template(use_close=False).
+        Output: present, confidence, shift_px, shift_ratio
         """
-        _none = {
-            "detected": False, "type": "none",
-            "area_ratio": 0.0, "hole_score": 1.0,
-            "canvas": None, "contours": [],
+        if not contours:
+            return {"present": False, "confidence": 0.0,
+                    "shift_px": 0.0, "shift_ratio": 0.0}
+
+        confidence = InspectionEngine._compute_shape_score(canvas, contours, tmpl)
+        shift_px, shift_ratio = InspectionEngine._check_shift(
+            contours, tmpl, exp_dx, exp_dy, mold_cx, mold_cy, roi_w, roi_h)
+
+        return {"present":     True,
+                "confidence":  confidence,
+                "shift_px":    shift_px,
+                "shift_ratio": shift_ratio}
+
+    # =========================================================
+    # P2  — Defect check (clean vs canvas diff)
+    # =========================================================
+
+    @staticmethod
+    def _defect_scan_slot(canvas: np.ndarray, clean: np.ndarray) -> dict:
+        """
+        Input : canvas (main contour fill) and clean (full morphed binary),
+                both from extract_font_template(use_close=False) on the same slot.
+        Steps:
+          1. temp   = canvas - clean   → missing strokes (filled but no actual pixels)
+          2. diff   = clean  - canvas  → extra material  (actual pixels outside fill)
+          3. merged = temp | diff      → all difference pixels
+          4. morph open (3×3)          → wipe single-pixel noise
+        Ratios are normalised against canvas_area (letter size, not cell size).
+        """
+        _k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+        temp   = cv2.subtract(canvas, clean)           # 1 — missing
+        diff   = cv2.subtract(clean,  canvas)           # 2 — extra
+        merged = cv2.bitwise_or(temp, diff)             # 3 — all diff
+        merged = cv2.morphologyEx(merged, cv2.MORPH_OPEN, _k)   # 4 — wipe noise
+
+        canvas_area   = max(cv2.countNonZero(canvas), 1)
+        missing_ratio = round(cv2.countNonZero(cv2.bitwise_and(temp, merged)) / canvas_area, 4)
+        extra_ratio   = round(cv2.countNonZero(cv2.bitwise_and(diff, merged)) / canvas_area, 4)
+
+        if extra_ratio > DIRTY_EXTRA_RATIO_MAX:
+            defect_type = "foreign_object"
+        elif missing_ratio > DIRTY_MISSING_RATIO_MAX:
+            defect_type = "missing_stroke"
+        else:
+            defect_type = "none"
+
+        return {
+            "detected":      defect_type != "none",
+            "type":          defect_type,
+            "extra_ratio":   extra_ratio,
+            "missing_ratio": missing_ratio,
+            "area_ratio":    round(max(extra_ratio, missing_ratio), 4),
+            "merged_map":    merged,
         }
-
-        # ── 1. Crop whole grid region from original image ─────────
-        half_gw = (roi_w * 3) // 2
-        half_gh = (roi_h * 3) // 2
-        gx1 = max(mold_x1, grid_cx - half_gw)
-        gy1 = max(mold_y1, grid_cy - half_gh)
-        gx2 = min(mold_x2, grid_cx + half_gw)
-        gy2 = min(mold_y2, grid_cy + half_gh)
-
-        if gx2 <= gx1 or gy2 <= gy1:
-            return [dict(_none) for _ in range(9)]
-
-        grid_crop = image_gray[gy1:gy2, gx1:gx2]
-
-        # ── 2. Single thresh + morph for whole grid ───────────────
-        grid_thresh = ContourTemplate._thresh_font(grid_crop, mold_size)
-        grid_clean  = ContourTemplate._morph_font(grid_thresh, use_close=False)
-
-        results = []
-
-        for slot_idx in range(9):
-            letter = (grid_letters[slot_idx].upper()
-                      if slot_idx < len(grid_letters) and grid_letters[slot_idx]
-                      else "")
-
-            row = slot_idx // 3
-            col = slot_idx  % 3
-
-            # Cell centre in crop space
-            cx = (grid_cx + (col - 1) * cell_w) - gx1
-            cy = (grid_cy + (row - 1) * cell_h) - gy1
-
-            x1 = max(0,          cx - roi_w // 2)
-            y1 = max(0,          cy - roi_h // 2)
-            x2 = min(gx2 - gx1, cx + roi_w // 2)
-            y2 = min(gy2 - gy1, cy + roi_h // 2)
-
-            if x2 <= x1 or y2 <= y1:
-                results.append(dict(_none))
-                continue
-
-            cell_bin = grid_clean[y1:y2, x1:x2]
-            ch, cw   = cell_bin.shape[:2]
-
-            cell_cnts, cell_others, cell_canvas = \
-                ContourTemplate._find_contours_all(cell_bin, ch, cw)
-
-            # ── Empty slot ────────────────────────────────────────
-            if not letter:
-                cell_area = max(ch * cw, 1)
-
-                # Run suppression once; used by both checks below.
-                filt_cnts, filt_canvas, _, _ = \
-                    InspectionEngine._suppress_large_blobs(cell_bin, mold_size)
-                filt_area = cv2.contourArea(filt_cnts[0]) if filt_cnts else 0.0
-
-                if cell_cnts:
-                    raw_area   = cv2.contourArea(cell_cnts[0])
-                    raw_ratio  = raw_area / cell_area
-                    surv_ratio = filt_area / max(raw_area, 1.0)
-
-                    # Large-blob FO: suppression removed most of the primary
-                    # contour area.  Thin bleed-over from adjacent marks
-                    # survives suppression (surv_ratio ≈ 1.0) so it never
-                    # fires here.  Slot 4/8 mold-mark exception added later.
-                    if (raw_ratio  >= ANOMALY_MIN_AREA_RATIO
-                            and surv_ratio < 0.20
-                            and not InspectionEngine._is_laser_mark(cell_canvas)):
-                        results.append({
-                            "detected":   True,
-                            "type":       "foreign_object",
-                            "area_ratio": round(raw_ratio, 4),
-                            "hole_score": 0.0,
-                            "extra_map":          None,
-                            "missing_map":        None,
-                            "others_center_norm": None,
-                            "canvas":     cell_canvas,
-                            "contours":   cell_cnts,
-                        })
-                        continue
-
-                # Thin-mark check on suppressed binary (original path).
-                if filt_cnts:
-                    filt_ratio = filt_area / cell_area
-                    if filt_ratio >= ANOMALY_MIN_AREA_RATIO:
-                        is_mark = InspectionEngine._is_laser_mark(filt_canvas)
-                        results.append({
-                            "detected":   True,
-                            "type":       "unexpected_mark" if is_mark
-                                          else "foreign_object",
-                            "area_ratio": round(filt_ratio, 4),
-                            "hole_score": 0.0,
-                            "extra_map":          None,
-                            "missing_map":        None,
-                            "others_center_norm": None,
-                            "canvas":     filt_canvas,
-                            "contours":   filt_cnts,
-                        })
-                        continue
-                results.append(dict(_none))
-                continue
-
-            # ── Letter slot ───────────────────────────────────────
-            tmpl = tmpl_map.get(letter)
-            if not cell_cnts or tmpl is None:
-                results.append(dict(_none))
-                continue
-
-            tmpl_contours    = tmpl.get("contours", [])
-            tmpl_holes       = tmpl_contours[1:] if len(tmpl_contours) > 1 else []
-            tmpl_hole_count  = len(tmpl_holes)
-            tmpl_outer_area  = (tmpl.get("tmpl_outer_area")
-                                or (cv2.contourArea(tmpl_contours[0])
-                                    if tmpl_contours else 1))
-            tmpl_hole_ratios = (tmpl.get("tmpl_hole_ratios")
-                                or [cv2.contourArea(h) / max(tmpl_outer_area, 1)
-                                    for h in tmpl_holes])
-
-            cell_outer = cell_cnts[0]
-            cell_holes = cell_cnts[1:]
-
-            # Contour-masked binary for dirty check (preserves defect gaps)
-            _cmask = np.zeros_like(cell_bin)
-            cv2.drawContours(_cmask, [cell_outer], -1, 255, cv2.FILLED)
-            cell_masked = cv2.bitwise_and(cell_bin, _cmask)
-
-            # Outside-contour pixel ratio: catches FO blobs that lie outside
-            # the character boundary and would be invisible to both the pixel
-            # diff and the secondary-contour checks in _check_dirty.
-            _outside_bin  = cv2.bitwise_and(cell_bin, cv2.bitwise_not(_cmask))
-            outside_ratio = int(cv2.countNonZero(_outside_bin)) / max(ch * cw, 1)
-
-            dirty = InspectionEngine._check_dirty(
-                cell_others, cell_masked,
-                tmpl.get("canvas"), ch, cw,
-                tmpl_canvas_aligned=tmpl.get("canvas_aligned"))
-
-            # Outside-contour pixel check: catches FO blobs that lie outside
-            # the character boundary — invisible to both the pixel diff and
-            # the secondary-contour checks (which can fail quality filters).
-            if not dirty["detected"]:
-                _outside_bin  = cv2.bitwise_and(cell_bin, cv2.bitwise_not(_cmask))
-                outside_ratio = int(cv2.countNonZero(_outside_bin)) / max(ch * cw, 1)
-                if outside_ratio >= DIRTY_EXTRA_RATIO_MAX:
-                    dirty = {
-                        "detected":           True,
-                        "type":               "foreign_object",
-                        "extra_ratio":        round(outside_ratio, 4),
-                        "missing_ratio":      0.0,
-                        "area_ratio":         round(outside_ratio, 4),
-                        "extra_map":          None,
-                        "missing_map":        None,
-                        "others_center_norm": None,
-                    }
-
-            # Hole check — uses original gray for retry path
-            cell_gray = image_gray[gy1 + y1: gy1 + y2, gx1 + x1: gx1 + x2]
-            hole_score, cell_holes, cell_canvas, cell_cnts = self._check_holes(
-                cell_gray, cell_outer, cell_holes, cell_canvas, cell_cnts,
-                tmpl_hole_count, tmpl_hole_ratios, mold_size)
-
-            if hole_score < 0:
-                results.append({
-                    "detected":   True,
-                    "type":       "hole_mismatch",
-                    "area_ratio": 0.0,
-                    "hole_score": float(hole_score),
-                    # pixel maps absent for hole fail; draw_letter uses canvas diff
-                    "extra_map":          None,
-                    "missing_map":        None,
-                    "others_center_norm": None,
-                    "canvas":     cell_canvas,
-                    "contours":   cell_cnts,
-                })
-                continue
-
-            # Spread full _check_dirty output so draw_letter gets extra_map,
-            # missing_map, others_center_norm for circle annotation.
-            results.append({
-                **dirty,
-                "hole_score": round(hole_score, 4),
-                "canvas":     cell_canvas,
-                "contours":   cell_cnts,
-            })
-
-        # ── Post-loop: apply grid-level anomaly detections ────────
-        _fo_base = {
-            "detected":           True,
-            "type":               "foreign_object",
-            "area_ratio":         round(ANOMALY_MIN_AREA_RATIO, 4),
-            "hole_score":         1.0,
-            "extra_map":          None,
-            "missing_map":        None,
-            "others_center_norm": None,
-            "canvas":             None,
-            "contours":           [],
-        }
-        for _si in _grid_fo_slots:
-            if _si < len(results) and not results[_si]["detected"]:
-                results[_si] = dict(_fo_base)
-
-        return results
 
     # =========================================================
     # COMPARE ROI  — orchestrates the pipeline
@@ -2829,45 +2347,45 @@ class ResultAnnotator:
         
 
     # ---- Last-lot flag -----------------------------------------------
-    @staticmethod
-    def draw_last_lot_flag(display:   np.ndarray,
-                           chip_cols: int,
-                           acx:       int,
-                           acy:       int,
-                           aw:        int,
-                           ah:        int):
-        """
-        Draw a prominent amber "LAST LOT" banner on the mold area.
+    # @staticmethod
+    # def draw_last_lot_flag(display:   np.ndarray,
+    #                        chip_cols: int,
+    #                        acx:       int,
+    #                        acy:       int,
+    #                        aw:        int,
+    #                        ah:        int):
+    #     """
+    #     Draw a prominent amber "LAST LOT" banner on the mold area.
 
-        Input : display (BGR ndarray, modified in-place),
-                chip_cols — number of leading columns that have chips (1 or 2),
-                acx/acy — mold centre, aw/ah — mold size.
-        """
-        ih, iw = display.shape[:2]
-        ax1 = max(0,    acx - aw // 2)
-        ay1 = max(0,    acy - ah // 2)
-        ax2 = min(iw-1, ax1 + aw)
-        ay2 = min(ih-1, ay1 + ah)
+    #     Input : display (BGR ndarray, modified in-place),
+    #             chip_cols — number of leading columns that have chips (1 or 2),
+    #             acx/acy — mold centre, aw/ah — mold size.
+    #     """
+    #     ih, iw = display.shape[:2]
+    #     ax1 = max(0,    acx - aw // 2)
+    #     ay1 = max(0,    acy - ah // 2)
+    #     ax2 = min(iw-1, ax1 + aw)
+    #     ay2 = min(ih-1, ay1 + ah)
 
-        # Amber semi-transparent fill over mold area
-        overlay = display.copy()
-        cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (0, 140, 255), cv2.FILLED)
-        cv2.addWeighted(overlay, 0.22, display, 0.78, 0, display)
+    #     # Amber semi-transparent fill over mold area
+    #     overlay = display.copy()
+    #     cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (0, 140, 255), cv2.FILLED)
+    #     cv2.addWeighted(overlay, 0.22, display, 0.78, 0, display)
 
-        # Solid amber border
-        cv2.rectangle(display, (ax1, ay1), (ax2, ay2), (0, 165, 255), 2)
+    #     # Solid amber border
+    #     cv2.rectangle(display, (ax1, ay1), (ax2, ay2), (0, 165, 255), 2)
 
-        # Label centred on mold
-        lbl   = f"LAST LOT ({chip_cols}/3 col)"
-        font  = cv2.FONT_HERSHEY_SIMPLEX
-        fscl  = 0.45
-        thick = 1
-        (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
-        tx = acx - tw // 2
-        ty = acy + th // 2
-        cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
-                      (0, 0, 0), cv2.FILLED)
-        cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 165, 255), thick)
+    #     # Label centred on mold
+    #     lbl   = f"LAST LOT ({chip_cols}/3 col)"
+    #     font  = cv2.FONT_HERSHEY_SIMPLEX
+    #     fscl  = 0.45
+    #     thick = 1
+    #     (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
+    #     tx = acx - tw // 2
+    #     ty = acy + th // 2
+    #     cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
+    #                   (0, 0, 0), cv2.FILLED)
+    #     cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 165, 255), thick)
 
     # ---- Ignored frame (last-lot empty column) ----------------------
     @staticmethod
@@ -2993,7 +2511,6 @@ class ResultAnnotator:
         if not passed and cell_w > 0 and cell_h > 0:
             dirty_info   = result.get("dirty", {})
             d_type       = dirty_info.get("type", "none")
-            defect_steps = result.get("defect_steps", [result.get("defect_step", 0)])
             roi_canvas   = result.get("roi_canvas")
             tmpl_canvas  = result.get("tmpl_canvas")
 
@@ -3020,8 +2537,11 @@ class ResultAnnotator:
                     drew = True
                 return drew
 
-            # Dirty pixel region circles
-            if d_type == "foreign_object":
+            # Dirty pixel region circles — merged_map (P2 morph diff) takes priority
+            merged_map = dirty_info.get("merged_map")
+            if merged_map is not None and np.any(merged_map):
+                _circle_from_map(merged_map)
+            elif d_type == "foreign_object":
                 extra_map = dirty_info.get("extra_map")
                 if extra_map is not None and np.any(extra_map):
                     _circle_from_map(extra_map)
@@ -3289,8 +2809,8 @@ class InspectionController:
             print(f"[Controller] Font '{name}' save error: {e}")
             return False
 
-    def list_fonts(self) -> list:
-        return self._ct.list_templates()
+    # def list_fonts(self) -> list:
+    #     return self._ct.list_templates()
 
         # ---- cache ----
     def load_cache(self, names: list) -> list:
@@ -3735,36 +3255,15 @@ class InspectionController:
             ResultAnnotator.draw_drop_label(display, acx, acy, mold_w, mold_h, ic_id=ic_id)
             return results
 
-        # ── Mold boundary — cell ROIs must not cross into adjacent frames
         mold_x1 = max(0,  acx - mold_w // 2)
         mold_x2 = min(iw, acx + mold_w // 2)
         mold_y1 = max(0,  acy - mold_h // 2)
         mold_y2 = min(ih, acy + mold_h // 2)
 
-        # ── P2: defect scan — one pass over the whole mold grid ─────
-        tmpl_map = {}
-        for _l in grid_letters:
-            if _l:
-                _u = _l.upper()
-                if _u not in tmpl_map:
-                    tmpl_map[_u] = self.cache.get(_u)
-
-        # Mold boundary — cell ROIs must not bleed into adjacent frames.
-        mold_x1 = max(0,  acx - mold_w // 2)
-        mold_x2 = min(iw, acx + mold_w // 2)
-        mold_y1 = max(0,  acy - mold_h // 2)
-        mold_y2 = min(ih, acy + mold_h // 2)
-
-        defect_map = self._eng._defect_scan_mold(
-            image_gray,
-            grid_cx, grid_cy, cell_w, cell_h, roi_w, roi_h,
-            iw, ih, grid_letters, tmpl_map, mold_size,
-            mold_x1=mold_x1, mold_y1=mold_y1,
-            mold_x2=mold_x2, mold_y2=mold_y2)
-
-        # ── Per-slot: P1 identity + merge with P2 ────────────────
         for slot_idx, letter in enumerate(grid_letters):
             letter = letter.upper() if letter else ""
+            if not letter:
+                continue
 
             row = slot_idx // 3
             col = slot_idx  % 3
@@ -3782,111 +3281,45 @@ class InspectionController:
             if lx2 <= lx1 or ly2 <= ly1:
                 continue
 
-            defect = defect_map[slot_idx]
-
-            # ── Empty slot ────────────────────────────────────────
-            if not letter:
-                if defect["detected"]:
-                    ocr_char, ocr_conf = "", 0.0
-                    if defect["type"] == "unexpected_mark":
-                        ocr_char, ocr_conf = self._eng.ocr_identify(
-                            defect["canvas"], defect["contours"],
-                            "", self._ocr_templates)
-                        if ocr_char == "?":
-                            continue
-                    results.append({
-                        "frame_idx":    f_idx + 1,
-                        "mold":         mold_label,
-                        "slot":         slot_idx,
-                        "letter":       "",
-                        "pass":         False,
-                        "confidence":   ocr_conf,
-                        "shift_px":     0.0,
-                        "shift_ratio":  0.0,
-                        "defect_step":  2,
-                        "defect_steps": [2],
-                        "defect_type":  defect["type"],
-                        "reason":       f"{defect['type']}(area={defect['area_ratio']:.3f})",
-                        "reasons":      [f"{defect['type']}(area={defect['area_ratio']:.3f})"],
-                        "ocr_char":     ocr_char,
-                        "ocr_conf":     ocr_conf,
-                        "cell_cx":      cell_cx,
-                        "cell_cy":      cell_cy,
-                        "elapsed_ms":   0.0,
-                        "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
-                        "roi_canvas":   defect["canvas"],
-                        "dirty":        {"detected": True,
-                                         "type":     defect["type"],
-                                         "area_ratio": defect["area_ratio"]},
-                    })
-                    ResultAnnotator.draw_letter(display, results[-1])
-                continue
-
-            # ── Letter slot: P1 identity ──────────────────────────
             tmpl = self.cache.get(letter)
             if tmpl is None:
                 continue
 
             slot_gray = image_gray[ly1:ly2, lx1:lx2]
 
-            t0     = time.perf_counter()
-            id_res = InspectionEngine._identify_slot(
-                slot_gray, tmpl,
-                expected_char = letter,
-                exp_dx        = dx,
-                exp_dy        = dy,
-                mold_cx       = acx,
-                mold_cy       = acy,
-                mold_size     = tmpl.get("mold_size", mold_size),
-                ocr_templates = self._ocr_templates)
+            t0 = time.perf_counter()
+            contours, canvas, clean, _ = ContourTemplate.extract_font_template(
+                slot_gray,
+                mold_size = tmpl.get("mold_size", mold_size),
+                use_close = False)
+
+            p1 = InspectionEngine._identify_slot(
+                contours, canvas, tmpl,
+                dx, dy, acx, acy,
+                slot_gray.shape[0], slot_gray.shape[1])
+
+            p2 = (InspectionEngine._defect_scan_slot(canvas, clean)
+                  if p1["present"]
+                  else {"detected": False, "type": "none",
+                        "extra_ratio": 0.0, "missing_ratio": 0.0, "area_ratio": 0.0})
+
             elapsed_ms = (time.perf_counter() - t0) * 1000
 
-            # ── Raw-thresh outside check ──────────────────────────
-            # P2 uses a quality-filtered contour set — blobs that fail
-            # SOLIDITY or EXTENT filters are invisible to dirty checks even
-            # if they are real features in the raw Otsu binary.  Check the
-            # raw thresh directly against the P1 contour fill so such blobs
-            # raise a defect before the failure collection below.
-            if not defect["detected"] and id_res["present"]:
-                _p1_thresh = id_res["thresh"]
-                _h_r, _w_r = _p1_thresh.shape[:2]
-                _cmask_r   = np.zeros((_h_r, _w_r), dtype=np.uint8)
-                cv2.drawContours(
-                    _cmask_r, [id_res["contours"][0]], -1, 255, cv2.FILLED)
-                _out_raw   = cv2.bitwise_and(
-                    _p1_thresh, cv2.bitwise_not(_cmask_r))
-                _raw_ratio = int(cv2.countNonZero(_out_raw)) / max(_h_r * _w_r, 1)
-                if _raw_ratio >= DIRTY_EXTRA_RATIO_MAX / 4:   # 0.05
-                    defect = {
-                        "detected":           True,
-                        "type":               "foreign_object",
-                        "extra_ratio":        round(_raw_ratio, 4),
-                        "missing_ratio":      0.0,
-                        "area_ratio":         round(_raw_ratio, 4),
-                        "extra_map":          None,
-                        "missing_map":        None,
-                        "others_center_norm": None,
-                    }
-
-            # ── Collect failures from P1 + P2 ────────────────────
+            # ── Collect failures ──────────────────────────────────
             failures = []
-            if not id_res["present"]:
+            if not p1["present"]:
                 failures.append((1, "missing_mark"))
             else:
-                if defect["detected"]:
+                if p2["detected"]:
                     failures.append((2,
-                        f"{defect['type']}"
-                        f"(area={defect['area_ratio']:.3f})"))
-                if id_res["shift_ratio"] > FONT_SHIFT_RATIO_MAX:
+                        f"{p2['type']}(area={p2['area_ratio']:.3f})"))
+                if p1["shift_ratio"] > FONT_SHIFT_RATIO_MAX:
                     failures.append((3,
-                        f"shift ratio={id_res['shift_ratio']:.3f}"
+                        f"shift ratio={p1['shift_ratio']:.3f}"
                         f" > {FONT_SHIFT_RATIO_MAX}"))
-                if id_res["char"] != "?" and id_res["char"] != letter:
-                    failures.append((5,
-                        f"wrong_char(got={id_res['char']},exp={letter})"))
-                if id_res["confidence"] < FONT_CONFIDENCE_MIN:
-                    failures.append((5,
-                        f"low_conf={id_res['confidence']:.3f}"
+                if p1["confidence"] < FONT_CONFIDENCE_MIN:
+                    failures.append((4,
+                        f"low_conf={p1['confidence']:.3f}"
                         f" < {FONT_CONFIDENCE_MIN}"))
             failures.sort(key=lambda x: x[0])
 
@@ -3894,38 +3327,35 @@ class InspectionController:
             defect_step = failures[0][0] if failures else 0
             reasons     = [r for _, r in failures] if failures else ["OK"]
 
-            # Full dirty dict from P2 — preserves extra_map/missing_map/
-            # others_center_norm so draw_letter can place defect circles.
-            # Strip non-dirty P2 fields (canvas, contours, hole_score).
-            dirty_info = {k: v for k, v in defect.items()
-                          if k not in ("canvas", "contours", "hole_score")}
-
             results.append({
                 "frame_idx":    f_idx + 1,
                 "mold":         mold_label,
                 "slot":         slot_idx,
                 "letter":       letter,
                 "pass":         passed,
-                "confidence":   id_res["confidence"],
-                "shift_px":     id_res["shift_px"],
-                "shift_ratio":  id_res["shift_ratio"],
+                "confidence":   p1["confidence"],
+                "shift_px":     p1["shift_px"],
+                "shift_ratio":  p1["shift_ratio"],
                 "defect_step":  defect_step,
                 "defect_steps": [s for s, _ in failures] if failures else [],
-                "defect_type":  defect["type"] if defect["detected"] else "",
+                "defect_type":  p2["type"] if p2["detected"] else "",
                 "reason":       reasons[0],
                 "reasons":      reasons,
-                "ocr_char":     id_res["char"],
-                "ocr_conf":     id_res["ocr_conf"],
+                "ocr_char":     letter,
+                "ocr_conf":     p1["confidence"],
                 "cell_cx":      cell_cx,
                 "cell_cy":      cell_cy,
                 "elapsed_ms":   round(elapsed_ms, 2),
                 "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
-                "roi_canvas":   id_res["canvas"],
-                "roi_thresh":   id_res["thresh"],
-                "tmpl_canvas":  tmpl.get("canvas"),
-                "orig_roi_w":   slot_gray.shape[1],
-                "orig_roi_h":   slot_gray.shape[0],
-                "dirty":        dirty_info,
+                "roi_canvas":   canvas,
+                "dirty": {
+                    "detected":      p2["detected"],
+                    "type":          p2["type"],
+                    "area_ratio":    p2["area_ratio"],
+                    "extra_ratio":   p2["extra_ratio"],
+                    "missing_ratio": p2["missing_ratio"],
+                    "merged_map":    p2.get("merged_map"),
+                },
             })
 
             if DEBUG_MODE:
@@ -3934,15 +3364,10 @@ class InspectionController:
                     f"[SLOT] F{ic_f} s{slot_idx+1}({letter})"
                     f" {'OK  ' if passed else 'FAIL'}"
                     f" step={defect_step}"
-                    f" conf={id_res['confidence']:.3f}"
-                    f" shift={id_res['shift_ratio']:.3f}"
-                    f" dirty={dirty_info['type']}({dirty_info['area_ratio']:.3f})"
-                    f" cnts={len(id_res['contours'])}"
+                    f" conf={p1['confidence']:.3f}"
+                    f" shift={p1['shift_ratio']:.3f}"
+                    f" defect={p2['type']}({p2['area_ratio']:.3f})"
                     f" | {'; '.join(reasons)}")
-                if not passed and defect_step == 1:
-                    pfx = f"debug/FAIL_F{f_idx+1}_{mold_label}_s{slot_idx}_{letter}"
-                    ContourTemplate.extract_font_template(
-                        slot_gray, mold_size=mold_size, debug_prefix=pfx)
 
             ResultAnnotator.draw_letter(display, results[-1])
 
@@ -4371,14 +3796,14 @@ class ImageView(QtWidgets.QLabel):
         self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
         self.update()
 
-    def set_mask_draw_mode(self, on: bool, add: bool = True):
-        self._mask_mode  = on
-        self._mask_add   = add
-        self._draw_mode  = False
-        self._start      = None
-        self._rect       = None
-        self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
-        self.update()
+    # def set_mask_draw_mode(self, on: bool, add: bool = True):
+    #     self._mask_mode  = on
+    #     self._mask_add   = add
+    #     self._draw_mode  = False
+    #     self._start      = None
+    #     self._rect       = None
+    #     self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
+    #     self.update()
 
     def set_stamp_mode(self, on: bool,
                        box_size: int = 45, box_h: int = 0,
@@ -5007,8 +4432,11 @@ class RightPanel(QtWidgets.QWidget):
     def apply_settings(self):
         sm    = self._sm
         pairs = [
-            (self.spin_pin_score, "pin_score_threshold"),
-            (self.spin_exposure,  "camera_exposure_us"),
+            (self.spin_pin_score,    "pin_score_threshold"),
+            (self.spin_exposure,     "camera_exposure_us"),
+            (self.spin_grid_scale,   "grid_scale"),
+            (self.spin_grid_x,       "grid_x_frac"),
+            (self.spin_grid_y,       "grid_y_frac"),
         ]
         for spin, key in pairs:
             spin.blockSignals(True)
@@ -5025,18 +4453,18 @@ class RightPanel(QtWidgets.QWidget):
             cell.setText(val)
             cell.blockSignals(False)
 
-    def pin_search_params(self) -> dict:
-        sm = self._sm
-        return {
-            "score_thr": sm.get("pin_score_threshold"),
-        }
+    # def pin_search_params(self) -> dict:
+    #     sm = self._sm
+    #     return {
+    #         "score_thr": sm.get("pin_score_threshold"),
+    #     }
 
-    def font_list(self, ct: "ContourTemplate") -> list:
-        """
-        Return all template names from the templates/ folder.
-        Auto-detected at run time — no user input required.
-        """
-        return ct.list_templates()
+    # def font_list(self, ct: "ContourTemplate") -> list:
+    #     """
+    #     Return all template names from the templates/ folder.
+    #     Auto-detected at run time — no user input required.
+    #     """
+    #     return ct.list_templates()
 
     def _on_grid_cell_changed(self):
         letters = self.grid_letters()
