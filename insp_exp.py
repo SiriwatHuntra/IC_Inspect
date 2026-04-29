@@ -2893,21 +2893,21 @@ class InspectionController:
                               all_results: list,
                               col_snap: int) -> tuple:
         """
-        Post-inspection last-lot check across all detected frame-columns.
+        Last-frame-fed check.
 
-        Condition (using LAST_LOT_CHIP_FRAME_COLS = N):
-          • Frame-columns 0 … N-1 must have physical chips (any pass/fail).
-          • Frame-columns N … end must have frames detected but NO chip
-            contours (defect_step == 1 on every letter-slot, or no letter-slots).
-          • Total detected frame-columns must be > N.
+        Condition (LAST_LOT_CHIP_FRAME_COLS = N):
+          • Exactly N columns where EVERY active slot qualifies as last-fed:
+              - reason == "dropped", OR
+              - pass == False AND ocr_char in (" ", "?")
+          • Total detected columns > N (at least one other column exists).
+          • Column position is not constrained.
+          • Other columns may contain PASS / normal NG — they stay active.
 
-        Physical chip = letter assigned AND defect_step != 1
-                        AND reason != "dropped".
-
-        Returns (is_last_lot: bool, chip_cols: int, total_cols: int).
+        Those N columns are marked ignored by the caller.
+        Returns (is_last_lot, ll_count, total_cols, fidx_to_col, ll_col_set).
         """
         if not matches:
-            return False, 0, 0
+            return False, 0, 0, {}, set()
 
         from collections import defaultdict
         cg_to_fidx: dict = defaultdict(list)
@@ -2920,7 +2920,7 @@ class InspectionController:
         n_chip    = LAST_LOT_CHIP_FRAME_COLS
 
         if n_cols <= n_chip:
-            return False, 0, n_cols, {}
+            return False, 0, n_cols, {}, set()
 
         # Build reverse map: f_idx → 0-based column index
         fidx_to_col: dict = {}
@@ -2928,28 +2928,36 @@ class InspectionController:
             for fi in cg_to_fidx[cg]:
                 fidx_to_col[fi] = col_i
 
-        # Mark columns that have at least one physically-present chip
-        col_has_chip = [False] * n_cols
+        # Collect active slots per column (letter assigned, contours found incl. dropped)
+        col_slots: dict = {i: [] for i in range(n_cols)}
         for r in all_results:
             fi = r.get("frame_idx", 0) - 1          # frame_idx is 1-based
             if fi not in fidx_to_col:
                 continue
-            if (r.get("letter", "") != ""
-                    and r.get("reason") != "dropped"
-                    and r.get("defect_step", 0) != 1):
-                col_has_chip[fidx_to_col[fi]] = True
+            if r.get("letter", "") != "" and r.get("defect_step", 0) != 1:
+                col_slots[fidx_to_col[fi]].append(r)
 
-        # First n_chip columns must ALL have chips
-        for c in range(n_chip):
-            if not col_has_chip[c]:
-                return False, 0, n_cols, {}
+        # A column is last-fed when it has slots AND every slot is Drop or NG-unreadable
+        ll_col_set: set = set()
+        for col_i in range(n_cols):
+            slots = col_slots[col_i]
+            if not slots:
+                continue
+            all_last_fed = True
+            for r in slots:
+                if r.get("reason") == "dropped":
+                    continue
+                if not r.get("pass", True) and r.get("ocr_char", " ") in (" ", "?"):
+                    continue
+                all_last_fed = False
+                break
+            if all_last_fed:
+                ll_col_set.add(col_i)
 
-        # Remaining columns must ALL be empty (no chip contours)
-        for c in range(n_chip, n_cols):
-            if col_has_chip[c]:
-                return False, 0, n_cols, {}
+        if len(ll_col_set) != n_chip:
+            return False, 0, n_cols, {}, set()
 
-        return True, n_chip, n_cols, fidx_to_col
+        return True, n_chip, n_cols, fidx_to_col, ll_col_set
 
     # ---- inspection pipeline ----
     def run(self,
@@ -3083,7 +3091,7 @@ class InspectionController:
 
         # ── Image-level last-lot check ──
         col_snap = max(1, anchor_tmpl.get("canvas_w", 60) // 2)
-        img_ll, img_chip_cols, img_total_cols, fidx_to_col = \
+        img_ll, img_chip_cols, img_total_cols, fidx_to_col, ll_col_set = \
             self._check_last_lot_image(fake_matches, self.results, col_snap)
 
         if img_ll:
@@ -3091,13 +3099,12 @@ class InspectionController:
                 r["last_lot"]      = True
                 r["last_lot_cols"] = img_chip_cols
                 fi = r.get("frame_idx", 0) - 1
-                if fidx_to_col.get(fi, -1) >= img_chip_cols:
+                if fidx_to_col.get(fi, -1) in ll_col_set:
                     r["ignored"] = True
 
             for f_idx, fentry in enumerate(frame_results):
-                if fidx_to_col.get(f_idx, -1) >= img_chip_cols:
+                if fidx_to_col.get(f_idx, -1) in ll_col_set:
                     anc_cx, anc_cy = fentry["cx"], fentry["cy"]
-                    fw, fh = fentry["fw"], fentry["fh"]
                     ResultAnnotator.draw_ignored_frame(display, anc_cx, anc_cy)
 
             ResultAnnotator.draw_last_lot_image_flag(
