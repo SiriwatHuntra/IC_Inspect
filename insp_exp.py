@@ -706,44 +706,6 @@ class ContourTemplate:
         return binary
 
     @staticmethod
-    def _hysteresis(tophat:     np.ndarray,
-                    high_ratio: float = 0.60,
-                    low_ratio:  float = 0.25) -> np.ndarray:
-        """
-        Two-threshold hysteresis on the top-hat image.
-
-        Otsu is used to find a stable high anchor automatically — no manual
-        tuning required.  The low threshold extends downward from there.
-
-        high_val = otsu_val * high_ratio  →  definite stroke pixels
-        low_val  = otsu_val * low_ratio   →  candidate pixels
-
-        A candidate pixel is kept only if it belongs to a connected
-        component that contains at least one definite pixel.
-        Isolated dim noise (no strong neighbour) is discarded.
-
-        high_ratio : 0.60  — fraction of Otsu value for "definite" gate
-        low_ratio  : 0.25  — fraction of Otsu value for "candidate" gate
-        """
-        otsu_val, _ = cv2.threshold(
-            tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        high_val  = max(1, int(otsu_val * high_ratio))
-        low_val   = max(1, int(otsu_val * low_ratio))
-
-        definite  = (tophat >= high_val).astype(np.uint8) * 255
-        candidate = (tophat >= low_val ).astype(np.uint8) * 255
-
-        n, labels = cv2.connectedComponents(candidate, connectivity=8)
-
-        result = np.zeros_like(candidate)
-        for i in range(1, n):
-            comp = labels == i
-            if np.any(definite[comp]):
-                result[comp] = 255
-        return result
-
-    @staticmethod
     def _thresh_font(gray: np.ndarray, mold_size: int = 150) -> np.ndarray:
         h, w = gray.shape[:2]
 
@@ -1378,25 +1340,6 @@ class InspectionEngine:
         return contours, canvas, clean_binary, others
 
     @staticmethod
-    def _suppress_large_blobs(clean_binary: np.ndarray, mold_size: int) -> tuple:
-        """
-        Empty-slot reflection suppressor: binary white top-hat with a large kernel.
-
-        TOPHAT(binary, k) = binary - OPEN(binary, k).
-        Structures narrower than k survive (OPEN erases them → TOPHAT = binary).
-        Large blobs wider than k are suppressed (OPEN ≈ blob → TOPHAT ≈ 0).
-
-        Keeps thin laser strokes while removing wide specular reflection blobs.
-        Returns (main_list, canvas, filtered_binary, others).
-        """
-        h, w = clean_binary.shape[:2]
-        k = max(13, mold_size // 6)   # ~25px at mold=150; adjust up if marks still survive
-        kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        filtered = cv2.morphologyEx(clean_binary, cv2.MORPH_TOPHAT, kernel)
-        main_list, others, canvas = ContourTemplate._find_contours_all(filtered, h, w)
-        return main_list, canvas, filtered, others
-
-    @staticmethod
     def _check_shift(contours:  list,
                      tmpl:      dict,
                      exp_dx:    int,
@@ -1532,23 +1475,6 @@ class InspectionEngine:
         union        = np.count_nonzero(cv2.bitwise_or(rc, tc))
         return round(float(intersection / max(union, 1)), 4)
     
-    @staticmethod
-    def _check_aspect(contours:    list,
-                      tmpl_aspect: float) -> tuple:
-        """
-        Step 6 — Aspect ratio.
-        Bounding-box aspect ratio vs template — catches horizontal / vertical distortion.
-
-        Input : contours (from _check_presence), tmpl_aspect (from template dict)
-        Output: (roi_aspect: float, aspect_diff: float)
-                aspect_diff is fractional deviation from tmpl_aspect.
-        """
-        all_pts        = np.vstack([c.reshape(-1, 2) for c in contours])
-        _, _, bw, bh = cv2.boundingRect(all_pts)
-        roi_aspect     = round(bw / max(bh, 1), 4)
-        aspect_diff    = abs(roi_aspect - tmpl_aspect) / max(tmpl_aspect, 1e-6)
-        return roi_aspect, aspect_diff
-
     @staticmethod
     def _hog_cosine(q_hog: np.ndarray, tmpl_hog: np.ndarray) -> float:
         """
@@ -1892,50 +1818,6 @@ class InspectionEngine:
 
         return round(float(np.clip(score, 0.0, 1.0)), 4)
 
-    @staticmethod
-    def _is_laser_mark(canvas: np.ndarray) -> bool:
-        """
-        Return True if canvas looks like a genuine thin-stroke laser mark.
-        Return False if it resembles an IC surface reflection (blob).
-
-        Used only for EMPTY slot unexpected-mark detection — prevents
-        medium-area specular reflections from being reported as marks.
-
-        Two checks (both must pass):
-          1. Fill ratio  — laser strokes fill < MARK_MAX_FILL_RATIO of bbox
-          2. Stroke thinness — max inscribed circle radius / slot size
-                               < MARK_MAX_THICKNESS_RATIO
-
-        A ring-shaped reflection passes check 1 (ring ≈ low fill) but
-        fails check 2 (ring wall is thicker than a laser stroke).
-        A solid blob fails check 1 immediately.
-        """
-        if canvas is None:
-            return False
-        white = int(cv2.countNonZero(canvas))
-        if white == 0:
-            return False
-
-        pts = cv2.findNonZero(canvas)
-        if pts is None:
-            return False
-        _, _, bw, bh = cv2.boundingRect(pts)
-        if bw == 0 or bh == 0:
-            return False
-
-        # Check 1: fill ratio
-        fill_ratio = white / max(bw * bh, 1)
-        if fill_ratio > MARK_MAX_FILL_RATIO:
-            return False
-
-        # Check 2: stroke thinness via distance transform
-        dist      = cv2.distanceTransform(canvas, cv2.DIST_L2, 3)
-        slot_size = float(max(canvas.shape[0], canvas.shape[1]))
-        if dist.max() / max(slot_size, 1.0) > MARK_MAX_THICKNESS_RATIO:
-            return False
-
-        return True
-
     def _check_holes(self,
                     gray:             np.ndarray,
                     roi_outer:        np.ndarray,
@@ -1999,120 +1881,6 @@ class InspectionEngine:
             return -1.0, roi_holes, canvas, contours
 
         return score2, new_holes, new_canvas, new_contours
-
-    @staticmethod
-    def ocr_identify(canvas:        np.ndarray,
-                     contours:      list,
-                     expected_char: str,
-                     all_templates: dict) -> tuple:
-        """
-        OCR identification using the same multi-descriptor scorer as compare_roi.
-
-        Query features pre-computed once — reused across all template comparisons.
-        Skeleton descriptors omitted (ximgproc absent); weights redistributed to
-        HOG, filled IoU, contour signal, and polygon approx.
-
-        Effective weights (skeleton absent):
-          HOG     0.40   filled IoU  0.25   signal  0.20   approx  0.15
-
-        Three-stage search:
-
-        Stage 1 — Expected char fast path
-            Score expected template directly.
-            If score >= OCR_CONF_EXPECTED (0.88) return immediately.
-
-        Stage 2 — Group search (fallback)
-            Alpha / numeric groups ordered by expected char type.
-            Skip next group only when best already exceeds exp_conf.
-
-        Returns (char: str, conf: float).
-        Returns ("?", conf) if nothing clears OCR_MIN_CONF (0.55).
-        """
-        if not all_templates or canvas is None:
-            return "?", 0.0
-
-        # ── Pre-compute query features once ───────────────────────
-        outer    = contours[0] if contours else None
-        q_hog    = _compute_hog(canvas)
-        q_signal = InspectionEngine._resample_contour_signal(outer) \
-                   if outer is not None else None
-        q_approx = InspectionEngine._approx_features(outer) \
-                   if outer is not None else None
-
-        def _score(tmpl: dict) -> float:
-            hog    = InspectionEngine._hog_cosine(q_hog, tmpl.get("hog_vec"))
-            filled = InspectionEngine._check_similarity(
-                canvas, tmpl.get("canvas"), tmpl.get("canvas_aligned"))
-            signal = InspectionEngine._contour_signal_sim(q_signal,
-                                                          tmpl.get("contour_signal"))
-            approx = InspectionEngine._approx_score(q_approx,
-                                                    tmpl.get("approx_feat"))
-            return hog * 0.40 + filled * 0.25 + signal * 0.20 + approx * 0.15
-
-        # ── Empty slot: flat scan, no group ordering ───────────────
-        if not expected_char:
-            best_char   = "?"
-            best_conf   = 0.0
-            second_conf = 0.0
-            for name, tmpl in all_templates.items():
-                score = _score(tmpl)
-                if score > best_conf:
-                    second_conf = best_conf
-                    best_conf   = score
-                    best_char   = name
-                elif score > second_conf:
-                    second_conf = score
-            if best_conf < OCR_MIN_CONF:
-                return "?", round(best_conf, 4)
-            if best_conf - second_conf < OCR_CONF_GAP_MIN:
-                return "?", round(best_conf, 4)
-            return best_char, round(best_conf, 4)
-
-        # ── Stage 1: expected char fast path ──────────────────────
-        exp_conf = 0.0
-        exp_tmpl = all_templates.get(expected_char)
-        if exp_tmpl is not None:
-            exp_conf = _score(exp_tmpl)
-
-        if exp_conf >= OCR_CONF_EXPECTED:
-            return expected_char, round(exp_conf, 4)
-
-        # ── Stage 2: group search — seeded with expected char ──────
-        # Same-type group runs first (alpha→alpha, num→num).
-        # Each group is fully scored before deciding whether to continue.
-        # Skip remaining groups only when a template already beat exp_conf —
-        # a different-type match can never be more reliable than same-type.
-        best_char   = expected_char if exp_conf >= OCR_MIN_CONF else "?"
-        best_conf   = exp_conf
-        second_conf = 0.0
-
-        alpha_group   = {k: v for k, v in all_templates.items()
-                         if k.isalpha() and k != expected_char}
-        numeric_group = {k: v for k, v in all_templates.items()
-                         if not k.isalpha() and k != expected_char}
-
-        groups = [alpha_group, numeric_group] if expected_char.isalpha() \
-                 else [numeric_group, alpha_group]
-
-        for group in groups:
-            for name, tmpl in group.items():
-                score = _score(tmpl)
-                if score > best_conf:
-                    second_conf = best_conf
-                    best_conf   = score
-                    best_char   = name
-                elif score > second_conf:
-                    second_conf = score
-            # Full group scored — only skip next group if a winner beat exp_conf
-            if best_conf > exp_conf:
-                break
-
-        if best_conf < OCR_MIN_CONF:
-            return "?", round(best_conf, 4)
-        if best_char != expected_char and best_conf - second_conf < OCR_CONF_GAP_MIN:
-            return "?", round(best_conf, 4)
-
-        return best_char, round(best_conf, 4)
 
     def find_all_pin_templates(self,
                            image_bgr:   np.ndarray,
@@ -2191,26 +1959,6 @@ class InspectionEngine:
 
         return kept
 
-    @staticmethod
-    def _identify_slot(slot_gray:     np.ndarray,
-                       tmpl:          dict,
-                       expected_char: str,
-                       exp_dx:        int,
-                       exp_dy:        int,
-                       mold_cx:       int,
-                       mold_cy:       int,
-                       mold_size:     int,
-                       ocr_templates: dict) -> dict:
-        """
-        Pipeline 1 — OCR / Identity.
-        Image access ends after _thresh_font; all remaining ops are contour/canvas domain.
-
-        Returns dict:
-          present, char, ocr_conf, confidence,
-          shift_px, shift_ratio, contours, canvas, thresh, others
-        """
-        # P1 — TO BE IMPLEMENTED
-        raise NotImplementedError("P1 identity pipeline not yet implemented")
 
     @staticmethod
     def _check_dirty(others:               list,
@@ -2315,39 +2063,6 @@ class InspectionEngine:
             "missing_map":        missing,  # 64×64 — template pixels absent from ROI
             "others_center_norm": others_center_norm,
         }
-
-    def _defect_scan_mold(self,
-                          image_gray:   np.ndarray,
-                          grid_cx:      int,
-                          grid_cy:      int,
-                          cell_w:       int,
-                          cell_h:       int,
-                          roi_w:        int,
-                          roi_h:        int,
-                          iw:           int,
-                          ih:           int,
-                          grid_letters: list,
-                          tmpl_map:     dict,
-                          mold_size:    int,
-                          mold_x1:      int = 0,
-                          mold_y1:      int = 0,
-                          mold_x2:      int = 0,
-                          mold_y2:      int = 0) -> list:
-        """
-        Pipeline 2 — Defect / Anomaly scan.
-        Thresholds the full grid region once; per-cell defect checks run on
-        crops of that single global binary.  No per-slot re-thresh.
-
-        mold_x1/y1/x2/y2: clip grid crop to mold boundary so no cell ROI
-        bleeds into an adjacent frame.  Default 0/0/0/0 = no clipping.
-
-        Returns list[9] of dicts:
-          detected, type, area_ratio, hole_score, canvas, contours
-        """
-        # P2 — TO BE IMPLEMENTED
-        _none = {"detected": False, "type": "none", "area_ratio": 0.0,
-                 "hole_score": 1.0, "canvas": None, "contours": []}
-        return [dict(_none) for _ in range(9)]
 
     # =========================================================
     # COMPARE ROI  — orchestrates the pipeline
