@@ -114,13 +114,12 @@ MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 1
 
 # ---- Dirty / Anomaly Detection ----
 ANOMALY_MIN_AREA_RATIO    = 0.30  # secondary contour / roi_area — below → noise, ignore
-DIRTY_EXTRA_RATIO_MAX     = 0.20  # extra pixels / union  > 20%  → foreign object / splatter
-DIRTY_MISSING_RATIO_MAX   = 0.40  # missing pixels / union > 40% → severe stroke loss
-# Dilation applied to both aligned canvases before computing extra/missing ratios.
-# Tolerates laser position drift (~2 px on 64 px canvas) without hiding real defects:
-#   mousebite  ≥ 5 px  → still caught (missing area > tolerance band)
-#   closing fill > 2 px → still caught as extra pixels inside hole
-#   shorting             → caught by secondary-contour check (unaffected by dilation)
+# P2 _defect_scan_slot normalises against canvas_area (white pixels in letter fill),
+# not roi_area.  Ratios are therefore relative to letter size, not cell size.
+#   extra   = clean AND NOT canvas  → FO / splatter outside letter boundary
+#   missing = canvas AND NOT clean  → stroke gap / erosion inside letter fill
+DIRTY_EXTRA_RATIO_MAX     = 0.15  # extra / canvas_area  > 15% → foreign object
+DIRTY_MISSING_RATIO_MAX   = 0.25  # missing / canvas_area > 25% → broken stroke
 DIRTY_CANVAS_DILATE_PX    = 2
 
 # ---- HOG descriptor (shared: template load + runtime OCR) ----
@@ -2065,6 +2064,80 @@ class InspectionEngine:
         }
 
     # =========================================================
+    # P1  — Presence · Shape score · Shift
+    # =========================================================
+
+    @staticmethod
+    def _identify_slot(contours:   list,
+                       canvas:     np.ndarray,
+                       tmpl:       dict,
+                       exp_dx:     int,
+                       exp_dy:     int,
+                       mold_cx:    int,
+                       mold_cy:    int,
+                       roi_h:      int,
+                       roi_w:      int) -> dict:
+        """
+        Input : contours + canvas from extract_font_template(use_close=False).
+        Output: present, confidence, shift_px, shift_ratio
+        """
+        if not contours:
+            return {"present": False, "confidence": 0.0,
+                    "shift_px": 0.0, "shift_ratio": 0.0}
+
+        confidence = InspectionEngine._compute_shape_score(canvas, contours, tmpl)
+        shift_px, shift_ratio = InspectionEngine._check_shift(
+            contours, tmpl, exp_dx, exp_dy, mold_cx, mold_cy, roi_w, roi_h)
+
+        return {"present":     True,
+                "confidence":  confidence,
+                "shift_px":    shift_px,
+                "shift_ratio": shift_ratio}
+
+    # =========================================================
+    # P2  — Defect check (clean vs canvas diff)
+    # =========================================================
+
+    @staticmethod
+    def _defect_scan_slot(canvas: np.ndarray, clean: np.ndarray) -> dict:
+        """
+        Input : canvas (main contour fill) and clean (full morphed binary),
+                both from extract_font_template(use_close=False) on the same slot.
+        Steps:
+          1. temp   = canvas - clean   → missing strokes (filled but no actual pixels)
+          2. diff   = clean  - canvas  → extra material  (actual pixels outside fill)
+          3. merged = temp | diff      → all difference pixels
+          4. morph open (3×3)          → wipe single-pixel noise
+        Ratios are normalised against canvas_area (letter size, not cell size).
+        """
+        _k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+        temp   = cv2.subtract(canvas, clean)           # 1 — missing
+        diff   = cv2.subtract(clean,  canvas)           # 2 — extra
+        merged = cv2.bitwise_or(temp, diff)             # 3 — all diff
+        merged = cv2.morphologyEx(merged, cv2.MORPH_OPEN, _k)   # 4 — wipe noise
+
+        canvas_area   = max(cv2.countNonZero(canvas), 1)
+        missing_ratio = round(cv2.countNonZero(cv2.bitwise_and(temp, merged)) / canvas_area, 4)
+        extra_ratio   = round(cv2.countNonZero(cv2.bitwise_and(diff, merged)) / canvas_area, 4)
+
+        if extra_ratio > DIRTY_EXTRA_RATIO_MAX:
+            defect_type = "foreign_object"
+        elif missing_ratio > DIRTY_MISSING_RATIO_MAX:
+            defect_type = "missing_stroke"
+        else:
+            defect_type = "none"
+
+        return {
+            "detected":      defect_type != "none",
+            "type":          defect_type,
+            "extra_ratio":   extra_ratio,
+            "missing_ratio": missing_ratio,
+            "area_ratio":    round(max(extra_ratio, missing_ratio), 4),
+            "merged_map":    merged,
+        }
+
+    # =========================================================
     # COMPARE ROI  — orchestrates the pipeline
     # =========================================================
 
@@ -2483,7 +2556,6 @@ class ResultAnnotator:
         if not passed and cell_w > 0 and cell_h > 0:
             dirty_info   = result.get("dirty", {})
             d_type       = dirty_info.get("type", "none")
-            defect_steps = result.get("defect_steps", [result.get("defect_step", 0)])
             roi_canvas   = result.get("roi_canvas")
             tmpl_canvas  = result.get("tmpl_canvas")
 
@@ -2510,8 +2582,11 @@ class ResultAnnotator:
                     drew = True
                 return drew
 
-            # Dirty pixel region circles
-            if d_type == "foreign_object":
+            # Dirty pixel region circles — merged_map (P2 morph diff) takes priority
+            merged_map = dirty_info.get("merged_map")
+            if merged_map is not None and np.any(merged_map):
+                _circle_from_map(merged_map)
+            elif d_type == "foreign_object":
                 extra_map = dirty_info.get("extra_map")
                 if extra_map is not None and np.any(extra_map):
                     _circle_from_map(extra_map)
@@ -3225,9 +3300,6 @@ class InspectionController:
             ResultAnnotator.draw_drop_label(display, acx, acy, mold_w, mold_h, ic_id=ic_id)
             return results
 
-        # ── Per-slot stub ──────────────────────────────────────────
-        # P1 (identity / OCR) — TO BE IMPLEMENTED
-        # P2 (defect scan)    — TO BE IMPLEMENTED
         mold_x1 = max(0,  acx - mold_w // 2)
         mold_x2 = min(iw, acx + mold_w // 2)
         mold_y1 = max(0,  acy - mold_h // 2)
@@ -3254,29 +3326,94 @@ class InspectionController:
             if lx2 <= lx1 or ly2 <= ly1:
                 continue
 
+            tmpl = self.cache.get(letter)
+            if tmpl is None:
+                continue
+
+            slot_gray = image_gray[ly1:ly2, lx1:lx2]
+
+            t0 = time.perf_counter()
+            contours, canvas, clean, _ = ContourTemplate.extract_font_template(
+                slot_gray,
+                mold_size = tmpl.get("mold_size", mold_size),
+                use_close = False)
+
+            p1 = InspectionEngine._identify_slot(
+                contours, canvas, tmpl,
+                dx, dy, acx, acy,
+                slot_gray.shape[0], slot_gray.shape[1])
+
+            p2 = (InspectionEngine._defect_scan_slot(canvas, clean)
+                  if p1["present"]
+                  else {"detected": False, "type": "none",
+                        "extra_ratio": 0.0, "missing_ratio": 0.0, "area_ratio": 0.0})
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+
+            # ── Collect failures ──────────────────────────────────
+            failures = []
+            if not p1["present"]:
+                failures.append((1, "missing_mark"))
+            else:
+                if p2["detected"]:
+                    failures.append((2,
+                        f"{p2['type']}(area={p2['area_ratio']:.3f})"))
+                if p1["shift_ratio"] > FONT_SHIFT_RATIO_MAX:
+                    failures.append((3,
+                        f"shift ratio={p1['shift_ratio']:.3f}"
+                        f" > {FONT_SHIFT_RATIO_MAX}"))
+                if p1["confidence"] < FONT_CONFIDENCE_MIN:
+                    failures.append((4,
+                        f"low_conf={p1['confidence']:.3f}"
+                        f" < {FONT_CONFIDENCE_MIN}"))
+            failures.sort(key=lambda x: x[0])
+
+            passed      = len(failures) == 0
+            defect_step = failures[0][0] if failures else 0
+            reasons     = [r for _, r in failures] if failures else ["OK"]
+
             results.append({
                 "frame_idx":    f_idx + 1,
                 "mold":         mold_label,
                 "slot":         slot_idx,
                 "letter":       letter,
-                "pass":         True,
-                "confidence":   0.0,
-                "shift_px":     0.0,
-                "shift_ratio":  0.0,
-                "defect_step":  0,
-                "defect_steps": [],
-                "defect_type":  "",
-                "reason":       "stub",
-                "reasons":      ["stub"],
+                "pass":         passed,
+                "confidence":   p1["confidence"],
+                "shift_px":     p1["shift_px"],
+                "shift_ratio":  p1["shift_ratio"],
+                "defect_step":  defect_step,
+                "defect_steps": [s for s, _ in failures] if failures else [],
+                "defect_type":  p2["type"] if p2["detected"] else "",
+                "reason":       reasons[0],
+                "reasons":      reasons,
                 "ocr_char":     letter,
-                "ocr_conf":     0.0,
+                "ocr_conf":     p1["confidence"],
                 "cell_cx":      cell_cx,
                 "cell_cy":      cell_cy,
-                "elapsed_ms":   0.0,
+                "elapsed_ms":   round(elapsed_ms, 2),
                 "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
-                "roi_canvas":   None,
-                "dirty":        {"detected": False, "type": "none", "area_ratio": 0.0},
+                "roi_canvas":   canvas,
+                "dirty": {
+                    "detected":      p2["detected"],
+                    "type":          p2["type"],
+                    "area_ratio":    p2["area_ratio"],
+                    "extra_ratio":   p2["extra_ratio"],
+                    "missing_ratio": p2["missing_ratio"],
+                    "merged_map":    p2.get("merged_map"),
+                },
             })
+
+            if DEBUG_MODE:
+                ic_f = f_idx * 2 + (1 if mold_label == "A" else 2)
+                print(
+                    f"[SLOT] F{ic_f} s{slot_idx+1}({letter})"
+                    f" {'OK  ' if passed else 'FAIL'}"
+                    f" step={defect_step}"
+                    f" conf={p1['confidence']:.3f}"
+                    f" shift={p1['shift_ratio']:.3f}"
+                    f" defect={p2['type']}({p2['area_ratio']:.3f})"
+                    f" | {'; '.join(reasons)}")
+
             ResultAnnotator.draw_letter(display, results[-1])
 
         return results
