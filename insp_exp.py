@@ -4437,8 +4437,11 @@ class RightPanel(QtWidgets.QWidget):
     def apply_settings(self):
         sm    = self._sm
         pairs = [
-            (self.spin_pin_score, "pin_score_threshold"),
-            (self.spin_exposure,  "camera_exposure_us"),
+            (self.spin_pin_score,    "pin_score_threshold"),
+            (self.spin_exposure,     "camera_exposure_us"),
+            (self.spin_grid_scale,   "grid_scale"),
+            (self.spin_grid_x,       "grid_x_frac"),
+            (self.spin_grid_y,       "grid_y_frac"),
         ]
         for spin, key in pairs:
             spin.blockSignals(True)

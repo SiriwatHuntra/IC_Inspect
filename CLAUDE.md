@@ -1,25 +1,26 @@
 # IC Frame Laser-Mark Inspection — Project Instructions
 
----
-
 ## Working Directory Layout
 
 | Path | Purpose |
 |---|---|
 | `insp_exp.py` | **Main file to edit** |
-| `debug/` | Debug results: saved gray image and processed image outputs |
-| `pin_recipe.json` | Frame/mold layout + slot shift refs |
-| `inspection_settings.txt` | Numeric runtime settings |
-| `search_mask.jpg` | Optional camera search mask |
+| `Setup.json` | All settings (static thresholds + user-tunable); replaces legacy `inspection_settings.txt` |
+| `pin_recipe.json` | Frame/mold layout + slot shift refs (v6) |
+| `frame_layout.json` | Saved frame layout from FrameLayoutPanel |
 | `templates/` | Per-character JSON templates |
-| `image_source/` | DEBUG_MODE input images |
+| `training_data/` | HOG OCR training crops (`training_data/<CHAR>/`) |
+| `Mold_detector_openvino_model/` | OpenVINO IR model for mold bbox detection |
+| `image_source/` | DEBUG_MODE input images (BMP/JPG/PNG) |
 | `Inspection_result/` | Failed image output |
+| `debug/` | Debug PNGs from inspection steps |
+| `search_mask.jpg` | Optional camera search mask |
 
 ---
 
 ## Project Identity
 
-**Stack:** Python · OpenCV · PyQt5 · pypylon (Basler SDK) · RPi.GPIO  
+**Stack:** Python · OpenCV · PyQt5 · pypylon (Basler SDK) · OpenVINO · RPi.GPIO  
 **Hardware:** Basler acA1300-60gc GigE, 1280×1024, link-local · Raspberry Pi GPIO
 
 ---
@@ -28,17 +29,23 @@
 
 ```
 InspectionResult        @dataclass — result carrier
-CONFIG block            constants (DEBUG_MODE, PIN_*, FONT_*, CAMERA_*)
-SettingsManager         persists inspection_settings.txt
+CONFIG block            constants (DEBUG_MODE, PIN_*, FONT_*, OCR_*, CAMERA_*)
+_compute_hog            module-level HOG helper (1764-dim L2-normalised vector)
+SettingsManager         persists Setup.json (static + setup sections)
 ImageIO                 save/load helpers
+BaslerCamera            Basler GigE camera wrapper
+MachineIO               GPIO trigger/busy/pass-fail output
 ContourTemplate         JSON template r/w (contour + base64 PNG canvas)
 cv2_draw_dashed_rect    drawing utility
+YOLOMoldDetector        OpenVINO IR inference — mold bbox detection
 InspectionEngine        core CV logic (static methods only)
+ResultAnnotator         draws boxes/labels on display image (no Qt)
 InspectionController    owns engine + template store + camera; run() entry point
+RunWorker               QThread wrapper around InspectionController.run()
 ImageView               PyQt5 QLabel subclass with zoom/pan
-MaskingToolbar          toolbar widget
-MaskConfirmDialog       modal for search-mask confirm
-TemplatePreviewDialog   modal for template save wizard (3-step)
+FrameTemplatePanel      frame rect draw UI (step 1 of template wizard)
+FrameLayoutPanel        mold A/B rect draw UI (steps 2–3 of template wizard)
+TemplatePreviewDialog   modal for font template save wizard (3-step)
 RightPanel              settings + controls panel
 MainWindow              top-level window; wires everything
 main()                  QApplication entry
@@ -50,12 +57,12 @@ main()                  QApplication entry
 
 | Rule | Detail |
 |---|---|
-| **No PCA rotation** | Fixed camera — removed entirely from save & compare paths; re-save all templates if pipeline changes |
-| **CHAIN_APPROX_NONE** | Never use TC89_KCOS — collapses diagonal strokes ("7") causing Hu moment failure |
+| **No PCA rotation** | Fixed camera — removed entirely; re-save all templates if pipeline changes |
+| **CHAIN_APPROX_NONE** | Never use TC89_KCOS — collapses diagonal strokes ("7") |
 | **Canvas IoU, not Hu moments** | 64×64 centre-aligned canvas IoU is the similarity metric |
-| **Otsu inversion check** | Bright-on-dark images: tophat+Otsu+invert used at template save; adaptive+unsharp at runtime |
+| **Otsu inversion check** | Bright-on-dark: tophat+Otsu+invert at template save; adaptive+unsharp at runtime |
 | **Save ↔ compare must match** | Any extraction logic change requires full template re-save |
-| **mold_size as kernel anchor** | Morph kernels sized to mold dims (~150–160px), not font ROI (~40–50px) |
+| **mold_size as kernel anchor** | Morph kernels sized to mold dims (~150–160 px), not font ROI (~40–50 px) |
 | **Rotation is mold-level** | All letters rotate as one laser unit; per-letter rotation check is wrong |
 
 ---
@@ -64,7 +71,7 @@ main()                  QApplication entry
 
 ```
 Step 1  Presence check          contours must exist
-Step 2  Shift detection         shift_px / tmpl_diagonal ≤ 0.20  (ratio-based)
+Step 2  Shift detection         shift_px / tmpl_diagonal ≤ FONT_SHIFT_RATIO_MAX (0.50)
 Step 3  Hole/stroke integrity   hole count + area ratio
 Step 4  Canvas IoU similarity   64×64 centre-aligned; weighted score:
                                   similarity×0.70 + hole_score×0.20 + aspect_score×0.10
@@ -73,12 +80,35 @@ Step 5  Aspect ratio check      bbox ratio vs template ± FONT_ASPECT_TOLERANCE
 
 ---
 
-## Lead Presence Gate
+## OCR — HOG Cosine Similarity (implemented)
 
-**Method:** `InspectionEngine._check_lead_presence()`
-- ROI boxes: 1/3 mold_width × full mold_height on each side
-- White pixel ratio threshold: 20% at threshold=128
-- No-lead molds → PASS result, skipped silently (logged gray), no alarm
+**Method:** `_compute_hog` → cosine similarity against stored template HOG vectors  
+**Constants:**
+```python
+OCR_CONF_EXPECTED = 0.88   # fast-path return if ≥ this
+OCR_MIN_CONF      = 0.60   # below → report "?" (unreadable)
+OCR_CONF_GAP_MIN  = 0.10   # best must beat 2nd-best by this (avoids 0/O/8/2 ties)
+```
+**Result fields:** `ocr_char`, `ocr_conf`, `ocr_string` (9-char mold ID)  
+**Training data:** 48×48 PNGs in `training_data/<CHAR>/`
+
+---
+
+## Pin Presence Gate
+
+**Method:** `InspectionEngine.check_pin_presence()`  
+- Sobel-Y edge magnitude threshold: `PIN_SOBEL_MAG = 40`  
+- Min edge-pixel fraction in lead ROI: `PIN_EDGE_RATIO = 0.150`  
+- No-lead molds → PASS, skipped silently (logged gray), no alarm
+
+---
+
+## YOLO Mold Detection
+
+**Class:** `YOLOMoldDetector`  
+- Wraps `Mold_detector_openvino_model/Mold_detector.xml` (YOLO8, single class "IC")  
+- Fallback: if model missing or OpenVINO unavailable → `is_ready()=False`, skipped silently  
+- Used by `InspectionController` for mold bbox detection
 
 ---
 
@@ -94,22 +124,19 @@ Step 5  Aspect ratio check      bbox ratio vs template ± FONT_ASPECT_TOLERANCE
 ## Template Storage
 
 **Font templates:** `templates/<char>_<slot>.json`  
-**PIN template:** `pin_recipe.json`
+**PIN/layout:** `pin_recipe.json` (v6) + `frame_layout.json`
 
-JSON contains:
-```json
-{
-  "contours": [...],
-  "canvas_b64": "<base64 PNG>",
-  "mold_size": [w, h],
-  "canvas_w": 64, "canvas_h": 64,
-  "tmpl_diagonal": ...,
-  "tmpl_contour_count": ...,
-  "tmpl_aspect": ...,
-  "tmpl_bbox": [...],
-  "shift_ref": [cx, cy]
-}
-```
+JSON fields: `contours`, `canvas_b64`, `mold_size`, `canvas_w/h`, `tmpl_diagonal`, `tmpl_contour_count`, `tmpl_aspect`, `tmpl_bbox`, `shift_ref`, `hog_vec` (OCR)
+
+---
+
+## Settings (`Setup.json`)
+
+Two sections:
+- `["static"]` — threshold constants (override code defaults; require restart)
+- `["setup"]` — user-tunable values (exposure, pin score, grid params, grid letters)
+
+Legacy `inspection_settings.txt` is auto-migrated on first run.
 
 ---
 
@@ -120,9 +147,8 @@ DEBUG_MODE = True   # loops image_source/ (BMP/JPG/PNG)
 DEBUG_MODE = False  # live Basler — GrabStrategy_LatestImageOnly
 ```
 
-**Output:** Failed images → `Inspection_result/`
-- `<timestamp>_R.png` raw grayscale
-- `<timestamp>.png`   annotated BGR
+**Output:** Failed images → `Inspection_result/`  
+- `<timestamp>_R.png` raw grayscale · `<timestamp>.png` annotated BGR
 
 **GPIO pins:** 3 = inspect trigger (active-LOW) · 5 = busy · 7 = pass/fail
 
@@ -130,59 +156,12 @@ DEBUG_MODE = False  # live Basler — GrabStrategy_LatestImageOnly
 
 ## Template Wizard (3-step)
 
-1. Draw frame rect
-2. Draw Mold A rect
-3. Draw Mold B rect
+1. `FrameTemplatePanel` — draw frame rect
+2. `FrameLayoutPanel` — draw Mold A rect
+3. `FrameLayoutPanel` — draw Mold B rect
 
 Auto-computes 9 slot positions at `mold_size/3` pitch.  
-Constraint zone: 1.3× frame-height square + `x_offset` param prevents wrong-frame mold placement.
-
----
-
-## Next Work — SVM OCR Integration
-
-**Plan file:** `SVM_OCR_Integration_Plan.md`  
-**Status:** Designed, not yet coded.
-
-### What to build (in order):
-
-1. **`SVMClassifier` class** — before `InspectionEngine`
-   - HOG: 48×48, blockSize 16×16, blockStride 8×8, cellSize 8×8, nbins 9 → 1764-dim vector
-   - `predict(crop_gray)` → `(char: str, conf: float)`
-   - Fallback: if `svm_model.pkl` missing → `is_ready()=False`, OCR step skipped silently
-
-2. **Wire `_svm`** onto `InspectionController.__init__`
-
-3. **Modify `_step3_inspect_fonts`** — OCR pass before defect pass per slot:
-   ```
-   recipe=""  AND ocr=""  → pass=True,  run_defect=False
-   recipe=""  AND ocr="X" → pass=False, run_defect=False  (unexpected mark)
-   recipe="X" AND ocr="X" → pass=True,  run_defect=True
-   recipe="X" AND ocr="Y" → pass=False, run_defect=True   (wrong letter)
-   recipe="X" AND ocr="?" → pass=None,  run_defect=True   (unreadable)
-   ```
-
-4. **Result dict new fields:** `ocr_char`, `ocr_conf`, `ocr_string` (9-char mold ID)
-
-5. **Log format update:**
-   ```
-   F1-A [ic=1]  PASS  [45.2ms]  OCR:"290  4 BZ"
-   F1-A [ic=1]  FAIL  [45.2ms]  OCR:"290  4 BZ"
-     mismatch: slot2(exp=8,got=9)
-     defect: slot3(low_conf=0.41)
-   ```
-
-6. **CSV export:** add `ocr_char`, `ocr_conf`, `ocr_string` columns
-
-7. **`svm_collect.py`** — standalone script, not imported by main app
-   - Iterates `image_source/`, crops all 9 slots per mold, saves 48×48 PNGs to `training_data/<CHAR>/`
-
-### SVM Constants (hardcoded):
-```python
-SVM_CONF_FIRST  = 0.60
-SVM_CONF_RETRY  = 0.45
-SVM_ROI_EXPAND  = 1.15
-```
+Constraint zone: 1.3× frame-height square + `x_offset` prevents wrong-frame mold placement.
 
 ---
 
@@ -191,9 +170,9 @@ SVM_ROI_EXPAND  = 1.15
 | Issue | Status |
 |---|---|
 | Shift detection: large shifts cause false-empty detection | Open |
-| Rotation detection: PCA on combined mold contours, not per-letter | Design agreed, not coded |
+| Rotation detection: PCA on combined mold contours | Design agreed, not coded |
 | `_step1_find_frames` multi-scale TM ~729ms bottleneck | Open — fixed ROI or reduced scales proposed |
-| Threshold tuning (lead presence, rotation) | Pending real-image testing |
+| Threshold tuning (pin presence, rotation) | Pending real-image testing |
 
 ---
 
