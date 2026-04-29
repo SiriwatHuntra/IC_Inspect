@@ -68,77 +68,39 @@ class InspectionResult:
 # CONFIG
 # =========================================================
 DEBUG_MODE     = True
-PIN_ROI_W          = 120       # fixed capture size in image-space px
-PIN_ROI_H          = 150
-PIN_SOBEL_MAG      = 40        # minimum Sobel Y magnitude counted as a strong edge
-PIN_EDGE_RATIO     = 0.150      # fraction of inner-ROI pixels that must be strong edges
-PIN_TM_STRIDE   = 4      # coarse grid step (px) — skip every N pixels in result map
-PIN_IOU_THR     = 0.50   # NMS overlap threshold
+PIN_SOBEL_MAG      = 40        # Sobel Y threshold for lead-edge detection
+PIN_EDGE_RATIO     = 0.150     # min edge-pixel fraction in lead ROI
+PIN_TM_STRIDE      = 4         # coarse TM grid step (px)
+PIN_IOU_THR        = 0.50      # NMS overlap threshold
 
 MIN_CONTOUR_AREA     = 1
-MIN_CONTOUR_SOLIDITY = 0.35   # convex-hull fill ratio; rough surface noise < 0.35; serif I ≈ 0.40
-MIN_CONTOUR_EXTENT   = 0.20   # area / bounding-rect; sparse blobs fail this
-MIN_CONTOUR_REL_AREA = 0.003  # fraction of ROI area; rejects sub-0.3% specks
+MIN_CONTOUR_SOLIDITY = 0.35   # < 0.35 → noise; serif I ≈ 0.40
+MIN_CONTOUR_EXTENT   = 0.20   # area / bbox; sparse blobs fail
+MIN_CONTOUR_REL_AREA = 0.003  # sub-0.3% of ROI → speck
 IMAGE_SOURCE_DIR  = "image_source/"
 OUTPUT_DIR        = "Inspection_result"
 
-# Camera
 CAMERA_SERIAL        = "22202392"
 CAMERA_WARMUP_FRAMES = 5
-CAMERA_EXPOSURE_US   = 8000     # µs — overridden by RightPanel at runtime
+CAMERA_EXPOSURE_US   = 8000   # µs — overridden by RightPanel
 
-# ---- Font Inspection Constants (hardcoded, not user-tunable) ----
 FONT_CONFIDENCE_MIN        = 0.70
 FONT_SHIFT_RATIO_MAX       = 0.50
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
-
-# ---- Last-lot detection ----
-# Number of leading frame-columns (by X position) that must contain chips.
-# Trailing columns must have frames detected but no chip contours.
 LAST_LOT_CHIP_FRAME_COLS   = 1
+MIN_TOPHAT_SIGNAL          = 20  # empty slot top-hat peak < 20 → skip Otsu
 
-# ---- Empty-slot guard (Otsu false-contour suppression) ----
-# Minimum peak value in the white top-hat image required before Otsu runs.
-# An empty (black) slot produces a near-zero top-hat; Otsu on that signal
-# picks threshold ~2–5 and turns camera noise into false contours.
-# Real laser marks produce top-hat peak >> 30.  Tune down if faint marks are
-# missed; tune up if empty slots still produce false contours.
-MIN_TOPHAT_SIGNAL          = 20
+# P2 defect thresholds — normalised against canvas_area (letter pixels, not cell)
+DIRTY_EXTRA_RATIO_MAX     = 0.15  # extra  > 15% → foreign object
+DIRTY_MISSING_RATIO_MAX   = 0.25  # missing > 25% → broken stroke
 
-# ---- Reflection / False-mark Filter (empty slots only) ----
-# Laser marks are thin strokes; IC surface reflections are blobs.
-# Both checks must pass for a contour to be reported as unexpected mark.
-MARK_MAX_FILL_RATIO       = 0.65  # non_zero / bbox_area  — blobs fill > 65%
-MARK_MAX_THICKNESS_RATIO  = 0.18  # max dist-transform / slot_size — blobs > 18%
-
-# ---- Dirty / Anomaly Detection ----
-ANOMALY_MIN_AREA_RATIO    = 0.30  # secondary contour / roi_area — below → noise, ignore
-# P2 _defect_scan_slot normalises against canvas_area (white pixels in letter fill),
-# not roi_area.  Ratios are therefore relative to letter size, not cell size.
-#   extra   = clean AND NOT canvas  → FO / splatter outside letter boundary
-#   missing = canvas AND NOT clean  → stroke gap / erosion inside letter fill
-DIRTY_EXTRA_RATIO_MAX     = 0.15  # extra / canvas_area  > 15% → foreign object
-DIRTY_MISSING_RATIO_MAX   = 0.25  # missing / canvas_area > 25% → broken stroke
-DIRTY_CANVAS_DILATE_PX    = 2
-
-# ---- HOG descriptor (shared: template load + runtime OCR) ----
-# win 64×64 → 7×7 block positions × 4 cells × 9 bins = 1764-dim vector
+# HOG: 64×64 win, 16×16 block, 8×8 stride, 8×8 cell, 9 bins → 1764-dim
 _HOG_WIN  = (64, 64)
 _HOG_DESC = cv2.HOGDescriptor(_HOG_WIN, (16, 16), (8, 8), (8, 8), 9)
 
 def _compute_hog(canvas: np.ndarray) -> np.ndarray:
-    """
-    L2-normalised HOG vector from a binary canvas.
-
-    Crops to the contour bounding box (+ 4px padding) before resizing,
-    so the HOG window is filled with stroke signal regardless of the
-    slot ROI size the canvas came from.  Makes HOG slot-size-invariant.
-
-    Input : uint8 binary ndarray (any size).
-    Output: float32 ndarray shape (1764,), L2-normalised.
-            All-zero vector when canvas is empty or has no non-zero pixels.
-    """
+    """L2-normalised 1764-dim HOG vector; zero vector when canvas is empty."""
     if canvas is None or canvas.size == 0:
         return np.zeros(1764, dtype=np.float32)
     pts = cv2.findNonZero(canvas)
@@ -170,13 +132,15 @@ SETTINGS_FILE = "inspection_settings.txt"   # legacy — migrated to Setup.json 
 # Static constants loaded from Setup.json ["static"] section.
 # Values here are only the in-code fallback; Setup.json overrides them at runtime.
 _SETUP_STATIC_DEFAULTS = {
-    "font_confidence_min":        0.80,
+    "font_confidence_min":        0.70,
     "font_shift_ratio_max":       0.50,
     "font_hole_count_tolerance":  1,
     "font_hole_area_tolerance":   0.30,
     "last_lot_chip_frame_cols":   1,
     "min_tophat_signal":          20,
     "pin_edge_ratio":             0.150,
+    "dirty_extra_ratio_max":      0.15,
+    "dirty_missing_ratio_max":    0.25,
 }
 
 # User-tunable setup values — stored in Setup.json ["setup"] section.
@@ -238,7 +202,6 @@ class SettingsManager:
 
     # ---- static access ---------------------------------------------------
 
-    # def get_static(self, key: str, default=None):
     #     return self._static.get(key, default)
 
     def _apply_statics(self):
@@ -246,6 +209,7 @@ class SettingsManager:
         global FONT_CONFIDENCE_MIN, FONT_SHIFT_RATIO_MAX
         global FONT_HOLE_COUNT_TOLERANCE, FONT_HOLE_AREA_TOLERANCE
         global LAST_LOT_CHIP_FRAME_COLS, MIN_TOPHAT_SIGNAL, PIN_EDGE_RATIO
+        global DIRTY_EXTRA_RATIO_MAX, DIRTY_MISSING_RATIO_MAX
         s = self._static
         FONT_CONFIDENCE_MIN        = float(s.get("font_confidence_min",        FONT_CONFIDENCE_MIN))
         FONT_SHIFT_RATIO_MAX       = float(s.get("font_shift_ratio_max",       FONT_SHIFT_RATIO_MAX))
@@ -254,6 +218,8 @@ class SettingsManager:
         LAST_LOT_CHIP_FRAME_COLS   = int(  s.get("last_lot_chip_frame_cols",   LAST_LOT_CHIP_FRAME_COLS))
         MIN_TOPHAT_SIGNAL          = int(  s.get("min_tophat_signal",          MIN_TOPHAT_SIGNAL))
         PIN_EDGE_RATIO             = float(s.get("pin_edge_ratio",             PIN_EDGE_RATIO))
+        DIRTY_EXTRA_RATIO_MAX      = float(s.get("dirty_extra_ratio_max",      DIRTY_EXTRA_RATIO_MAX))
+        DIRTY_MISSING_RATIO_MAX    = float(s.get("dirty_missing_ratio_max",    DIRTY_MISSING_RATIO_MAX))
 
     # ---- setup (numeric) access ------------------------------------------
 
@@ -2012,16 +1978,10 @@ class InspectionEngine:
 
             union_area = max(int(np.count_nonzero(cv2.bitwise_or(rc, tc))), 1)
 
-            # Dilate both canvases to absorb laser position drift before diff.
-            # union_area stays on raw canvases so ratio scale is consistent.
-            if DIRTY_CANVAS_DILATE_PX > 0:
-                _dk = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE,
-                    (DIRTY_CANVAS_DILATE_PX * 2 + 1, DIRTY_CANVAS_DILATE_PX * 2 + 1))
-                rc_cmp = cv2.dilate(rc, _dk)
-                tc_cmp = cv2.dilate(tc, _dk)
-            else:
-                rc_cmp, tc_cmp = rc, tc
+            # 2px dilation absorbs laser position drift without hiding real defects
+            _dk    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            rc_cmp = cv2.dilate(rc, _dk)
+            tc_cmp = cv2.dilate(tc, _dk)
 
             extra   = cv2.subtract(rc, tc_cmp)   # pixels in ROI outside dilated template
             missing = cv2.subtract(tc, rc_cmp)   # template pixels not covered by dilated ROI
@@ -2035,7 +1995,7 @@ class InspectionEngine:
         others_center_norm = None   # (nx, ny) of largest qualifying secondary contour
         for c in others:
             r = cv2.contourArea(c) / roi_area
-            if r >= ANOMALY_MIN_AREA_RATIO and r > others_max_ratio:
+            if r >= 0.30 and r > others_max_ratio:
                 others_max_ratio = r
                 M = cv2.moments(c)
                 if M["m00"] > 0:
@@ -2045,7 +2005,7 @@ class InspectionEngine:
 
         # ── Decision ─────────────────────────────────────────────────
         dirty_type = "none"
-        if extra_ratio > DIRTY_EXTRA_RATIO_MAX or others_max_ratio >= ANOMALY_MIN_AREA_RATIO:
+        if extra_ratio > DIRTY_EXTRA_RATIO_MAX or others_max_ratio >= 0.30:
             dirty_type = "foreign_object"
         elif missing_ratio > DIRTY_MISSING_RATIO_MAX:
             dirty_type = "missing_stroke"
