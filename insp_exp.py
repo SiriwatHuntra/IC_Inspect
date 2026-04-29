@@ -238,8 +238,8 @@ class SettingsManager:
 
     # ---- static access ---------------------------------------------------
 
-    def get_static(self, key: str, default=None):
-        return self._static.get(key, default)
+    # def get_static(self, key: str, default=None):
+    #     return self._static.get(key, default)
 
     def _apply_statics(self):
         """Push static section values into module-level globals."""
@@ -2392,45 +2392,45 @@ class ResultAnnotator:
         
 
     # ---- Last-lot flag -----------------------------------------------
-    @staticmethod
-    def draw_last_lot_flag(display:   np.ndarray,
-                           chip_cols: int,
-                           acx:       int,
-                           acy:       int,
-                           aw:        int,
-                           ah:        int):
-        """
-        Draw a prominent amber "LAST LOT" banner on the mold area.
+    # @staticmethod
+    # def draw_last_lot_flag(display:   np.ndarray,
+    #                        chip_cols: int,
+    #                        acx:       int,
+    #                        acy:       int,
+    #                        aw:        int,
+    #                        ah:        int):
+    #     """
+    #     Draw a prominent amber "LAST LOT" banner on the mold area.
 
-        Input : display (BGR ndarray, modified in-place),
-                chip_cols — number of leading columns that have chips (1 or 2),
-                acx/acy — mold centre, aw/ah — mold size.
-        """
-        ih, iw = display.shape[:2]
-        ax1 = max(0,    acx - aw // 2)
-        ay1 = max(0,    acy - ah // 2)
-        ax2 = min(iw-1, ax1 + aw)
-        ay2 = min(ih-1, ay1 + ah)
+    #     Input : display (BGR ndarray, modified in-place),
+    #             chip_cols — number of leading columns that have chips (1 or 2),
+    #             acx/acy — mold centre, aw/ah — mold size.
+    #     """
+    #     ih, iw = display.shape[:2]
+    #     ax1 = max(0,    acx - aw // 2)
+    #     ay1 = max(0,    acy - ah // 2)
+    #     ax2 = min(iw-1, ax1 + aw)
+    #     ay2 = min(ih-1, ay1 + ah)
 
-        # Amber semi-transparent fill over mold area
-        overlay = display.copy()
-        cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (0, 140, 255), cv2.FILLED)
-        cv2.addWeighted(overlay, 0.22, display, 0.78, 0, display)
+    #     # Amber semi-transparent fill over mold area
+    #     overlay = display.copy()
+    #     cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (0, 140, 255), cv2.FILLED)
+    #     cv2.addWeighted(overlay, 0.22, display, 0.78, 0, display)
 
-        # Solid amber border
-        cv2.rectangle(display, (ax1, ay1), (ax2, ay2), (0, 165, 255), 2)
+    #     # Solid amber border
+    #     cv2.rectangle(display, (ax1, ay1), (ax2, ay2), (0, 165, 255), 2)
 
-        # Label centred on mold
-        lbl   = f"LAST LOT ({chip_cols}/3 col)"
-        font  = cv2.FONT_HERSHEY_SIMPLEX
-        fscl  = 0.45
-        thick = 1
-        (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
-        tx = acx - tw // 2
-        ty = acy + th // 2
-        cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
-                      (0, 0, 0), cv2.FILLED)
-        cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 165, 255), thick)
+    #     # Label centred on mold
+    #     lbl   = f"LAST LOT ({chip_cols}/3 col)"
+    #     font  = cv2.FONT_HERSHEY_SIMPLEX
+    #     fscl  = 0.45
+    #     thick = 1
+    #     (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
+    #     tx = acx - tw // 2
+    #     ty = acy + th // 2
+    #     cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
+    #                   (0, 0, 0), cv2.FILLED)
+    #     cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 165, 255), thick)
 
     # ---- Ignored frame (last-lot empty column) ----------------------
     @staticmethod
@@ -2854,8 +2854,8 @@ class InspectionController:
             print(f"[Controller] Font '{name}' save error: {e}")
             return False
 
-    def list_fonts(self) -> list:
-        return self._ct.list_templates()
+    # def list_fonts(self) -> list:
+    #     return self._ct.list_templates()
 
         # ---- cache ----
     def load_cache(self, names: list) -> list:
@@ -3841,14 +3841,14 @@ class ImageView(QtWidgets.QLabel):
         self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
         self.update()
 
-    def set_mask_draw_mode(self, on: bool, add: bool = True):
-        self._mask_mode  = on
-        self._mask_add   = add
-        self._draw_mode  = False
-        self._start      = None
-        self._rect       = None
-        self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
-        self.update()
+    # def set_mask_draw_mode(self, on: bool, add: bool = True):
+    #     self._mask_mode  = on
+    #     self._mask_add   = add
+    #     self._draw_mode  = False
+    #     self._start      = None
+    #     self._rect       = None
+    #     self.setCursor(QtCore.Qt.CrossCursor if on else QtCore.Qt.ArrowCursor)
+    #     self.update()
 
     def set_stamp_mode(self, on: bool,
                        box_size: int = 45, box_h: int = 0,
@@ -4495,18 +4495,18 @@ class RightPanel(QtWidgets.QWidget):
             cell.setText(val)
             cell.blockSignals(False)
 
-    def pin_search_params(self) -> dict:
-        sm = self._sm
-        return {
-            "score_thr": sm.get("pin_score_threshold"),
-        }
+    # def pin_search_params(self) -> dict:
+    #     sm = self._sm
+    #     return {
+    #         "score_thr": sm.get("pin_score_threshold"),
+    #     }
 
-    def font_list(self, ct: "ContourTemplate") -> list:
-        """
-        Return all template names from the templates/ folder.
-        Auto-detected at run time — no user input required.
-        """
-        return ct.list_templates()
+    # def font_list(self, ct: "ContourTemplate") -> list:
+    #     """
+    #     Return all template names from the templates/ folder.
+    #     Auto-detected at run time — no user input required.
+    #     """
+    #     return ct.list_templates()
 
     def _on_grid_cell_changed(self):
         letters = self.grid_letters()
