@@ -7,8 +7,6 @@
 | Path | Purpose |
 |---|---|
 | `insp_exp.py` | **Main file to edit** |
-| `insp_exp copy.py` | Manual backup of current stable version — rollback target |
-| `Backup_Code/` | Backup files for experiment branches / manual version snapshots |
 | `debug/` | Debug results: saved gray image and processed image outputs |
 | `pin_recipe.json` | Frame/mold layout + slot shift refs |
 | `inspection_settings.txt` | Numeric runtime settings |
@@ -16,11 +14,6 @@
 | `templates/` | Per-character JSON templates |
 | `image_source/` | DEBUG_MODE input images |
 | `Inspection_result/` | Failed image output |
-| `training_data/` | (to be created) SVM crop dataset |
-| `svm_model.pkl` | (to be created) trained SVM model |
-| `svm_collect.py` | (to be created) crop collector |
-| `svm_train.py` | (to be created) model trainer |
-| `svm_test.py` | (to be created) model evaluator |
 
 ---
 
