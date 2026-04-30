@@ -2238,11 +2238,11 @@ class ResultAnnotator:
       Fail box   : (0, 0, 200)    red solid
     """
 
-    COLOR_FRAME = (0, 224, 255)
-    COLOR_MOLD  = (0, 180, 200)
-    COLOR_PASS  = (0, 200, 0)
-    COLOR_FAIL  = (0, 0, 200)
-    COLOR_OCR   = (0, 255, 255)   # yellow — OCR read label
+    COLOR_FRAME = (180, 130, 70)   # steel-blue (BGR) — template structure
+    COLOR_MOLD  = (150, 110, 60)   # dim steel-blue (BGR) — template structure
+    COLOR_PASS  = (50,  210, 50)   # green (BGR) — pass annotation
+    COLOR_FAIL  = (50,  50,  210)  # red (BGR) — fail annotation
+    COLOR_OCR   = (190, 190, 190)  # light gray (BGR) — OCR label
 
     # ---- Frame -------------------------------------------------------
 
@@ -2391,9 +2391,9 @@ class ResultAnnotator:
         ay2 = min(ih-1, ay1 + ah)
 
         overlay = display.copy()
-        cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (180, 180, 0), cv2.FILLED)
-        cv2.addWeighted(overlay, 0.18, display, 0.82, 0, display)
-        cv2.rectangle(display, (ax1, ay1), (ax2, ay2), (0, 200, 200), 1)
+        cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (80, 65, 45), cv2.FILLED)
+        cv2.addWeighted(overlay, 0.25, display, 0.75, 0, display)
+        cv2.rectangle(display, (ax1, ay1), (ax2, ay2), ResultAnnotator.COLOR_MOLD, 1)
 
         lbl   = f"{ic_id} DROP" if ic_id else "DROP"
         font  = cv2.FONT_HERSHEY_SIMPLEX
@@ -2404,7 +2404,7 @@ class ResultAnnotator:
         ty = acy + th // 2
         cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
                       (0, 0, 0), cv2.FILLED)
-        cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 200, 200), thick, cv2.LINE_AA)
+        cv2.putText(display, lbl, (tx, ty), font, fscl, ResultAnnotator.COLOR_MOLD, thick, cv2.LINE_AA)
 
     # ---- Missing frame (no TM match in layout ROI) ------------------
     @staticmethod
@@ -2416,7 +2416,7 @@ class ResultAnnotator:
         ih, iw = display.shape[:2]
         x1 = max(0,    rx);      y1 = max(0,    ry)
         x2 = min(iw-1, rx + rw); y2 = min(ih-1, ry + rh)
-        cv2_draw_dashed_rect(display, (x1, y1), (x2, y2), (0, 0, 180), 2)
+        cv2_draw_dashed_rect(display, (x1, y1), (x2, y2), ResultAnnotator.COLOR_FAIL, 2)
         lbl  = f"{frame_id} MISSING" if frame_id else "MISSING"
         font = cv2.FONT_HERSHEY_SIMPLEX
         fscl = 0.50; thick = 1
@@ -2425,7 +2425,7 @@ class ResultAnnotator:
         ty = (y1 + y2) // 2 + th // 2
         cv2.rectangle(display, (tx - 2, ty - th - bl), (tx + tw + 2, ty + bl),
                       (0, 0, 0), cv2.FILLED)
-        cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 80, 255), thick, cv2.LINE_AA)
+        cv2.putText(display, lbl, (tx, ty), font, fscl, ResultAnnotator.COLOR_FAIL, thick, cv2.LINE_AA)
 
     # ---- Last-lot image-level banner --------------------------------
     @staticmethod
@@ -3820,15 +3820,15 @@ class ImageView(QtWidgets.QLabel):
                 QtCore.QSize(int(cr.width()  * self._scale),
                              int(cr.height() * self._scale)),
             )
-            p.setPen(QtGui.QPen(QtGui.QColor(255, 200, 0), 2,
+            p.setPen(QtGui.QPen(QtGui.QColor(80, 140, 210), 2,
                                 QtCore.Qt.DashLine))
             p.drawRect(wcr)
             p.setFont(QtGui.QFont("Arial", 8, QtGui.QFont.Bold))
-            p.setPen(QtGui.QColor(255, 200, 0))
+            p.setPen(QtGui.QColor(80, 140, 210))
             p.drawText(wcr.topLeft() + QtCore.QPoint(3, -4), "DRAW MOLD HERE")
             
         if self._draw_mode and self._rect:
-            p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 0), 1,
+            p.setPen(QtGui.QPen(QtGui.QColor(100, 155, 220), 1,
                                 QtCore.Qt.DashLine))
             p.drawRect(self._rect)
 
@@ -3856,16 +3856,16 @@ class ImageView(QtWidgets.QLabel):
             wh  = int(self._stamp_h   * self._scale)
             wx  = wcx - ww // 2
             wy  = wcy - wh // 2
-            p.setPen(QtGui.QPen(QtGui.QColor(0, 224, 255), 2,
+            p.setPen(QtGui.QPen(QtGui.QColor(80, 140, 210), 2,
                                 QtCore.Qt.DashLine))
             p.drawRect(wx, wy, ww, wh)
-            p.setPen(QtGui.QPen(QtGui.QColor(0, 255, 120), 1,
+            p.setPen(QtGui.QPen(QtGui.QColor(130, 190, 130), 1,
                                 QtCore.Qt.SolidLine))
             p.drawLine(wcx - 8, wcy, wcx + 8, wcy)
             p.drawLine(wcx, wcy - 8, wcx, wcy + 8)
             if self._stamp_label:
                 p.setFont(QtGui.QFont("Arial", 9, QtGui.QFont.Bold))
-                p.setPen(QtGui.QColor(0, 224, 255))
+                p.setPen(QtGui.QColor(80, 140, 210))
                 p.drawText(wx + 3, wy + 13, self._stamp_label)
 
         p.end()
@@ -3921,12 +3921,12 @@ class FrameTemplatePanel(QtWidgets.QWidget):
 
         self._lbl_title = QtWidgets.QLabel("Auto Mold Detection")
         self._lbl_title.setStyleSheet(
-            "font-size:13px;font-weight:bold;color:#00e5ff")
+            "font-size:13px;font-weight:bold;color:#7ab8d8")
         self._lbl_title.setAlignment(QtCore.Qt.AlignCenter)
         lay.addWidget(self._lbl_title)
 
         self._lbl_status = QtWidgets.QLabel("Detecting…")
-        self._lbl_status.setStyleSheet("color:#cccccc;font-size:11px")
+        self._lbl_status.setStyleSheet("color:#b0bec8;font-size:11px")
         self._lbl_status.setAlignment(QtCore.Qt.AlignCenter)
         self._lbl_status.setWordWrap(True)
         lay.addWidget(self._lbl_status)
@@ -3939,13 +3939,13 @@ class FrameTemplatePanel(QtWidgets.QWidget):
         self._btn_cancel  = QtWidgets.QPushButton("Cancel")
 
         self._btn_confirm.setStyleSheet(
-            "background:#005f6b;color:#fff;font-weight:bold;"
+            "background:#1a4070;color:#d8e8f0;font-weight:bold;"
             "padding:6px 14px;border-radius:4px")
         self._btn_retry.setStyleSheet(
-            "background:#4a3a00;color:#fff;font-weight:bold;"
+            "background:#384858;color:#d8e8f0;font-weight:bold;"
             "padding:6px 14px;border-radius:4px")
         self._btn_cancel.setStyleSheet(
-            "background:#4a1a1a;color:#fff;font-weight:bold;"
+            "background:#5a2a30;color:#d8e8f0;font-weight:bold;"
             "padding:6px 14px;border-radius:4px")
 
         self._btn_confirm.setEnabled(False)
@@ -4018,7 +4018,7 @@ class FrameLayoutPanel(QtWidgets.QWidget):
         lay.setContentsMargins(14, 14, 14, 14)
 
         title = QtWidgets.QLabel("Stamp Expected Frame Positions")
-        title.setStyleSheet("font-size:13px;font-weight:bold;color:#00e5ff")
+        title.setStyleSheet("font-size:13px;font-weight:bold;color:#7ab8d8")
         title.setAlignment(QtCore.Qt.AlignCenter)
         lay.addWidget(title)
 
@@ -4042,12 +4042,12 @@ class FrameLayoutPanel(QtWidgets.QWidget):
         self._btn_cancel  = QtWidgets.QPushButton("Cancel")
 
         self._btn_undo.setStyleSheet(
-            "background:#4a3a00;color:#fff;padding:5px 10px;border-radius:4px")
+            "background:#384858;color:#d8e8f0;padding:5px 10px;border-radius:4px")
         self._btn_confirm.setStyleSheet(
-            "background:#005f6b;color:#fff;font-weight:bold;"
+            "background:#1a4070;color:#d8e8f0;font-weight:bold;"
             "padding:5px 12px;border-radius:4px")
         self._btn_cancel.setStyleSheet(
-            "background:#4a1a1a;color:#fff;padding:5px 10px;border-radius:4px")
+            "background:#5a2a30;color:#d8e8f0;padding:5px 10px;border-radius:4px")
 
         self._btn_confirm.setEnabled(False)
         self._btn_undo.clicked.connect(self._on_undo)
@@ -4065,7 +4065,7 @@ class FrameLayoutPanel(QtWidgets.QWidget):
     def update_count(self, n: int):
         self._lbl_count.setText(f"Stamps placed: {n}")
         self._lbl_count.setStyleSheet(
-            f"color:{'#88ff88' if n > 0 else '#888888'};font-size:11px")
+            f"color:{'#7ab8d8' if n > 0 else '#888898'};font-size:11px")
         self._btn_confirm.setEnabled(n > 0)
 
     def closeEvent(self, e):
@@ -4521,16 +4521,16 @@ class MainWindow(QtWidgets.QWidget):
 
         btn("Open Image",        self._open_image)
         sep()
-        btn("Create Frame Tmpl", self._start_frame,   "#1155aa")
-        btn("Create Font Tmpl",  self._start_font,    "#116611")
+        btn("Create Frame Tmpl", self._start_frame,   "#1a4070")
+        btn("Create Font Tmpl",  self._start_font,    "#1a4070")
         sep()
-        self._btn_run  = btn("▶ Start Run", self._start_run, "#1a6b2a")
-        self._btn_stop = btn("■ Stop",      self._stop_run,  "#882200")
+        self._btn_run  = btn("▶ Start Run", self._start_run, "#1a5530")
+        self._btn_stop = btn("■ Stop",      self._stop_run,  "#7a2010")
         self._btn_stop.setEnabled(False)
         btn("Clear", self._clear)
         sep()
-        btn("⚙ Load Settings",  self._load_settings, "#555500")
-        btn("Save Settings",  self._save_settings, "#555500")
+        btn("⚙ Load Settings",  self._load_settings, "#384858")
+        btn("Save Settings",    self._save_settings,  "#384858")
         sep()
         bar.addStretch()
         return bar
@@ -4641,11 +4641,11 @@ class MainWindow(QtWidgets.QWidget):
         pin_a_rect = QtCore.QRect(pin_lx, ay, pin_w, ah)
         pin_b_rect = QtCore.QRect(pin_lx, by, pin_w, ah)
 
-        self._view.add_overlay(rect_a,      QtGui.QColor(0,   224, 255), "MOLD_A", "dash")
-        self._view.add_overlay(rect_b,      QtGui.QColor(0,   180, 255), "MOLD_B", "dash")
-        self._view.add_overlay(anchor_rect, QtGui.QColor(255, 220, 0),   "ANCHOR", "dash")
-        self._view.add_overlay(pin_a_rect,  QtGui.QColor(255, 120, 200), "PIN_A",  "dash")
-        self._view.add_overlay(pin_b_rect,  QtGui.QColor(255, 120, 200), "PIN_B",  "dash")
+        self._view.add_overlay(rect_a,      QtGui.QColor(70,  130, 210), "MOLD_A", "dash")
+        self._view.add_overlay(rect_b,      QtGui.QColor(60,  110, 180), "MOLD_B", "dash")
+        self._view.add_overlay(anchor_rect, QtGui.QColor(110, 145, 185), "ANCHOR", "dash")
+        self._view.add_overlay(pin_a_rect,  QtGui.QColor(140, 155, 175), "PIN_A",  "dash")
+        self._view.add_overlay(pin_b_rect,  QtGui.QColor(140, 155, 175), "PIN_B",  "dash")
 
         desc = (f"Pair [{offset},{offset+1}]  "
                 f"A: {aw}×{ah}px  pitch={by - ay}px  "
@@ -4755,7 +4755,7 @@ class MainWindow(QtWidgets.QWidget):
         n = len(self._layout_stamps) + 1
         self._layout_stamps.append(rect)
         self._view.add_overlay(
-            rect, QtGui.QColor(0, 224, 255), f"F{n}", "dash")
+            rect, QtGui.QColor(80, 140, 210), f"F{n}", "dash")
         if self._layout_panel:
             self._layout_panel.update_count(n)
         self._view.set_stamp_label(f"F{n + 1}")
@@ -4871,7 +4871,7 @@ class MainWindow(QtWidgets.QWidget):
                                 mold_size     = mold_size)
         if ok:
             self._view.add_overlay(
-                rect, QtGui.QColor(0, 210, 80), name, "solid")
+                rect, QtGui.QColor(80, 140, 210), name, "solid")
             self._panel.log(
                 f"Font '{name}' saved ({w}x{h} px).", "#88ff88")
         else:
@@ -5066,15 +5066,15 @@ if __name__ == "__main__":
 
     pal = QtGui.QPalette()
     for role, col in [
-        (QtGui.QPalette.Window,          (28,  28,  28)),
-        (QtGui.QPalette.WindowText,      (220, 220, 220)),
-        (QtGui.QPalette.Base,            (18,  18,  18)),
-        (QtGui.QPalette.AlternateBase,   (38,  38,  38)),
-        (QtGui.QPalette.Text,            (220, 220, 220)),
-        (QtGui.QPalette.Button,          (48,  48,  48)),
-        (QtGui.QPalette.ButtonText,      (220, 220, 220)),
-        (QtGui.QPalette.Highlight,       (42,  130, 218)),
-        (QtGui.QPalette.HighlightedText, (0,   0,   0)),
+        (QtGui.QPalette.Window,          (28,  33,  42)),
+        (QtGui.QPalette.WindowText,      (200, 210, 222)),
+        (QtGui.QPalette.Base,            (18,  22,  30)),
+        (QtGui.QPalette.AlternateBase,   (35,  42,  54)),
+        (QtGui.QPalette.Text,            (200, 210, 222)),
+        (QtGui.QPalette.Button,          (44,  54,  70)),
+        (QtGui.QPalette.ButtonText,      (200, 210, 222)),
+        (QtGui.QPalette.Highlight,       (50,  105, 165)),
+        (QtGui.QPalette.HighlightedText, (220, 230, 242)),
     ]:
         pal.setColor(role, QtGui.QColor(*col))
     app.setPalette(pal)
