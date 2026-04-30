@@ -2863,7 +2863,19 @@ class InspectionController:
         if not active_grid:
             return ["__NO_GRID__"]
 
-        unique = list(set(active_grid))
+        # Deduplicate: ['A','B','A','A'] → ['A','B']
+        unique = sorted(set(c.upper() for c in active_grid))
+        print(f"[Prepare] Grid chars (unique): {unique}")
+
+        # Explicit file-existence check before attempting to load
+        tmpl_dir = self._ct.TEMPLATE_DIR
+        missing_tmpls = [c for c in unique
+                         if not os.path.exists(
+                             os.path.join(tmpl_dir, f"{c}_template.json"))]
+        if missing_tmpls:
+            print(f"[Prepare] Missing templates: {missing_tmpls}")
+            return missing_tmpls
+
         failed = self.load_cache(unique)
         if failed:
             return failed
@@ -5023,6 +5035,9 @@ class MainWindow(QtWidgets.QWidget):
                     f"Create these templates using 'Create Font Tmpl'\n"
                     f"before starting the run."
                 )
+                QtWidgets.QMessageBox.warning(self, "Missing Template", msg)
+                self._panel.log(f"Run blocked — missing: {missing}", "#ff4444")
+                return
             QtWidgets.QMessageBox.warning(self, "Cannot Start Run", msg)
             self._panel.log(f"Run blocked — missing: {missing}", "#ff4444")
             return
