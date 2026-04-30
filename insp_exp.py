@@ -1225,7 +1225,6 @@ class YOLOMoldDetector:
         if not boxes:
             return None
         x1, y1, w, h = min(boxes, key=lambda b: b[0] + b[1])
-        from PyQt5 import QtCore
         return QtCore.QRect(x1, y1, w, h)
 
     def detect_all(self, image_bgr: np.ndarray,
@@ -1242,7 +1241,6 @@ class YOLOMoldDetector:
         col_snap  = max(1, median_w // 2)
         boxes_sorted = sorted(boxes,
                               key=lambda b: (round(b[0] / col_snap), b[1]))
-        from PyQt5 import QtCore
         return [QtCore.QRect(x, y, w, h) for x, y, w, h in boxes_sorted]
 
 
@@ -2070,157 +2068,6 @@ class InspectionEngine:
     # COMPARE ROI  — orchestrates the pipeline
     # =========================================================
 
-    def compare_roi(self,
-                roi_bgr:      np.ndarray,
-                tmpl:         dict,
-                exp_dx:       int,
-                exp_dy:       int,
-                mold_cx:      int,
-                mold_cy:      int,
-                mold_size:    int   = 150,
-                is_retry:     bool  = False,
-                precomputed:  tuple = None,
-                roi_thresh:   "np.ndarray | None" = None) -> dict:
-        """
-        precomputed : (contours, canvas, clean_binary, others) from a prior
-                      _check_presence call — skips Step 1 re-extraction.
-        roi_thresh  : precomputed Otsu binary — eliminates redundant _thresh_font call.
-        """
-
-        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY) \
-            if roi_bgr.ndim == 3 else roi_bgr.copy()
-
-        orig_roi_h, orig_roi_w = gray.shape[:2]
-        roi_h, roi_w = gray.shape[:2]
-        if roi_thresh is None:
-            roi_thresh = ContourTemplate._thresh_font(gray, mold_size)
-
-        tmpl_contours = tmpl.get("contours", [])
-
-        _no_dirty = {"detected": False, "type": "none", "area_ratio": 0.0, "contours": []}
-
-        def _fail(step: int, reason: str, extras: dict = None) -> dict:
-            base = {
-                "pass":        False,
-                "confidence":  0.0,
-                "shift_px":    0.0,
-                "shift_ratio": 0.0,
-                "reason":      reason,
-                "defect_step": step,
-                "roi_canvas":  None,
-                "roi_thresh":  roi_thresh,
-                "tmpl_canvas": tmpl.get("canvas"),
-                "orig_roi_w":  orig_roi_w,
-                "orig_roi_h":  orig_roi_h,
-                "dirty":       _no_dirty,
-            }
-            if extras:
-                base.update(extras)
-            return base
-
-        if not tmpl_contours:
-            return _fail(0, "no template contours")
-
-        # Template geometry — use pre-cached values when available (set in ContourTemplate.load)
-        tmpl_outer      = tmpl_contours[0]
-        tmpl_holes      = tmpl_contours[1:] if len(tmpl_contours) > 1 else []
-        tmpl_hole_count = len(tmpl_holes)
-        tmpl_outer_area  = tmpl.get("tmpl_outer_area") \
-                           if tmpl.get("tmpl_outer_area") is not None \
-                           else cv2.contourArea(tmpl_outer)
-        tmpl_hole_ratios = tmpl.get("tmpl_hole_ratios") \
-                           if tmpl.get("tmpl_hole_ratios") is not None \
-                           else [cv2.contourArea(h) / max(tmpl_outer_area, 1)
-                                 for h in tmpl_holes]
-
-        # ── Step 1 : Presence (hard) ─────────────────────────────────
-        if precomputed is not None:
-            contours, canvas, clean_binary, others = precomputed
-        else:
-            contours, canvas, clean_binary, others = self._check_presence(gray, mold_size, thresh=roi_thresh)
-
-        if not contours:
-            return _fail(1, "missing mark")
-
-        roi_outer = contours[0]
-        roi_holes = contours[1:] if len(contours) > 1 else []
-
-        failures: list = []   # (step, reason, extras)
-
-        # ── Step 2 : Align + Dirty check ─────────────────────────────
-        # Contour-masked binary: actual pixel content inside the outer letter boundary.
-        # Preserves defect gaps (mousebites, stroke breaks) without scatter misalignment.
-        _cmask = np.zeros_like(clean_binary)
-        cv2.drawContours(_cmask, [roi_outer], -1, 255, cv2.FILLED)
-        roi_for_dirty = cv2.bitwise_and(clean_binary, _cmask)
-        dirty = self._check_dirty(others, roi_for_dirty, tmpl.get("canvas"), roi_h, roi_w,
-                                   tmpl_canvas_aligned=tmpl.get("canvas_aligned"))
-        if dirty["detected"]:
-            failures.append((2,
-                f"dirty:{dirty['type']} area={dirty['area_ratio']:.3f}",
-                {"roi_canvas": canvas, "dirty": dirty}))
-
-        # ── Step 3 : Shift ────────────────────────────────────────────
-        shift_px, shift_ratio = self._check_shift(
-            contours, tmpl, exp_dx, exp_dy, mold_cx, mold_cy, roi_w, roi_h)
-
-        if shift_ratio > FONT_SHIFT_RATIO_MAX:
-            failures.append((3,
-                f"shift ratio={shift_ratio:.3f} > {FONT_SHIFT_RATIO_MAX}",
-                {"shift_px": shift_px, "shift_ratio": shift_ratio, "roi_canvas": canvas}))
-
-        # ── Step 4 : Holes (with cleanup retry) ──────────────────────
-        hole_score, roi_holes, canvas, contours = self._check_holes(
-            gray, roi_outer, roi_holes, canvas, contours,
-            tmpl_hole_count, tmpl_hole_ratios, mold_size)
-
-        if hole_score < 0:
-            failures.append((4,
-                f"hole mismatch got={len(roi_holes)} expected={tmpl_hole_count}",
-                {"shift_px": shift_px, "shift_ratio": shift_ratio, "roi_canvas": canvas}))
-
-        # ── Step 5 : Shape score ──────────────────────────────────────
-        confidence = self._compute_shape_score(canvas, contours, tmpl)
-
-        conf_thr = max(0.0, FONT_CONFIDENCE_MIN - 0.05) if is_retry \
-                   else FONT_CONFIDENCE_MIN
-        if confidence < conf_thr:
-            failures.append((5,
-                f"low shape_score={confidence:.3f} < {conf_thr:.3f}",
-                {"confidence":  confidence,
-                 "shift_px":    shift_px,
-                 "shift_ratio": shift_ratio,
-                 "roi_canvas":  canvas}))
-
-        if failures:
-            # Merge extras from all failures (later steps fill in richer data)
-            merged: dict = {"dirty": _no_dirty}
-            for _, _, ex in failures:
-                if ex:
-                    merged.update(ex)
-            first_step, first_reason, _ = failures[0]
-            result = _fail(first_step, first_reason, merged)
-            result["reasons"]      = [r for _, r, _ in failures]
-            result["defect_steps"] = [s for s, _, _ in failures]
-            return result
-
-        return {
-            "pass":         True,
-            "confidence":   round(confidence, 4),
-            "shift_px":     shift_px,
-            "shift_ratio":  shift_ratio,
-            "reason":       "OK",
-            "reasons":      ["OK"],
-            "defect_step":  0,
-            "defect_steps": [],
-            "roi_canvas":   canvas,
-            "roi_thresh":   roi_thresh,
-            "tmpl_canvas":  tmpl.get("canvas"),
-            "orig_roi_w":   orig_roi_w,
-            "orig_roi_h":   orig_roi_h,
-            "dirty":        _no_dirty,
-        }
-
 
 # =========================================================
 # C.  ResultAnnotator  — standalone, no Qt dependency
@@ -2459,83 +2306,84 @@ class ResultAnnotator:
         ty = bar_h // 2 + th // 2
         cv2.putText(display, lbl, (tx, ty), font, fscl, (0, 255, 255), thick, cv2.LINE_AA)
 
+    # ---- Defect circle highlight (extracted from draw_letter) -------
+
+    @staticmethod
+    def _draw_defect_highlight(display: np.ndarray, result: dict,
+                               lx1: int, ly1: int,
+                               cell_w: int, cell_h: int):
+        """Draw one defect circle per contour cluster on a failed letter cell."""
+        dirty_info  = result.get("dirty", {})
+        d_type      = dirty_info.get("type", "none")
+        roi_canvas  = result.get("roi_canvas")
+        tmpl_canvas = result.get("tmpl_canvas")
+        fail_color  = ResultAnnotator.COLOR_FAIL
+
+        def _circles_from_map(dmap) -> bool:
+            if dmap is None or not dmap.size or not np.any(dmap):
+                return False
+            cnts, _ = cv2.findContours(dmap, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            drew = False
+            for cnt in cnts:
+                if cv2.contourArea(cnt) < 2:
+                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                cx = lx1 + int((x + w / 2) * cell_w / dmap.shape[1])
+                cy = ly1 + int((y + h / 2) * cell_h / dmap.shape[0])
+                r  = max(4, int(np.hypot(w * cell_w / dmap.shape[1],
+                                         h * cell_h / dmap.shape[0]) * 0.40))
+                cv2.circle(display, (cx, cy), r, fail_color, 2)
+                drew = True
+            return drew
+
+        merged_map = dirty_info.get("merged_map")
+        if merged_map is not None and np.any(merged_map):
+            _circles_from_map(merged_map)
+            return
+
+        if d_type == "foreign_object":
+            extra_map = dirty_info.get("extra_map")
+            if extra_map is not None and np.any(extra_map):
+                _circles_from_map(extra_map)
+            else:
+                norm_pt = dirty_info.get("others_center_norm")
+                if norm_pt is not None:
+                    cx = lx1 + int(norm_pt[0] * cell_w)
+                    cy = ly1 + int(norm_pt[1] * cell_h)
+                    cv2.circle(display, (cx, cy),
+                               max(4, int(min(cell_w, cell_h) * 0.12)),
+                               fail_color, 2)
+        elif d_type == "missing_stroke":
+            _circles_from_map(dirty_info.get("missing_map"))
+        elif d_type == "hole_mismatch":
+            if roi_canvas is not None and tmpl_canvas is not None:
+                diff = cv2.subtract(InspectionEngine._centre_align(tmpl_canvas),
+                                    InspectionEngine._centre_align(roi_canvas))
+                if np.any(diff):
+                    _circles_from_map(diff)
+
     # ---- Letter ------------------------------------------------------
     @staticmethod
-    def draw_letter(display: np.ndarray,
-                    result:  dict):
-        passed      = result["pass"]
-        letter      = result["letter"]
-        confidence  = result["confidence"]
-        lx1         = result["lx1"]
-        ly1         = result["ly1"]
-        lx2         = result["lx2"]
-        ly2         = result["ly2"]
-        ocr_char    = result.get("ocr_char", "?")
-        ocr_conf    = result.get("ocr_conf",  0.0)
-        roi_thresh  = result.get("roi_thresh")
+    def draw_letter(display: np.ndarray, result: dict):
+        passed     = result["pass"]
+        letter     = result["letter"]
+        confidence = result["confidence"]
+        lx1        = result["lx1"]
+        ly1        = result["ly1"]
+        lx2        = result["lx2"]
+        ly2        = result["ly2"]
+        ocr_char   = result.get("ocr_char", "?")
+        ocr_conf   = result.get("ocr_conf",  0.0)
+        roi_thresh = result.get("roi_thresh")
 
-        col      = ResultAnnotator.COLOR_PASS if passed else ResultAnnotator.COLOR_FAIL
-        cell_w   = lx2 - lx1
-        cell_h   = ly2 - ly1
+        col    = ResultAnnotator.COLOR_PASS if passed else ResultAnnotator.COLOR_FAIL
+        cell_w = lx2 - lx1
+        cell_h = ly2 - ly1
 
-        # ── Defect region circle highlight ───────────────────────────
-        # Step 2 dirty  → foreign_object: extra_map / norm_pt
-        #                 missing_stroke: missing_map
-        # Step 4 hole   → hole-fill diff (canvas diff)
         if not passed and cell_w > 0 and cell_h > 0:
-            dirty_info   = result.get("dirty", {})
-            d_type       = dirty_info.get("type", "none")
-            roi_canvas   = result.get("roi_canvas")
-            tmpl_canvas  = result.get("tmpl_canvas")
-
-            def _circle_from_map(dmap) -> bool:
-                """Draw one circle per individual contour in a 64×64 binary map."""
-                if dmap is None or not dmap.size or not np.any(dmap):
-                    return False
-                cnts, _ = cv2.findContours(dmap, cv2.RETR_EXTERNAL,
-                                           cv2.CHAIN_APPROX_SIMPLE)
-                if not cnts:
-                    return False
-                map_w, map_h = dmap.shape[1], dmap.shape[0]
-                drew = False
-                for cnt in cnts:
-                    if cv2.contourArea(cnt) < 2:   # skip single-pixel noise
-                        continue
-                    x, y, w, h = cv2.boundingRect(cnt)
-                    cx = lx1 + int((x + w / 2) * cell_w / map_w)
-                    cy = ly1 + int((y + h / 2) * cell_h / map_h)
-                    sw = w * cell_w / map_w
-                    sh = h * cell_h / map_h
-                    r  = max(4, int(np.hypot(sw, sh) * 0.40))
-                    cv2.circle(display, (cx, cy), r, (0, 0, 255), 2)
-                    drew = True
-                return drew
-
-            # Dirty pixel region circles — merged_map (P2 morph diff) takes priority
-            merged_map = dirty_info.get("merged_map")
-            if merged_map is not None and np.any(merged_map):
-                _circle_from_map(merged_map)
-            elif d_type == "foreign_object":
-                extra_map = dirty_info.get("extra_map")
-                if extra_map is not None and np.any(extra_map):
-                    _circle_from_map(extra_map)
-                else:
-                    norm_pt = dirty_info.get("others_center_norm")
-                    if norm_pt is not None:
-                        cx = lx1 + int(norm_pt[0] * cell_w)
-                        cy = ly1 + int(norm_pt[1] * cell_h)
-                        r  = max(4, int(min(cell_w, cell_h) * 0.12))
-                        cv2.circle(display, (cx, cy), r, (0, 0, 255), 2)
-            elif d_type == "missing_stroke":
-                _circle_from_map(dirty_info.get("missing_map"))
-            elif d_type == "hole_mismatch":
-                # Canvas diff between template and ROI shows hole position
-                if roi_canvas is not None and tmpl_canvas is not None:
-                    tc   = InspectionEngine._centre_align(tmpl_canvas)
-                    rc   = InspectionEngine._centre_align(roi_canvas)
-                    diff = cv2.subtract(tc, rc)   # template holes absent in ROI
-                    if np.any(diff):
-                        _circle_from_map(diff)
+            ResultAnnotator._draw_defect_highlight(
+                display, result, lx1, ly1, cell_w, cell_h)
 
         # ── Extracted edges — threshold contours in pass/fail color ──
         if roi_thresh is not None and roi_thresh.size > 0 and cell_w > 0 and cell_h > 0:
@@ -2544,10 +2392,7 @@ class ResultAnnotator:
             cv2.drawContours(display[ly1:ly2, lx1:lx2], rcnts, -1, col, 1)
 
         # ── Label with black background ───────────────────────────
-        if letter:
-            lbl = f"{letter}: {confidence:.2f}"
-        else:
-            lbl = f"!{ocr_char}: {ocr_conf:.2f}"
+        lbl = f"{letter}: {confidence:.2f}" if letter else f"!{ocr_char}: {ocr_conf:.2f}"
         font       = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.30
         thickness  = 1
@@ -2744,13 +2589,14 @@ class InspectionController:
         }
 
     def get_frame_template(self) -> dict:
-        """Return anchor section (canvas ready for TM search)."""
-        return self.load_frame_recipe()["anchor"]
+        """Return anchor section. Uses cached recipe from prepare() when available."""
+        r = self._active_recipe if getattr(self, "_active_recipe", None) else self.load_frame_recipe()
+        return r["anchor"]
 
     def get_mold_offsets(self) -> tuple:
-        """Return (mold_a_shift, mold_b_shift) as [dx, dy] lists."""
-        recipe = self.load_frame_recipe()
-        return recipe["mold_a_shift"], recipe["mold_b_shift"]
+        """Return (mold_a_shift, mold_b_shift). Uses cached recipe from prepare()."""
+        r = self._active_recipe if getattr(self, "_active_recipe", None) else self.load_frame_recipe()
+        return r["mold_a_shift"], r["mold_b_shift"]
 
     # ---- frame layout (frame_layout.json) ----
     LAYOUT_FILE = "frame_layout.json"
@@ -2798,6 +2644,42 @@ class InspectionController:
                 failed.append(key)
         return failed
     
+    def _run_ocr(self, canvas: np.ndarray) -> tuple:
+        """
+        HOG cosine match of canvas against all loaded OCR templates.
+
+        Returns (char, confidence):
+          - Fast path  : best_conf ≥ OCR_CONF_EXPECTED → return immediately.
+          - Gap check  : best − 2nd < OCR_CONF_GAP_MIN → ambiguous → "?".
+          - Floor check: best_conf < OCR_MIN_CONF → unreadable → "?".
+          - "?"        : no templates loaded, canvas is None, or above checks fail.
+        """
+        if not self._ocr_templates or canvas is None:
+            return "?", 0.0
+
+        q_hog  = _compute_hog(canvas)
+        scores = sorted(
+            ((InspectionEngine._hog_cosine(q_hog, t.get("hog_vec")), n)
+             for n, t in self._ocr_templates.items()
+             if t.get("hog_vec") is not None),
+            reverse=True,
+        )
+        if not scores:
+            return "?", 0.0
+
+        best_conf, best_char = scores[0]
+
+        if best_conf >= OCR_CONF_EXPECTED:
+            return best_char, round(best_conf, 4)
+
+        if len(scores) >= 2 and (best_conf - scores[1][0]) < OCR_CONF_GAP_MIN:
+            return "?", round(best_conf, 4)
+
+        if best_conf < OCR_MIN_CONF:
+            return "?", round(best_conf, 4)
+
+        return best_char, round(best_conf, 4)
+
     def prepare(self, grid_letters: list) -> list:
         """
         Pre-flight: load recipe + layout + cache all templates for grid_letters.
@@ -2890,7 +2772,6 @@ class InspectionController:
         if not matches:
             return False, 0, 0, {}, set()
 
-        from collections import defaultdict
         cg_to_fidx: dict = defaultdict(list)
         for f_idx, (anc_cx, *_) in enumerate(matches):
             cg = round(anc_cx / max(col_snap, 1))
@@ -3296,11 +3177,18 @@ class InspectionController:
                   else {"detected": False, "type": "none",
                         "extra_ratio": 0.0, "missing_ratio": 0.0, "area_ratio": 0.0})
 
+            ocr_char, ocr_conf = self._run_ocr(canvas) if p1["present"] else ("?", 0.0)
+
             elapsed_ms = (time.perf_counter() - t0) * 1000
 
             # ── Collect failures ──────────────────────────────────
             failures = []
             if not p1["present"]:
+                # SHIFT PLAN: a large shift can push the mark outside the ROI so
+                # step-1 fires "missing_mark" instead of a step-3 shift fail.
+                # Fix (not yet implemented): on step-1 empty, retry extraction on
+                # a 1.5× wider ROI; if contours appear, reclassify as step-3 and
+                # compute shift_ratio against the wider crop centre.
                 failures.append((1, "missing_mark"))
             else:
                 if p2["detected"]:
@@ -3314,6 +3202,10 @@ class InspectionController:
                     failures.append((4,
                         f"low_conf={p1['confidence']:.3f}"
                         f" < {FONT_CONFIDENCE_MIN}"))
+                if ocr_char != "?" and ocr_char != letter and ocr_conf >= OCR_MIN_CONF:
+                    failures.append((5,
+                        f"wrong_mark ocr={ocr_char}({ocr_conf:.2f})"
+                        f" expected={letter}"))
             failures.sort(key=lambda x: x[0])
 
             passed      = len(failures) == 0
@@ -3334,8 +3226,8 @@ class InspectionController:
                 "defect_type":  p2["type"] if p2["detected"] else "",
                 "reason":       reasons[0],
                 "reasons":      reasons,
-                "ocr_char":     letter,
-                "ocr_conf":     p1["confidence"],
+                "ocr_char":     ocr_char,
+                "ocr_conf":     ocr_conf,
                 "cell_cx":      cell_cx,
                 "cell_cy":      cell_cy,
                 "elapsed_ms":   round(elapsed_ms, 2),
@@ -3360,6 +3252,7 @@ class InspectionController:
                     f" conf={p1['confidence']:.3f}"
                     f" shift={p1['shift_ratio']:.3f}"
                     f" defect={p2['type']}({p2['area_ratio']:.3f})"
+                    f" ocr={ocr_char}({ocr_conf:.2f})"
                     f" | {'; '.join(reasons)}")
 
             ResultAnnotator.draw_letter(display, results[-1])
