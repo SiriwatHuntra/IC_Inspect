@@ -737,6 +737,33 @@ class ContourTemplate:
     # =========================================================
 
     @staticmethod
+    def _filter_valid_roots(raw_cnts: list,
+                            hierarchy: np.ndarray,
+                            roi_area:  int) -> list:
+        """
+        Return (area, index) pairs for all top-level contours that pass
+        the texture-noise filters (area, relative-area, solidity, extent).
+        Shared by _find_contours and _find_contours_all.
+        """
+        result = []
+        for i, c in enumerate(raw_cnts):
+            if hierarchy[i][3] != -1:
+                continue
+            area = cv2.contourArea(c)
+            if area < MIN_CONTOUR_AREA:
+                continue
+            if area / roi_area < MIN_CONTOUR_REL_AREA:
+                continue
+            hull_area = cv2.contourArea(cv2.convexHull(c))
+            if area / max(hull_area, 1) < MIN_CONTOUR_SOLIDITY:
+                continue
+            _, _, bw, bh = cv2.boundingRect(c)
+            if area / max(bw * bh, 1) < MIN_CONTOUR_EXTENT:
+                continue
+            result.append((area, i))
+        return result
+
+    @staticmethod
     def _find_contours(binary: np.ndarray, h: int, w: int) -> tuple:
         raw_cnts, hierarchy = cv2.findContours(
             binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)  # was TC89_KCOS
@@ -748,38 +775,11 @@ class ContourTemplate:
 
         hierarchy = hierarchy[0]
 
-        # Find largest top-level contour passing texture-noise filters
-        roi_area  = max(h * w, 1)
-        best_idx  = -1
-        best_area = 0.0
-        for i, c in enumerate(raw_cnts):
-            if hierarchy[i][3] != -1:
-                continue                              # skip non-root contours
-
-            area = cv2.contourArea(c)
-            if area < MIN_CONTOUR_AREA:
-                continue
-
-            # ── Relative area: reject sub-pixel specks ────────────
-            if area / roi_area < MIN_CONTOUR_REL_AREA:
-                continue
-
-            # ── Solidity: reject jagged rough-surface noise ───────
-            hull_area = cv2.contourArea(cv2.convexHull(c))
-            if area / max(hull_area, 1) < MIN_CONTOUR_SOLIDITY:
-                continue
-
-            # ── Extent: reject sparse irregular blobs ─────────────
-            _, _, bw, bh = cv2.boundingRect(c)
-            if area / max(bw * bh, 1) < MIN_CONTOUR_EXTENT:
-                continue
-
-            if area > best_area:
-                best_area = area
-                best_idx  = i
-
-        if best_idx == -1:
+        valid = ContourTemplate._filter_valid_roots(raw_cnts, hierarchy, max(h * w, 1))
+        if not valid:
             return [], empty_canvas
+
+        _, best_idx = max(valid, key=lambda x: x[0])
 
         # Root + direct children
         contours = [raw_cnts[best_idx]]
@@ -823,28 +823,9 @@ class ContourTemplate:
             return [], [], empty_canvas
 
         hierarchy = hierarchy[0]
-        roi_area  = max(h * w, 1)
 
-        valid_roots = []   # (area, raw_index)
-        for i, c in enumerate(raw_cnts):
-            if hierarchy[i][3] != -1:
-                continue                              # skip non-root contours
-
-            area = cv2.contourArea(c)
-            if area < MIN_CONTOUR_AREA:
-                continue
-            if area / roi_area < MIN_CONTOUR_REL_AREA:
-                continue
-
-            hull_area = cv2.contourArea(cv2.convexHull(c))
-            if area / max(hull_area, 1) < MIN_CONTOUR_SOLIDITY:
-                continue
-
-            _, _, bw, bh = cv2.boundingRect(c)
-            if area / max(bw * bh, 1) < MIN_CONTOUR_EXTENT:
-                continue
-
-            valid_roots.append((area, i))
+        valid_roots = ContourTemplate._filter_valid_roots(
+            raw_cnts, hierarchy, max(h * w, 1))
 
         if not valid_roots:
             return [], [], empty_canvas
@@ -1678,28 +1659,13 @@ class InspectionEngine:
             except AttributeError:
                 return None
 
-        def _centre_align(src: np.ndarray, size: int = 64) -> np.ndarray:
-            pts = cv2.findNonZero(src)
-            if pts is None:
-                return np.zeros((size, size), dtype=np.uint8)
-            x, y, w, h = cv2.boundingRect(pts)
-            crop  = src[y:y + h, x:x + w]
-            scale = min(size / max(w, 1), size / max(h, 1))
-            sw    = max(1, int(round(w * scale)))
-            sh    = max(1, int(round(h * scale)))
-            rsz   = cv2.resize(crop, (sw, sh), interpolation=cv2.INTER_NEAREST)
-            frame = np.zeros((size, size), dtype=np.uint8)
-            frame[(size - sh) // 2:(size - sh) // 2 + sh,
-                  (size - sw) // 2:(size - sw) // 2 + sw] = rsz
-            return frame
-
         sq = _thin(canvas_q)
         st = _thin(canvas_t)
         if sq is None or st is None:
             return 0.0
 
-        sq = _centre_align(sq)
-        st = _centre_align(st)
+        sq = InspectionEngine._centre_align(sq)
+        st = InspectionEngine._centre_align(st)
 
         if dilate_px > 0:
             k  = cv2.getStructuringElement(
@@ -3450,34 +3416,25 @@ class RunWorker(QtCore.QThread):
     def _log(self, msg: str, color: str = "#dddddd"):
         self.sig_result.emit(msg, color)
 
-    def _save_fail(self, img_gray: np.ndarray, display_bgr: np.ndarray):
-        """
-        Save raw gray + annotated BGR for a failed image.
-        Files: Inspection_result/<ts>_R.png  and  <ts>.png
-        """
+    def _save_result_images(self, img_gray: np.ndarray, display_bgr: np.ndarray,
+                            prefix: str = "") -> str:
+        """Write <prefix><ts>_R.png + <prefix><ts>.png; return base name."""
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        raw_path = os.path.join(OUTPUT_DIR, f"{ts}_R.png")
-        ann_path = os.path.join(OUTPUT_DIR, f"{ts}.png")
-        cv2.imwrite(raw_path, img_gray)
-        cv2.imwrite(ann_path, display_bgr)
-        self._log(f"  NG saved: {ts}_R.png + {ts}.png", "#ffaa44")
+        base = f"{prefix}{ts}"
+        cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}_R.png"), img_gray)
+        cv2.imwrite(os.path.join(OUTPUT_DIR, f"{base}.png"),   display_bgr)
+        return base
+
+    def _save_fail(self, img_gray: np.ndarray, display_bgr: np.ndarray):
+        base = self._save_result_images(img_gray, display_bgr)
+        self._log(f"  NG saved: {base}_R.png + {base}.png", "#ffaa44")
 
     def _save_last_lot(self, img_gray: np.ndarray, display_bgr: np.ndarray,
                        chip_cols: int):
-        """
-        Save raw gray + annotated BGR for a last-lot image.
-        Files: Inspection_result/lastlot_<ts>_R.png  and  lastlot_<ts>.png
-        """
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        ts       = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        raw_path = os.path.join(OUTPUT_DIR, f"lastlot_{ts}_R.png")
-        ann_path = os.path.join(OUTPUT_DIR, f"lastlot_{ts}.png")
-        cv2.imwrite(raw_path, img_gray)
-        cv2.imwrite(ann_path, display_bgr)
+        base = self._save_result_images(img_gray, display_bgr, prefix="lastlot_")
         self._log(
-            f"  LAST LOT saved: lastlot_{ts}_R.png + lastlot_{ts}.png"
-            f"  ({chip_cols}/3 col)",
+            f"  LAST LOT saved: {base}_R.png + {base}.png  ({chip_cols}/3 col)",
             "#ffaa00")
 
     def _append_csv(self, ic_groups: dict, image_name: str):
@@ -3520,6 +3477,77 @@ class RunWorker(QtCore.QThread):
         except Exception as e:
             self._log(f"  CSV write error: {e}", "#ff4444")
 
+    # ---- shared per-image result handler ----
+    def _handle_result(self,
+                       result:      "InspectionResult",
+                       img_gray:    np.ndarray,
+                       img_ms:      float,
+                       image_name:  str) -> tuple:
+        """
+        Log per-mold verdicts, save fail/last-lot images, write CSV, fire IO.
+        Returns (passed_count, total_count) for caller accumulation.
+        """
+        ic_groups: dict = defaultdict(list)
+        for r in result.results:
+            ic_groups[r.get("ic_num", 0)].append(r)
+
+        for ic_num in sorted(ic_groups.keys()):
+            group    = ic_groups[ic_num]
+            r0       = group[0]
+            f_idx    = r0["frame_idx"]
+            mold_lbl = r0["mold"]
+            mold_ms  = sum(r["elapsed_ms"] for r in group)
+            passed   = all(r["pass"] for r in group)
+            verdict  = "PASS" if passed else "NG"
+            color    = "#88ff88" if passed else "#ff4444"
+
+            ignored = all(r.get("ignored") for r in group)
+            no_lead = all(r.get("reason") == "dropped" for r in group)
+            if ignored:
+                self._log(
+                    f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
+                    f"LAST LOT — ignored (empty col)  [{mold_ms:.1f}ms]",
+                    "#666666")
+                continue
+            if no_lead:
+                self._log(
+                    f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
+                    f"DROP WORK — skipped (pass)  [{mold_ms:.1f}ms]",
+                    "#888888")
+                continue
+
+            ocr_map    = {r["slot"]: r.get("ocr_char", " ") for r in group}
+            ocr_str    = "".join(ocr_map.get(i, " ") for i in range(9))
+            fail_causes = [
+                f"slot{r['slot']}({r['letter']}):"
+                f"{'; '.join(r.get('reasons', [r['reason']]))}"
+                for r in group if not r["pass"]
+            ]
+            cause_str = "  " + "  ".join(fail_causes) if fail_causes else ""
+            self._log(
+                f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  {verdict}"
+                f"  [{mold_ms:.1f}ms]  OCR:\"{ocr_str}\"{cause_str}",
+                color)
+
+        self._log(
+            f"  ▸ Image total: {img_ms:.1f}ms  "
+            f"ICs={len(ic_groups)}  passed={result.passed}/{result.total}",
+            "#aaaaaa")
+
+        if result.passed != result.total or result.total == 0:
+            self._save_fail(img_gray, result.display)
+
+        if result.last_lot:
+            self._log(
+                f"  *** LAST LOT — {result.last_lot_cols}/3 col(s) filled ***",
+                "#ffaa00")
+            self._save_last_lot(img_gray, result.display, result.last_lot_cols)
+            self._io.on_last_lot(result.last_lot_cols)
+
+        self._append_csv(ic_groups, image_name)
+        self._io.on_frame_result(result.passed, result.total)
+        return result.passed, result.total
+
     # ---- debug (folder) mode ----
     def _run_debug(self):
         files = self._image_io.list_images(IMAGE_SOURCE_DIR)
@@ -3557,80 +3585,9 @@ class RunWorker(QtCore.QThread):
 
             self.sig_image.emit(result.display)
 
-            all_pass = (result.passed == result.total and result.total > 0)
-
-            # ── Per-mold summary ──────────────────────────────────
-            ic_groups: dict = defaultdict(list)
-            for r in result.results:
-                ic_groups[r.get("ic_num", 0)].append(r)
-
-            for ic_num in sorted(ic_groups.keys()):
-                group    = ic_groups[ic_num]
-                r0       = group[0]
-                f_idx    = r0["frame_idx"]
-                mold_lbl = r0["mold"]
-                mold_ms  = sum(r["elapsed_ms"] for r in group)
-                passed   = all(r["pass"] for r in group)
-                verdict  = "PASS" if passed else "NG"
-                color    = "#88ff88" if passed else "#ff4444"
-
-                # Check no-lead / last-lot ignored
-                no_lead = all(r.get("reason") == "dropped" for r in group)
-                ignored = all(r.get("ignored") for r in group)
-                if no_lead:
-                    self._log(
-                        f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
-                        f"DROP WORK — skipped (pass)  "
-                        f"[{mold_ms:.1f}ms]",
-                        "#888888")
-                    continue
-                if ignored:
-                    self._log(
-                        f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
-                        f"LAST LOT — ignored (empty col)  "
-                        f"[{mold_ms:.1f}ms]",
-                        "#666666")
-                    continue
-
-                # Build OCR string — slot-ordered 9 chars, space for inactive
-                ocr_map = {r["slot"]: r.get("ocr_char", " ") for r in group}
-                ocr_str = "".join(ocr_map.get(i, " ") for i in range(9))
-
-                # Build fail causes
-                fail_causes = []
-                for r in group:
-                    if not r["pass"]:
-                        fail_causes.append(
-                            f"slot{r['slot']}({r['letter']}):"
-                            f"{'; '.join(r.get('reasons', [r['reason']]))}")
-
-                cause_str = "  " + "  ".join(fail_causes) if fail_causes else ""
-                self._log(
-                    f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  {verdict}"
-                    f"  [{mold_ms:.1f}ms]  OCR:\"{ocr_str}\"{cause_str}",
-                    color)
-
-            # ── Image timing summary ──────────────────────────────
-            n_ic = len(ic_groups)
-            self._log(
-                f"  ▸ Image total: {img_ms:.1f}ms  "
-                f"ICs={n_ic}  passed={result.passed}/{result.total}",
-                "#aaaaaa")
-
-            if not all_pass:
-                self._save_fail(img, result.display)
-
-            if result.last_lot:
-                self._log(
-                    f"  *** LAST LOT — {result.last_lot_cols}/3 col(s) filled ***",
-                    "#ffaa00")
-                self._save_last_lot(img, result.display, result.last_lot_cols)
-                self._io.on_last_lot(result.last_lot_cols)
-
-            self._append_csv(ic_groups, fname)
-            self._io.on_frame_result(result.passed, result.total)
-            total_passed  += result.passed
-            total_letters += result.total
+            p, t = self._handle_result(result, img, img_ms, fname)
+            total_passed  += p
+            total_letters += t
 
         self._io.set_busy(False)
         self._io.on_run_complete(total_passed, total_letters)
@@ -3673,79 +3630,10 @@ class RunWorker(QtCore.QThread):
 
             self.sig_image.emit(result.display)
 
-            all_pass = (result.passed == result.total and result.total > 0)
-
-            # ── Per-mold summary ──────────────────────────────────
-            ic_groups: dict = defaultdict(list)
-            for r in result.results:
-                ic_groups[r.get("ic_num", 0)].append(r)
-
-            for ic_num in sorted(ic_groups.keys()):
-                group    = ic_groups[ic_num]
-                r0       = group[0]
-                f_idx    = r0["frame_idx"]
-                mold_lbl = r0["mold"]
-                mold_ms  = sum(r["elapsed_ms"] for r in group)
-                passed   = all(r["pass"] for r in group)
-                verdict  = "PASS" if passed else "NG"
-                color    = "#88ff88" if passed else "#ff4444"
-
-                no_lead = all(r.get("reason") == "dropped" for r in group)
-                ignored = all(r.get("ignored") for r in group)
-                if ignored:
-                    self._log(
-                        f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
-                        f"LAST LOT — ignored (empty col)  "
-                        f"[{mold_ms:.1f}ms]",
-                        "#666666")
-                    continue
-                if no_lead:
-                    self._log(
-                        f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  "
-                        f"DROP WORK — skipped (pass)  "
-                        f"[{mold_ms:.1f}ms]",
-                        "#888888")
-                    continue
-
-                # Build OCR string — slot-ordered 9 chars, space for inactive
-                ocr_map = {r["slot"]: r.get("ocr_char", " ") for r in group}
-                ocr_str = "".join(ocr_map.get(i, " ") for i in range(9))
-
-                fail_causes = []
-                for r in group:
-                    if not r["pass"]:
-                        fail_causes.append(
-                            f"slot{r['slot']}({r['letter']}):"
-                            f"{'; '.join(r.get('reasons', [r['reason']]))}")
-
-                cause_str = "  " + "  ".join(fail_causes) if fail_causes else ""
-                self._log(
-                    f"  F{f_idx}-{mold_lbl} [{ic_num:>2}]  {verdict}"
-                    f"  [{mold_ms:.1f}ms]  OCR:\"{ocr_str}\"{cause_str}",
-                    color)
-
-            # ── Image timing summary ──────────────────────────────
-            n_ic = len(ic_groups)
-            self._log(
-                f"  ▸ Image total: {img_ms:.1f}ms  "
-                f"ICs={n_ic}  passed={result.passed}/{result.total}",
-                "#aaaaaa")
-
-            if not all_pass:
-                self._save_fail(img, result.display)
-
-            if result.last_lot:
-                self._log(
-                    f"  *** LAST LOT — {result.last_lot_cols}/3 col(s) filled ***",
-                    "#ffaa00")
-                self._save_last_lot(img, result.display, result.last_lot_cols)
-                self._io.on_last_lot(result.last_lot_cols)
-
             ts_label = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._append_csv(ic_groups, f"cam_{ts_label}")
-            self._io.on_frame_result(result.passed, result.total)
-            total_passed  += result.passed
-            total_letters += result.total
+            p, t = self._handle_result(result, img, img_ms, f"cam_{ts_label}")
+            total_passed  += p
+            total_letters += t
             self._io.set_busy(False)
 
         self._io.on_run_complete(total_passed, total_letters)
