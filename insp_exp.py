@@ -2241,7 +2241,7 @@ class ResultAnnotator:
       Fail box   : (0, 0, 200)    red solid
     """
 
-    COLOR_FRAME = (180, 130, 70)   # steel-blue (BGR) — template structure
+    COLOR_FRAME = (180, 150, 70)   # steel-blue (BGR) — template structure
     COLOR_MOLD  = (150, 110, 60)   # dim steel-blue (BGR) — template structure
     COLOR_PASS  = (50,  210, 50)   # green (BGR) — pass annotation
     COLOR_FAIL  = (50,  50,  210)  # red (BGR) — fail annotation
@@ -4644,11 +4644,11 @@ class MainWindow(QtWidgets.QWidget):
         pin_a_rect = QtCore.QRect(pin_lx, ay, pin_w, ah)
         pin_b_rect = QtCore.QRect(pin_lx, by, pin_w, ah)
 
-        self._view.add_overlay(rect_a,      QtGui.QColor(215, 55,  205), "MOLD_A", "dash")
-        self._view.add_overlay(rect_b,      QtGui.QColor(185, 48,  178), "MOLD_B", "dash")
-        self._view.add_overlay(anchor_rect, QtGui.QColor(165, 80,  160), "ANCHOR", "dash")
-        self._view.add_overlay(pin_a_rect,  QtGui.QColor(150, 88,  148), "PIN_A",  "dash")
-        self._view.add_overlay(pin_b_rect,  QtGui.QColor(150, 88,  148), "PIN_B",  "dash")
+        self._view.add_overlay(rect_a,      QtGui.QColor(200, 50,  255), "MOLD_A", "dash")
+        self._view.add_overlay(rect_b,      QtGui.QColor(200, 50,  255), "MOLD_B", "dash")
+        self._view.add_overlay(anchor_rect, QtGui.QColor(240, 180,  240), "ANCHOR", "dash")
+        self._view.add_overlay(pin_a_rect,  QtGui.QColor(150, 255,  148), "PIN_A",  "dash")
+        self._view.add_overlay(pin_b_rect,  QtGui.QColor(150, 255,  148), "PIN_B",  "dash")
 
         desc = (f"Pair [{offset},{offset+1}]  "
                 f"A: {aw}×{ah}px  pitch={by - ay}px  "
