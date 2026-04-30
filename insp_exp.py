@@ -67,7 +67,8 @@ class InspectionResult:
 # =========================================================
 # CONFIG
 # =========================================================
-DEBUG_MODE     = True
+DEBUG_MODE     = True   # True = folder source; False = live camera
+TEMPLATE_DEBUG = False  # True = write debug PNGs to debug/ on every template save/encode
 PIN_SOBEL_MAG      = 40        # Sobel Y threshold for lead-edge detection
 PIN_EDGE_RATIO     = 0.150     # min edge-pixel fraction in lead ROI
 PIN_TM_STRIDE      = 4         # coarse TM grid step (px)
@@ -930,7 +931,9 @@ class ContourTemplate:
         Output: section dict  {contour, contours, canvas_b64, canvas_w, canvas_h, [offset]}
         Raises: RuntimeError when no contours found.
         """
-        contours, canvas, _ = ContourTemplate.extract_frame_template(roi_gray)
+        contours, canvas, _ = ContourTemplate.extract_frame_template(
+            roi_gray,
+            debug_prefix=f"debug/frame_{rect_xywh[0]}_{rect_xywh[1]}" if TEMPLATE_DEBUG else "")
 
         if not contours:
             x, y, w, h = rect_xywh
@@ -972,7 +975,7 @@ class ContourTemplate:
 
         contours, canvas, *_ = ContourTemplate.extract_font_template(
             gray, mold_size=mold_size,
-            debug_prefix=f"debug/{name}")
+            debug_prefix=f"debug/{name}" if TEMPLATE_DEBUG else "")
 
         if not contours:
             raise RuntimeError(f"No contours found in ROI for '{name}'")
