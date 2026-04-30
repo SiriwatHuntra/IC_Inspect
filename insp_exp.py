@@ -2216,21 +2216,35 @@ class ResultAnnotator:
     # ---- Ignored frame (last-lot empty column) ----------------------
     @staticmethod
     def draw_ignored_frame(display: np.ndarray,
-                           acx: int, acy: int):
+                           acx: int, acy: int,
+                           fw: int = 0, fh: int = 0):
         """
-        'IGNORED' text with black background, centred on an empty-column frame.
-        No area overlay — the frame image remains visible beneath.
+        Dim the frame area with a semi-transparent gray overlay to suppress the
+        per-slot pass/fail boxes drawn earlier, then stamp 'IGNORED' in the centre.
+        fw/fh are the anchor template dimensions; overlay is skipped when zero.
         """
+        ih, iw = display.shape[:2]
+
+        if fw > 0 and fh > 0:
+            x1 = max(0,    acx - fw // 2)
+            y1 = max(0,    acy - fh // 2)
+            x2 = min(iw-1, x1 + fw)
+            y2 = min(ih-1, y1 + fh)
+            overlay = display.copy()
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (35, 35, 35), cv2.FILLED)
+            cv2.addWeighted(overlay, 0.55, display, 0.45, 0, display)
+            cv2.rectangle(display, (x1, y1), (x2, y2), (90, 90, 90), 1)
+
         lbl  = "IGNORED"
         font = cv2.FONT_HERSHEY_SIMPLEX
-        fscl = 0.40
+        fscl = 0.45
         thick = 1
         (tw, th), bl = cv2.getTextSize(lbl, font, fscl, thick)
         tx = acx - tw // 2
         ty = acy + th // 2
-        cv2.rectangle(display, (tx - 2, ty - th - bl), (tx + tw + 2, ty + bl),
+        cv2.rectangle(display, (tx - 3, ty - th - bl), (tx + tw + 3, ty + bl),
                       (0, 0, 0), cv2.FILLED)
-        cv2.putText(display, lbl, (tx, ty), font, fscl, (160, 160, 160), thick, cv2.LINE_AA)
+        cv2.putText(display, lbl, (tx, ty), font, fscl, (180, 180, 180), thick, cv2.LINE_AA)
 
     # ---- Drop-work label (no-lead / Drop by Pin) --------------------
     @staticmethod
@@ -2767,8 +2781,9 @@ class InspectionController:
 
         Condition (LAST_LOT_CHIP_FRAME_COLS = N):
           • Exactly N columns where EVERY active slot qualifies as last-fed:
-              - reason == "dropped", OR
-              - pass == False AND ocr_char in (" ", "?")
+              - reason == "dropped"  (no-lead / drop work), OR
+              - pass == False        (any NG, regardless of fail reason or OCR)
+          • Active slots include step-1 fails (empty slot / missing mark).
           • Total detected columns > N (at least one other column exists).
           • Column position is not constrained.
           • Other columns may contain PASS / normal NG — they stay active.
@@ -2797,30 +2812,25 @@ class InspectionController:
             for fi in cg_to_fidx[cg]:
                 fidx_to_col[fi] = col_i
 
-        # Collect active slots per column (letter assigned, contours found incl. dropped)
+        # Collect active slots per column — all assigned letters including
+        # step-1 (missing mark / empty slot) and dropped.
         col_slots: dict = {i: [] for i in range(n_cols)}
         for r in all_results:
             fi = r.get("frame_idx", 0) - 1          # frame_idx is 1-based
             if fi not in fidx_to_col:
                 continue
-            if r.get("letter", "") != "" and r.get("defect_step", 0) != 1:
+            if r.get("letter", ""):
                 col_slots[fidx_to_col[fi]].append(r)
 
-        # A column is last-fed when it has slots AND every slot is Drop or NG-unreadable
+        # A column is last-fed when it has slots AND every slot is Drop or any NG.
+        # Drop (no leads) and any inspection fail both qualify — no OCR filter.
         ll_col_set: set = set()
         for col_i in range(n_cols):
             slots = col_slots[col_i]
             if not slots:
                 continue
-            all_last_fed = True
-            for r in slots:
-                if r.get("reason") == "dropped":
-                    continue
-                if not r.get("pass", True) and r.get("ocr_char", " ") in (" ", "?"):
-                    continue
-                all_last_fed = False
-                break
-            if all_last_fed:
+            if all(r.get("reason") == "dropped" or not r.get("pass", True)
+                   for r in slots):
                 ll_col_set.add(col_i)
 
         if len(ll_col_set) != n_chip:
@@ -2973,8 +2983,9 @@ class InspectionController:
 
             for f_idx, fentry in enumerate(frame_results):
                 if fidx_to_col.get(f_idx, -1) in ll_col_set:
-                    anc_cx, anc_cy = fentry["cx"], fentry["cy"]
-                    ResultAnnotator.draw_ignored_frame(display, anc_cx, anc_cy)
+                    ResultAnnotator.draw_ignored_frame(
+                        display, fentry["cx"], fentry["cy"],
+                        fentry["fw"], fentry["fh"])
 
             ResultAnnotator.draw_last_lot_image_flag(
                 display, img_chip_cols, img_total_cols)
