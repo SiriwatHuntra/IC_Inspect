@@ -2238,8 +2238,8 @@ class ResultAnnotator:
       Fail box   : (0, 0, 200)    red solid
     """
 
-    COLOR_FRAME = (180, 130, 70)   # steel-blue (BGR) — template structure
-    COLOR_MOLD  = (150, 110, 60)   # dim steel-blue (BGR) — template structure
+    COLOR_FRAME = (200, 50,  205)  # magenta (BGR) — template structure
+    COLOR_MOLD  = (165, 40,  170)  # dim magenta (BGR) — template structure
     COLOR_PASS  = (50,  210, 50)   # green (BGR) — pass annotation
     COLOR_FAIL  = (50,  50,  210)  # red (BGR) — fail annotation
     COLOR_OCR   = (190, 190, 190)  # light gray (BGR) — OCR label
@@ -3820,15 +3820,15 @@ class ImageView(QtWidgets.QLabel):
                 QtCore.QSize(int(cr.width()  * self._scale),
                              int(cr.height() * self._scale)),
             )
-            p.setPen(QtGui.QPen(QtGui.QColor(80, 140, 210), 2,
+            p.setPen(QtGui.QPen(QtGui.QColor(210, 55, 200), 2,
                                 QtCore.Qt.DashLine))
             p.drawRect(wcr)
             p.setFont(QtGui.QFont("Arial", 8, QtGui.QFont.Bold))
-            p.setPen(QtGui.QColor(80, 140, 210))
+            p.setPen(QtGui.QColor(210, 55, 200))
             p.drawText(wcr.topLeft() + QtCore.QPoint(3, -4), "DRAW MOLD HERE")
             
         if self._draw_mode and self._rect:
-            p.setPen(QtGui.QPen(QtGui.QColor(100, 155, 220), 1,
+            p.setPen(QtGui.QPen(QtGui.QColor(215, 65, 210), 1,
                                 QtCore.Qt.DashLine))
             p.drawRect(self._rect)
 
@@ -3856,16 +3856,16 @@ class ImageView(QtWidgets.QLabel):
             wh  = int(self._stamp_h   * self._scale)
             wx  = wcx - ww // 2
             wy  = wcy - wh // 2
-            p.setPen(QtGui.QPen(QtGui.QColor(80, 140, 210), 2,
+            p.setPen(QtGui.QPen(QtGui.QColor(210, 55, 200), 2,
                                 QtCore.Qt.DashLine))
             p.drawRect(wx, wy, ww, wh)
-            p.setPen(QtGui.QPen(QtGui.QColor(130, 190, 130), 1,
+            p.setPen(QtGui.QPen(QtGui.QColor(220, 155, 215), 1,
                                 QtCore.Qt.SolidLine))
             p.drawLine(wcx - 8, wcy, wcx + 8, wcy)
             p.drawLine(wcx, wcy - 8, wcx, wcy + 8)
             if self._stamp_label:
                 p.setFont(QtGui.QFont("Arial", 9, QtGui.QFont.Bold))
-                p.setPen(QtGui.QColor(80, 140, 210))
+                p.setPen(QtGui.QColor(210, 55, 200))
                 p.drawText(wx + 3, wy + 13, self._stamp_label)
 
         p.end()
@@ -4641,11 +4641,11 @@ class MainWindow(QtWidgets.QWidget):
         pin_a_rect = QtCore.QRect(pin_lx, ay, pin_w, ah)
         pin_b_rect = QtCore.QRect(pin_lx, by, pin_w, ah)
 
-        self._view.add_overlay(rect_a,      QtGui.QColor(70,  130, 210), "MOLD_A", "dash")
-        self._view.add_overlay(rect_b,      QtGui.QColor(60,  110, 180), "MOLD_B", "dash")
-        self._view.add_overlay(anchor_rect, QtGui.QColor(110, 145, 185), "ANCHOR", "dash")
-        self._view.add_overlay(pin_a_rect,  QtGui.QColor(140, 155, 175), "PIN_A",  "dash")
-        self._view.add_overlay(pin_b_rect,  QtGui.QColor(140, 155, 175), "PIN_B",  "dash")
+        self._view.add_overlay(rect_a,      QtGui.QColor(215, 55,  205), "MOLD_A", "dash")
+        self._view.add_overlay(rect_b,      QtGui.QColor(185, 48,  178), "MOLD_B", "dash")
+        self._view.add_overlay(anchor_rect, QtGui.QColor(165, 80,  160), "ANCHOR", "dash")
+        self._view.add_overlay(pin_a_rect,  QtGui.QColor(150, 88,  148), "PIN_A",  "dash")
+        self._view.add_overlay(pin_b_rect,  QtGui.QColor(150, 88,  148), "PIN_B",  "dash")
 
         desc = (f"Pair [{offset},{offset+1}]  "
                 f"A: {aw}×{ah}px  pitch={by - ay}px  "
@@ -4755,7 +4755,7 @@ class MainWindow(QtWidgets.QWidget):
         n = len(self._layout_stamps) + 1
         self._layout_stamps.append(rect)
         self._view.add_overlay(
-            rect, QtGui.QColor(80, 140, 210), f"F{n}", "dash")
+            rect, QtGui.QColor(210, 55, 200), f"F{n}", "dash")
         if self._layout_panel:
             self._layout_panel.update_count(n)
         self._view.set_stamp_label(f"F{n + 1}")
@@ -4871,7 +4871,7 @@ class MainWindow(QtWidgets.QWidget):
                                 mold_size     = mold_size)
         if ok:
             self._view.add_overlay(
-                rect, QtGui.QColor(80, 140, 210), name, "solid")
+                rect, QtGui.QColor(210, 55, 200), name, "solid")
             self._panel.log(
                 f"Font '{name}' saved ({w}x{h} px).", "#88ff88")
         else:
