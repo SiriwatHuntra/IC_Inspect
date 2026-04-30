@@ -5144,8 +5144,8 @@ class MainWindow(QtWidgets.QWidget):
     # ----------------------------------------------------------
     def _load_settings(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load Settings File", "",
-            "Text files (*.txt);;All files (*)")
+            self, "Load Settings", SETUP_FILE,
+            "JSON files (*.json);;All files (*)")
         if not path:
             return
         try:
@@ -5158,8 +5158,8 @@ class MainWindow(QtWidgets.QWidget):
 
     def _save_settings(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Settings File", SETTINGS_FILE,
-            "Text files (*.txt);;All files (*)")
+            self, "Save Settings", SETUP_FILE,
+            "JSON files (*.json);;All files (*)")
         if not path:
             return
         try:
