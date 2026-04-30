@@ -2241,8 +2241,8 @@ class ResultAnnotator:
       Fail box   : (0, 0, 200)    red solid
     """
 
-    COLOR_FRAME = (200, 50,  205)  # magenta (BGR) — template structure
-    COLOR_MOLD  = (165, 40,  170)  # dim magenta (BGR) — template structure
+    COLOR_FRAME = (180, 130, 70)   # steel-blue (BGR) — template structure
+    COLOR_MOLD  = (150, 110, 60)   # dim steel-blue (BGR) — template structure
     COLOR_PASS  = (50,  210, 50)   # green (BGR) — pass annotation
     COLOR_FAIL  = (50,  50,  210)  # red (BGR) — fail annotation
     COLOR_OCR   = (190, 190, 190)  # light gray (BGR) — OCR label
