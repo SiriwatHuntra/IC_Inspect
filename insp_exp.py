@@ -87,6 +87,7 @@ CAMERA_EXPOSURE_US   = 8000   # µs — overridden by RightPanel
 
 FONT_CONFIDENCE_MIN        = 0.70
 FONT_SHIFT_RATIO_MAX       = 0.50
+FONT_SHIFT_WIDE_FACTOR     = 1.5   # wide-ROI retry multiplier for shift detection
 FONT_HOLE_COUNT_TOLERANCE  = 1
 FONT_HOLE_AREA_TOLERANCE   = 0.30
 LAST_LOT_CHIP_FRAME_COLS   = 1
@@ -135,6 +136,7 @@ SETTINGS_FILE = "inspection_settings.txt"   # legacy — migrated to Setup.json 
 _SETUP_STATIC_DEFAULTS = {
     "font_confidence_min":        0.70,
     "font_shift_ratio_max":       0.50,
+    "font_shift_wide_factor":     1.5,
     "font_hole_count_tolerance":  1,
     "font_hole_area_tolerance":   0.30,
     "last_lot_chip_frame_cols":   1,
@@ -148,6 +150,8 @@ _SETUP_STATIC_DEFAULTS = {
 # (header, default, min, max, is_float)
 _SETTINGS_DEFAULTS = [
     ("pin_score_threshold",  0.75,  0.50,  1.00,  True ),
+    ("ocr_conf_expected",    0.88,  0.50,  1.00,  True ),
+    ("ocr_min_conf",         0.60,  0.30,  1.00,  True ),
     ("camera_exposure_us",   8000,   100, 100000,  False),
     ("grid_scale",            0.85,  0.50,  1.20,  True ),
     ("grid_x_frac",           0.00, -0.30,  0.30,  True ),
@@ -207,13 +211,14 @@ class SettingsManager:
 
     def _apply_statics(self):
         """Push static section values into module-level globals."""
-        global FONT_CONFIDENCE_MIN, FONT_SHIFT_RATIO_MAX
+        global FONT_CONFIDENCE_MIN, FONT_SHIFT_RATIO_MAX, FONT_SHIFT_WIDE_FACTOR
         global FONT_HOLE_COUNT_TOLERANCE, FONT_HOLE_AREA_TOLERANCE
         global LAST_LOT_CHIP_FRAME_COLS, MIN_TOPHAT_SIGNAL, PIN_EDGE_RATIO
         global DIRTY_EXTRA_RATIO_MAX, DIRTY_MISSING_RATIO_MAX
         s = self._static
         FONT_CONFIDENCE_MIN        = float(s.get("font_confidence_min",        FONT_CONFIDENCE_MIN))
         FONT_SHIFT_RATIO_MAX       = float(s.get("font_shift_ratio_max",       FONT_SHIFT_RATIO_MAX))
+        FONT_SHIFT_WIDE_FACTOR     = float(s.get("font_shift_wide_factor",     FONT_SHIFT_WIDE_FACTOR))
         FONT_HOLE_COUNT_TOLERANCE  = int(  s.get("font_hole_count_tolerance",  FONT_HOLE_COUNT_TOLERANCE))
         FONT_HOLE_AREA_TOLERANCE   = float(s.get("font_hole_area_tolerance",   FONT_HOLE_AREA_TOLERANCE))
         LAST_LOT_CHIP_FRAME_COLS   = int(  s.get("last_lot_chip_frame_cols",   LAST_LOT_CHIP_FRAME_COLS))
@@ -2668,14 +2673,16 @@ class InspectionController:
             return "?", 0.0
 
         best_conf, best_char = scores[0]
+        conf_expected = self._sm.get("ocr_conf_expected")
+        conf_min      = self._sm.get("ocr_min_conf")
 
-        if best_conf >= OCR_CONF_EXPECTED:
+        if best_conf >= conf_expected:
             return best_char, round(best_conf, 4)
 
         if len(scores) >= 2 and (best_conf - scores[1][0]) < OCR_CONF_GAP_MIN:
             return "?", round(best_conf, 4)
 
-        if best_conf < OCR_MIN_CONF:
+        if best_conf < conf_min:
             return "?", round(best_conf, 4)
 
         return best_char, round(best_conf, 4)
@@ -3184,12 +3191,40 @@ class InspectionController:
             # ── Collect failures ──────────────────────────────────
             failures = []
             if not p1["present"]:
-                # SHIFT PLAN: a large shift can push the mark outside the ROI so
-                # step-1 fires "missing_mark" instead of a step-3 shift fail.
-                # Fix (not yet implemented): on step-1 empty, retry extraction on
-                # a 1.5× wider ROI; if contours appear, reclassify as step-3 and
-                # compute shift_ratio against the wider crop centre.
-                failures.append((1, "missing_mark"))
+                # Wide-ROI retry: expands the search window by FONT_SHIFT_WIDE_FACTOR
+                # to catch marks displaced outside the normal cell ROI by a large shift.
+                # Clamped to full image bounds (not mold bounds) so nothing is missed.
+                wide_w    = int(roi_w * FONT_SHIFT_WIDE_FACTOR)
+                wide_h    = int(roi_h * FONT_SHIFT_WIDE_FACTOR)
+                wlx1      = max(0,  cell_cx - wide_w // 2)
+                wly1      = max(0,  cell_cy - wide_h // 2)
+                wlx2      = min(iw, wlx1 + wide_w)
+                wly2      = min(ih, wly1 + wide_h)
+                shift_found = False
+
+                if wlx2 > wlx1 and wly2 > wly1:
+                    wide_gray = image_gray[wly1:wly2, wlx1:wlx2]
+                    w_cnts, w_canvas, _, _ = ContourTemplate.extract_font_template(
+                        wide_gray,
+                        mold_size = tmpl.get("mold_size", mold_size),
+                        use_close = False)
+
+                    if w_cnts:
+                        w_p1 = InspectionEngine._identify_slot(
+                            w_cnts, w_canvas, tmpl,
+                            dx, dy, acx, acy,
+                            wide_gray.shape[0], wide_gray.shape[1])
+                        # Promote wide-ROI data — mark is present but shifted
+                        p1         = w_p1
+                        canvas     = w_canvas
+                        ocr_char, ocr_conf = self._run_ocr(w_canvas)
+                        shift_found = True
+                        failures.append((3,
+                            f"shift ratio={w_p1['shift_ratio']:.3f}"
+                            f" > {FONT_SHIFT_RATIO_MAX} (wide-retry)"))
+
+                if not shift_found:
+                    failures.append((1, "missing_mark"))
             else:
                 if p2["detected"]:
                     failures.append((2,
@@ -3202,7 +3237,7 @@ class InspectionController:
                     failures.append((4,
                         f"low_conf={p1['confidence']:.3f}"
                         f" < {FONT_CONFIDENCE_MIN}"))
-                if ocr_char != "?" and ocr_char != letter and ocr_conf >= OCR_MIN_CONF:
+                if ocr_char != "?" and ocr_char != letter and ocr_conf >= self._sm.get("ocr_min_conf"):
                     failures.append((5,
                         f"wrong_mark ocr={ocr_char}({ocr_conf:.2f})"
                         f" expected={letter}"))
@@ -4080,6 +4115,19 @@ class RightPanel(QtWidgets.QWidget):
         fl_pin.addRow("", note_pin)
         lay.addWidget(gb_pin)
 
+        # ── OCR Confidence ────────────────────────────────────
+        gb_ocr = QtWidgets.QGroupBox("OCR Confidence")
+        fl_ocr = QtWidgets.QFormLayout(gb_ocr)
+        self.spin_ocr_expected = self._bind_fspin("ocr_conf_expected", fl_ocr, "Expected")
+        self.spin_ocr_min      = self._bind_fspin("ocr_min_conf",      fl_ocr, "Min")
+        note_ocr = QtWidgets.QLabel(
+            "Expected: fast-path accept if score ≥ this.\n"
+            "Min: below this → unreadable (reported as '?').")
+        note_ocr.setStyleSheet("color:#888;font-size:9px")
+        note_ocr.setWordWrap(True)
+        fl_ocr.addRow("", note_ocr)
+        lay.addWidget(gb_ocr)
+
         # ── Grid Position ─────────────────────────────────────
         gb_grid = QtWidgets.QGroupBox("Grid Position")
         fl_grid = QtWidgets.QFormLayout(gb_grid)
@@ -4241,6 +4289,8 @@ class RightPanel(QtWidgets.QWidget):
         sm    = self._sm
         pairs = [
             (self.spin_pin_score,    "pin_score_threshold"),
+            (self.spin_ocr_expected, "ocr_conf_expected"),
+            (self.spin_ocr_min,      "ocr_min_conf"),
             (self.spin_exposure,     "camera_exposure_us"),
             (self.spin_grid_scale,   "grid_scale"),
             (self.spin_grid_x,       "grid_x_frac"),
